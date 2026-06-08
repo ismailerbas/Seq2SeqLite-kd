@@ -1482,6 +1482,7 @@ def evaluate_and_save(
 # main
 # ==============================================================================
 
+
 def main():
     args = parse_args()
     pf   = lambda s: print(s, flush=True)
@@ -1634,7 +1635,9 @@ def main():
         f"Per-GPU batch size: "
         f"{args.batch_size // max(strategy.num_replicas_in_sync, 1)}"
     )
-    pf(f"KD params         : α={args.alpha}  T={args.temperature}")
+    pf(
+        f"KD hyper-params   : alpha={args.alpha}  temperature={args.temperature}"
+    )
     pf(
         f"Quantization bits : kernel={args.bits_kernel}  "
         f"recurrent={args.bits_recurrent}  bias={args.bits_bias}  "
@@ -1642,6 +1645,15 @@ def main():
     )
 
     # ── 8. Training loop ──────────────────────────────────────────────────────
+    pf("=" * 60)
+    pf("VANILLA KD STUDENT TRAINING")
+    pf(f"  Job: {job_name}")
+    pf(f"  alpha={args.alpha}  temperature={args.temperature}")
+    pf(f"  Teacher GRU hidden={args.teacher_units} x {args.teacher_layers} layers")
+    pf(f"  Student QGRU-{args.student_units}  {args.bits_kernel}-bit kernel")
+    pf(f"  SEQLEN={args.seq_len}  BATCH={args.batch_size}  EPOCHS={args.epochs}")
+    pf("=" * 60)
+
     history, best_val_loss = training_loop(
         strategy,
         student_model,
