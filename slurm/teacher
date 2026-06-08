@@ -157,12 +157,16 @@ EXIT_CODE=$?
 echo "============================================================"
 echo "Training Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
+    # Derive the ckpt_tag in bash the same way parse_args() does in Python:
+    # join all elements of LAYERS_LIST with "x" and prepend "gru"
+    CKPT_TAG="gru$(echo ${LAYERS_LIST} | tr ' ' 'x')"
+    JOB_OUT_DIR="${DATA_PATH}/teacher_training_${CKPT_TAG}"
     echo "Completed successfully."
-    echo "Outputs in: ${DATA_PATH}/teacher_training/"
-    echo "  Best weights : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_best.weights.h5" 2>/dev/null)"
-    echo "  PNGs  : $(find "${DATA_PATH}/teacher_training" -name "*.png"  2>/dev/null | wc -l)"
-    echo "  JSONs : $(find "${DATA_PATH}/teacher_training" -name "*.json" 2>/dev/null | wc -l)"
-    echo "  CSVs  : $(find "${DATA_PATH}/teacher_training" -name "*.csv"  2>/dev/null | wc -l)"
+    echo "Outputs in: ${JOB_OUT_DIR}"
+    echo "  Best weights : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_best_${CKPT_TAG}.weights.h5" 2>/dev/null)"
+    echo "  PNGs  : $(find "${JOB_OUT_DIR}" -name "*.png"  2>/dev/null | wc -l)"
+    echo "  JSONs : $(find "${JOB_OUT_DIR}" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  CSVs  : $(find "${JOB_OUT_DIR}" -name "*.csv"  2>/dev/null | wc -l)"
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
