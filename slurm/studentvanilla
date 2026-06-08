@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=8
-#SBATCH --time=06:00:00
+#SBATCH --time=02:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
 
@@ -107,7 +107,7 @@ export OPENBLAS_NUM_THREADS=1
 # --- Paths ---
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 DATA_PATH="${SCRATCH_BASE}/nmi"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
+SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 SAVE_DIR="${SCRATCH_BASE}/nmi"
 
 # --- Scratch / cache dirs ---

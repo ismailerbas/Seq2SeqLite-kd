@@ -4,13 +4,25 @@ train_teacher.py — Supercomputer-compatible Teacher Seq2Seq GRU Training
 Stacked GRUCell inside keras.layers.RNN — matches supercomputer student script.
 
 Architecture:
-  Encoder: RNN([GRUCell(128), GRUCell(128)], return_state=True)  -> "encrnn"
-  Decoder: RNN([GRUCell(128), GRUCell(128)],
-               return_sequences=True, return_state=True)          -> "decrnn"
-  Dense:   Dense(n_out, activation='linear')                     -> "decdense"
+  Encoder: RNN([GRUCell(u0), GRUCell(u1), ...], return_state=True)  -> "encrnn"
+  Decoder: RNN([GRUCell(u0), GRUCell(u1), ...],
+               return_sequences=True, return_state=True)             -> "decrnn"
+  Dense:   Dense(n_out, activation='linear')                        -> "decdense"
   Input names: "encinput", "decinput"
 
-LAYERS_TEACHER = [128, 128]  (teacher_layers=2, teacher_units=128 each)
+--teacher-layers-list defines the hidden units for each stacked GRUCell layer.
+Examples:
+  --teacher-layers-list 128 128   →  LAYERS_TEACHER = [128, 128]  (default, 299 139 params)
+  --teacher-layers-list 64 64     →  LAYERS_TEACHER = [64, 64]
+  --teacher-layers-list 64 16     →  LAYERS_TEACHER = [64, 16]
+  --teacher-layers-list 45 45     →  LAYERS_TEACHER = [45, 45]
+  --teacher-layers-list 32 32     →  LAYERS_TEACHER = [32, 32]
+  --teacher-layers-list 16 16     →  LAYERS_TEACHER = [16, 16]
+  --teacher-layers-list 128       →  LAYERS_TEACHER = [128]  (single layer)
+
+Backward-compatible: --teacher-units and --teacher-layers still work and
+produce [teacher_units] * teacher_layers.  If both --teacher-layers-list
+and --teacher-units/--teacher-layers are given, --teacher-layers-list wins.
 
 Data files expected in --data-dir:
   tpsf_seq_L{SEQ_LEN}_{N}M.npy     -- encoder input  (N, SEQ_LEN, 1)
@@ -29,7 +41,7 @@ Usage:
     --data-dir /gpfs/.../nmi \
     --n-total-m 8 \
     --seq-len 135 --n-out 3 \
-    --teacher-units 128 --teacher-layers 2 \
+    --teacher-layers-list 128 128 \
     --batch-size 2048 --epochs 300 --patience 20 \
     --lr 1e-3 --lr-factor 0.5 --lr-patience 8 --lr-min 1e-6 \
     --split-seed 42
@@ -94,11 +106,19 @@ def parse_args():
     p.add_argument("--gate-width-ns", type=float, default=0.09,
                    help="Gate width in ns per time bin (SS3 = 0.09 ns)")
     # --- architecture ---
+    # New: heterogeneous per-layer unit counts.  Takes priority over
+    # --teacher-units / --teacher-layers when provided.
+    p.add_argument("--teacher-layers-list", type=int, nargs="+", default=None,
+                   help="Hidden units for each stacked GRUCell layer in order. "
+                        "Overrides --teacher-units and --teacher-layers when given. "
+                        "Example: --teacher-layers-list 64 16  →  [64, 16]")
+    # Legacy args kept for backward compatibility.
     p.add_argument("--teacher-units",  type=int, default=128,
-                   help="Hidden units per GRUCell layer")
+                   help="Hidden units per GRUCell layer (all layers identical). "
+                        "Ignored when --teacher-layers-list is given.")
     p.add_argument("--teacher-layers", type=int, default=2,
-                   help="Number of stacked GRUCell layers (default: 2, "
-                        "i.e. LAYERS_TEACHER=[128,128])")
+                   help="Number of stacked GRUCell layers (all identical size). "
+                        "Ignored when --teacher-layers-list is given.")
     # --- training ---
     p.add_argument("--batch-size",  type=int,   default=2048)
     p.add_argument("--epochs",      type=int,   default=300)
@@ -125,8 +145,24 @@ def parse_args():
     args = p.parse_args()
     if args.save_dir is None:
         args.save_dir = args.data_dir
-    return args
 
+    # Resolve LAYERS_TEACHER here once so every downstream function
+    # reads args.layers_teacher — a plain Python list of ints.
+    if args.teacher_layers_list is not None:
+        if len(args.teacher_layers_list) < 1:
+            p.error("--teacher-layers-list must have at least one value")
+        for u in args.teacher_layers_list:
+            if u < 1:
+                p.error(f"--teacher-layers-list: all unit counts must be >= 1, got {u}")
+        args.layers_teacher = args.teacher_layers_list
+    else:
+        if args.teacher_units < 1:
+            p.error("--teacher-units must be >= 1")
+        if args.teacher_layers < 1:
+            p.error("--teacher-layers must be >= 1")
+        args.layers_teacher = [args.teacher_units] * args.teacher_layers
+
+    return args
 
 # ---------------------------------------------------------------------------
 # STEP 3 — GPU / Strategy setup with explicit device list
@@ -340,22 +376,36 @@ def make_fast_dataset(enc_arr, tgt_arr, batch_size, shuffle, prefetch_batches):
 # Teacher model — stacked GRUCell inside RNN (exact notebook match)
 # Layer names: encinput, decinput, encrnn, decrnn, decdense
 # ---------------------------------------------------------------------------
-def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
-    LAYERS_TEACHER = [teacher_units] * teacher_layers
+def build_teacher(seq_len, n_out, layers_teacher):
+    """
+    Build a stacked GRU Seq2Seq teacher.
 
+    Parameters
+    ----------
+    seq_len       : int   — sequence length (used only for shape comment; model
+                            accepts variable-length via shape=(None, 1))
+    n_out         : int   — number of output channels (e.g. 3 for tau1/tau2/fret)
+    layers_teacher: list[int] — hidden units per GRUCell layer in stack order.
+                    Examples:
+                      [128, 128]  →  two-layer 128-unit teacher  (default)
+                      [64, 16]    →  heterogeneous paper ablation config
+                      [64]        →  single-layer teacher
+    """
     encoder_inputs = Input(shape=(None, 1), name="encinput")
     encoder_cells  = [
         GRUCell(units, reset_after=True, name=f"enc_cell{i}")
-        for i, units in enumerate(LAYERS_TEACHER)
+        for i, units in enumerate(layers_teacher)
     ]
     encoder_rnn = RNN(encoder_cells, return_state=True, name="encrnn")
     enc_outputs_and_states = encoder_rnn(encoder_inputs)
-    encoder_states = enc_outputs_and_states[1:]   # [h1_T, h2_T]
+    # enc_outputs_and_states[0]  : last output  (B, units[-1])
+    # enc_outputs_and_states[1:] : hidden states per cell [h0_T, h1_T, ...]
+    encoder_states = enc_outputs_and_states[1:]
 
     decoder_inputs = Input(shape=(None, 1), name="decinput")
     decoder_cells  = [
         GRUCell(units, reset_after=True, name=f"dec_cell{i}")
-        for i, units in enumerate(LAYERS_TEACHER)
+        for i, units in enumerate(layers_teacher)
     ]
     decoder_rnn = RNN(
         decoder_cells,
@@ -366,7 +416,8 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
     dec_outputs_and_states = decoder_rnn(
         decoder_inputs, initial_state=encoder_states
     )
-    decoder_hidden_sequence = dec_outputs_and_states[0]   # (B, T, 128)
+    # dec_outputs_and_states[0] : full hidden sequence (B, T, units[-1])
+    decoder_hidden_sequence = dec_outputs_and_states[0]
 
     decoder_output = Dense(n_out, activation="linear", name="decdense")(
         decoder_hidden_sequence
@@ -666,7 +717,7 @@ def save_loss_curves(history, best_val_loss, args, job_dir, pf):
     axes[1].text(
         0.05, 0.55,
         f"Teacher seq2seq GRU\n"
-        f"LAYERS = [{', '.join([str(args.teacher_units)]*args.teacher_layers)}]\n"
+        f"LAYERS = {args.layers_teacher}\n"
         f"SEQLEN={args.seq_len}  n_out={args.n_out}\n"
         f"Batch size={args.batch_size}\n"
         f"Best val loss={best_val_loss:.6f}\n"
@@ -858,7 +909,7 @@ def main():
     with strategy.scope():
         teacher_model = build_teacher(
             args.seq_len, args.n_out,
-            args.teacher_units, args.teacher_layers,
+            args.layers_teacher,
         )
         optimizer    = keras.optimizers.Adam(learning_rate=args.lr)
         lr_scheduler = ReduceLROnPlateau(
@@ -870,7 +921,8 @@ def main():
         )
 
     teacher_model.summary(print_fn=pf)
-    pf(f"Teacher params: {teacher_model.count_params():,}")
+    pf(f"Teacher params    : {teacher_model.count_params():,}")
+    pf(f"LAYERS_TEACHER    : {args.layers_teacher}")
     pf(f"Encoder layer name: {teacher_model.get_layer('encrnn').name}")
     pf(f"Decoder layer name: {teacher_model.get_layer('decrnn').name}")
     pf(f"Dense head name   : {teacher_model.get_layer('decdense').name}")
