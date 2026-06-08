@@ -94,7 +94,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import pearsonr
-from tqdm import tqdm
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclideanfrom tqdm import tqdm
 
 import tensorflow as tf
 import tensorflow.keras as keras
@@ -1230,6 +1231,89 @@ def compute_metrics(gt, pred, label, pfn):
     return rmse, float(r), cov
 
 
+def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
+    """
+    Compute the 4 paper metrics (Table 1/2/3) on raw SDF output sequences.
+
+    gt_seqs   : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
+    pred_seqs : np.ndarray shape (N, T, C)  — student predictions
+    channel_names : list of str, length C   — e.g. ["ch0_full","ch1_short","ch2_long"]
+    pfn       : print function
+
+    Returns a dict keyed by channel name, each containing:
+        rmse, r2, l2_norm, dtw_distance  (all per-sample means)
+
+    RMSE     : sqrt(mean over samples and timesteps of squared error)
+    R²       : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
+    L2-norm  : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
+    DTW      : mean over samples of FastDTW distance (euclidean path cost)
+    """
+    N, T, C = gt_seqs.shape
+    results = {}
+
+    for c, ch_name in enumerate(channel_names):
+        gt_c   = gt_seqs[:, :, c]    # (N, T)
+        pred_c = pred_seqs[:, :, c]  # (N, T)
+
+        # ── RMSE (scalar over all samples and timesteps) ─────────────────────
+        rmse = float(np.sqrt(np.mean((gt_c - pred_c) ** 2)))
+
+        # ── R² (computed per sample, then averaged) ──────────────────────────
+        ss_res = np.sum((gt_c - pred_c) ** 2, axis=1)        # (N,)
+        ss_tot = np.sum((gt_c - gt_c.mean(axis=1, keepdims=True)) ** 2, axis=1)  # (N,)
+        # Avoid division by zero for flat ground-truth sequences
+        r2_per_sample = np.where(
+            ss_tot > 1e-12,
+            1.0 - ss_res / ss_tot,
+            np.where(ss_res < 1e-12, 1.0, 0.0),
+        )
+        r2 = float(np.mean(r2_per_sample))
+
+        # ── L2-norm (mean over samples of Euclidean distance per sample) ─────
+        l2_per_sample = np.sqrt(np.sum((gt_c - pred_c) ** 2, axis=1))  # (N,)
+        l2_norm = float(np.mean(l2_per_sample))
+
+        # ── DTW distance (FastDTW, mean over samples) ────────────────────────
+        # FastDTW operates on sequences of scalars (1-D arrays).
+        # radius=1 matches the paper's DTW implementation (tight band).
+        # We chunk the loop and print progress every 10% for large N.
+        dtw_total = 0.0
+        print_every_dtw = max(1, N // 10)
+        t0_dtw = time.time()
+        pfn(
+            f"  [SDF DTW] channel={ch_name}  N={N:,}  T={T}  "
+            f"computing FastDTW (radius=1)..."
+        )
+        sys.stdout.flush()
+        for i in range(N):
+            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=euclidean)
+            dtw_total += dist
+            if (i + 1) % print_every_dtw == 0 or (i + 1) == N:
+                pct = 100.0 * (i + 1) / N
+                elapsed_dtw = time.time() - t0_dtw
+                pfn(
+                    f"  [SDF DTW]   {i + 1:>8,}/{N:,}  ({pct:5.1f}%)  "
+                    f"elapsed={elapsed_dtw / 60:.1f}min"
+                )
+                sys.stdout.flush()
+        dtw_distance = float(dtw_total / N)
+
+        results[ch_name] = {
+            "rmse":         rmse,
+            "r2_score":     r2,
+            "l2_norm":      l2_norm,
+            "dtw_distance": dtw_distance,
+        }
+
+        pfn(
+            f"  SDF {ch_name:12s}  RMSE={rmse:.4f}  R²={r2:.4f}  "
+            f"L2={l2_norm:.4f}  DTW={dtw_distance:.4f}"
+        )
+        sys.stdout.flush()
+
+    return results
+
+
 def run_inference(model, enc_arr, seq_len, n_out, batch_size, pfn):
     n     = len(enc_arr)
     preds = np.zeros((n, seq_len, n_out), dtype=np.float32)
@@ -1266,6 +1350,7 @@ def evaluate_and_save(
 
     enc_test = normalized_input[test_idx]
     lab_test = labels[test_idx]
+    res_test = res[test_idx]
 
     student_preds = run_inference(
         student_model, enc_test, seq_len, n_out, infer_batch, pfn
@@ -1301,6 +1386,28 @@ def evaluate_and_save(
     with open(metrics_path, "w") as f:
         json.dump(test_metrics, f, indent=2)
     pfn(f"Test metrics saved: {metrics_path}")
+
+    # ── SDF-domain metrics (Table 1/2/3 of the paper) ─────────────────────────
+    # Computed on the raw output decay sequences (res), not the lifetime params.
+    # res_test shape: (N, T, 3)  — ch0=full, ch1=short, ch2=long
+    # student_preds shape: (N, T, 3)
+    pfn("=" * 60)
+    pfn("SDF-domain metrics (paper Table 1/2/3): RMSE, R², L2-norm, DTW")
+    pfn("=" * 60)
+    sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
+    sdf_metrics = compute_sdf_metrics(
+        gt_seqs       = res_test.astype(np.float32),
+        pred_seqs     = student_preds,
+        channel_names = sdf_channel_names,
+        pfn           = pfn,
+    )
+    sdf_metrics["job_name"] = job_name
+    sdf_metrics["n_test"]   = int(len(test_idx))
+    sdf_metrics_path = os.path.join(job_dir, "test_sdf_metrics.json")
+    with open(sdf_metrics_path, "w") as f:
+        json.dump(sdf_metrics, f, indent=2)
+    pfn(f"SDF metrics saved: {sdf_metrics_path}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     panels = [
         (tau1_gt, tau1_pred, m1, "τ₁ (ns)", "GT τ₁ (ns)", "Pred τ₁ (ns)",
@@ -1369,8 +1476,6 @@ def evaluate_and_save(
     pfn(f"Residuals saved: {residuals_path}")
 
     return test_metrics
-
-
 # ==============================================================================
 # main
 # ==============================================================================
