@@ -340,15 +340,15 @@ python "${SCRIPT_DIR}/train_student.py" \
     --gate-width-ns      "${GATE_WIDTH_NS}"    \
     --batch-size         "${BATCH_SIZE}"       \
     --epochs             300                   \
-    --patience           15                    \
+    --patience           30                    \
     --min-delta          1e-5                  \
-    --lr                 1e-4                  \
+    --lr                 1.6e-3                \
     --lr-factor          0.5                   \
-    --lr-patience        8                     \
+    --lr-patience        16                    \
     --lr-min             1e-6                  \
     --alpha              0.5                   \
     --beta               0.05                  \
-    --gamma              0.1                   \
+    --gamma              5e-2                   \
     --shadow-sync-every  1                     \
     --log-interval       10                    \
     --fisher-batch       4096                  \
