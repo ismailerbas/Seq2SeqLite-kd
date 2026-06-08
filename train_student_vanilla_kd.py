@@ -705,7 +705,6 @@ def mse_kd_loss(y_teacher, y_student):
 # nan_in_grads returned as tf.float32 for explicit cast in distributed wrapper.
 # ==============================================================================
 
-
 def train_step_per_replica(
     batch_x,
     batch_y,
@@ -729,22 +728,31 @@ def train_step_per_replica(
         total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
 
     grads = tape.gradient(total_loss, student_model.trainable_variables)
-    grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
+    # Replace any None gradient (non-differentiable path) with a zero tensor
+    # so tf.clip_by_global_norm receives a homogeneous list with no Nones.
+    grads = [
+        tf.zeros_like(v) if g is None else g
+        for g, v in zip(grads, student_model.trainable_variables)
+    ]
+
+    # Check NaN BEFORE clipping — clipping a NaN gradient produces 0.0 (hidden NaN)
     nan_in_grads = tf.reduce_any(tf.stack([
-        tf.reduce_any(tf.math.is_nan(g))
-        for g in grads if g is not None
+        tf.reduce_any(tf.math.is_nan(g)) for g in grads
     ]))
 
-    def apply_grads():
-        optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
-        return total_loss
+    # Clip gradients. tf.clip_by_global_norm returns (clipped_grads, global_norm).
+    grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
-    def skip_grads():
-        return total_loss
+    # ALWAYS call apply_gradients — no tf.cond, no merge_call inside strategy.run().
+    # NaN gradients become 0.0 after clip_by_global_norm when the norm is NaN,
+    # so the weight update is a no-op. nan_in_grads is returned so the caller
+    # can count and warn without gating the apply call inside the replica context.
+    optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
 
-    final_loss = tf.cond(nan_in_grads, skip_grads, apply_grads)
-    return final_loss, hard_loss, soft_loss, tf.cast(nan_in_grads, tf.float32)
+    return total_loss, hard_loss, soft_loss, tf.cast(nan_in_grads, tf.float32)
+
+
 # ==============================================================================
 # Per-replica val step — NO @tf.function here (same reason as train step).
 # ==============================================================================
