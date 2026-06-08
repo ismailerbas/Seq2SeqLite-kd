@@ -95,7 +95,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import pearsonr
 from fastdtw import fastdtw
-from scipy.spatial.distance import euclideanfrom tqdm import tqdm
+
+from scipy.spatial.distance import euclidean
+from tqdm import tqdm
 
 import tensorflow as tf
 import tensorflow.keras as keras
