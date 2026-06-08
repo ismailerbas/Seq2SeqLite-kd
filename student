@@ -1,0 +1,529 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
+
+# ============================================================================
+# FW-QATD-RAC Student Training  (full novelties: Fisher KD + RAC)
+# All 8 GPUs used via MirroredStrategy inside train_student.py.
+#
+# Auto-resubmission logic:
+#   - SIGUSR1 fires 120s before wall time -> sets RESUBMIT=1 IMMEDIATELY
+#     (Python runs in background so the trap is not deferred).
+#     Python finishes its current epoch, then job resubmits itself with --resume.
+#   - Python exits 0 cleanly within wall time -> check resume_state.json:
+#     if start_epoch < 300 and no early stop, resubmit with --resume so the
+#     next wall-time slot continues training.
+#   - Python exits 0 and resume_state.json says start_epoch >= 300 OR
+#     patience was exhausted -> training is genuinely done, no resubmit.
+#   - Python exits non-zero and RESUBMIT=0 -> hard failure, no resubmit.
+#   - Python killed by SIGTERM (exit 143) and RESUBMIT=0 -> treat as
+#     wall-time preemption (SIGUSR1 race condition), resubmit with --resume.
+#
+# KEY FIX vs prior version:
+#   Python is launched in BACKGROUND with & and the shell waits via
+#   `wait $PYTHON_PID`. This makes the SIGUSR1 trap fire IMMEDIATELY when
+#   the signal arrives instead of being deferred until Python exits.
+#   Without this fix, RESUBMIT was never set to 1 during a running job
+#   because bash defers traps for foreground processes.
+#
+# Usage:
+#   sbatch --job-name=student_b8k8r8a8_gru32x1_dense3_bs8192 \
+#          student \
+#          <BITS_KERNEL> <BITS_BIAS> <BITS_RECURRENT> <BITS_ACTIVATION> \
+#          <BITS_STATE> <STUDENT_UNITS> <TEACHER_UNITS> <TEACHER_LAYERS> \
+#          <SEQ_LEN> <N_OUT> <GATE_WIDTH_NS> <BATCH_SIZE> <TEACHER_CKPT> \
+#          [--resume] [--mixed-precision]
+#
+# Example fresh run (8-bit, gru32, bs16384):
+#   sbatch --job-name=student_b8k8r8a8_gru32x1_dense3_bs16384 \
+#          student \
+#          8 8 8 8 8 32 128 2 135 3 0.2 16384 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5
+#
+# Example resume from best weights:
+#   sbatch --job-name=student_b8k8r8a8_gru32x1_dense3_bs16384 \
+#          student \
+#          8 8 8 8 8 32 128 2 135 3 0.2 16384 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
+#          --resume
+# ============================================================================
+
+
+
+# --- Positional arguments ---
+BITS_KERNEL=$1
+BITS_BIAS=$2
+BITS_RECURRENT=$3
+BITS_ACTIVATION=$4
+BITS_STATE=$5
+STUDENT_UNITS=$6
+TEACHER_UNITS=$7
+TEACHER_LAYERS=$8
+SEQ_LEN=$9
+N_OUT=${10}
+GATE_WIDTH_NS=${11}
+BATCH_SIZE=${12}
+TEACHER_CKPT=${13}
+RESUME_FLAG=${14:-""}
+MIXED_PRECISION_FLAG=${15:-""}
+
+
+
+# --- Required argument check ---
+if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"        ] || \
+   [ -z "${BITS_RECURRENT}" ] || [ -z "${BITS_ACTIVATION}"  ] || \
+   [ -z "${BITS_STATE}"     ] || [ -z "${STUDENT_UNITS}"    ] || \
+   [ -z "${TEACHER_UNITS}"  ] || [ -z "${TEACHER_LAYERS}"   ] || \
+   [ -z "${SEQ_LEN}"        ] || [ -z "${N_OUT}"            ] || \
+   [ -z "${GATE_WIDTH_NS}"  ] || [ -z "${BATCH_SIZE}"       ] || \
+   [ -z "${TEACHER_CKPT}"   ]; then
+    echo "FATAL: Missing positional arguments."
+    echo "Usage: sbatch student BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION BITS_STATE STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS SEQ_LEN N_OUT GATE_WIDTH_NS BATCH_SIZE TEACHER_CKPT [--resume] [--mixed-precision]"
+    exit 1
+fi
+
+
+
+# --- Teacher checkpoint existence check ---
+if [ ! -f "${TEACHER_CKPT}" ]; then
+    echo "FATAL: teacher checkpoint not found: ${TEACHER_CKPT}"
+    exit 1
+fi
+
+
+
+# --- Validate RESUME_FLAG if provided: must be --resume, --mixed-precision, or empty ---
+if [ -n "${RESUME_FLAG}" ] && \
+   [ "${RESUME_FLAG}" != "--resume" ] && \
+   [ "${RESUME_FLAG}" != "--mixed-precision" ]; then
+    echo "FATAL: argument 14 must be --resume or --mixed-precision, got: ${RESUME_FLAG}"
+    exit 1
+fi
+
+
+
+# ============================================================================
+# STEP 1 - modules
+# No cuda/cudnn modules exist on this cluster -- system-installed only.
+# Only gcc is needed here.
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+
+
+# ============================================================================
+# STEP 2 - activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+
+
+# ============================================================================
+# STEP 3 - THE FIX (ported from run_teacher.sh)
+# libcudnn.so.8 is in $CONDA_PREFIX/lib but LD_LIBRARY_PATH is empty on
+# this cluster. TF cannot find cuDNN without this one export.
+# Confirmed working: 8x V100 detected after this line.
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+
+
+# ============================================================================
+# STEP 4 - GPU / TF settings
+# CUDA_VISIBLE_DEVICES must be set HERE in the shell BEFORE python launches.
+# train_student.py also guards this at import time but setting it here
+# ensures SLURM's GPU isolation does not override it silently.
+# ============================================================================
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+# Do NOT set TF_FORCE_GPU_ALLOW_GROWTH here -- train_student.py calls
+# set_memory_growth() programmatically via set_memory_growth(gpu, True).
+# Setting the env var and the API call together can cause a RuntimeError.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${SCRATCH_BASE}/nmi"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+
+
+# --- Results subfolder: matches make_job_name() in train_student.py exactly ---
+# student_b{K}k{K}r{R}a{A}_gru{U}x1_dense{NOUT}_bs{B}
+JOB_TAG="student_b${BITS_KERNEL}k${BITS_KERNEL}r${BITS_RECURRENT}a${BITS_ACTIVATION}_gru${STUDENT_UNITS}x1_dense${N_OUT}_bs${BATCH_SIZE}"
+
+
+
+# SAVE_DIR points to the root under which results/JOB_TAG is built.
+# train_student.py constructs: job_dir = save_dir/results/JOB_TAG
+# The existing best weights live under:
+#   /gpfs/u/home/HBNN/HBNNrbss/scratch/nmi/results/JOB_TAG/
+# so SAVE_DIR must be the home-based scratch path, not the scratch alias.
+SAVE_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+mkdir -p "${SAVE_DIR}/results/${JOB_TAG}"
+
+
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+
+
+
+# ============================================================================
+# STEP 5 - Auto-resubmission trap
+#
+# CRITICAL FIX: Python is launched in BACKGROUND below so that bash can
+# interrupt `wait $PYTHON_PID` and fire this trap IMMEDIATELY when SIGUSR1
+# arrives. With a foreground process, bash DEFERS all traps until the
+# foreground command exits -- by then SLURM has already killed everything
+# and RESUBMIT is never set to 1.
+#
+# Flow on wall-time hit:
+#   T-120s  : SLURM sends SIGUSR1 to this shell.
+#   T-120s  : trap fires immediately (Python is background, wait is interrupted).
+#             RESUBMIT=1 is set. wait resumes waiting for Python.
+#   T-120s..0: Python finishes its current epoch, writes resume_state.json, exits 0.
+#   T=0     : SLURM sends SIGTERM if Python still running (hard kill).
+#             exit 143 triggers the SIGTERM hardening block below.
+#   After wait: resubmit block sees RESUBMIT=1 -> sbatch with --resume.
+# ============================================================================
+RESUBMIT=0
+PYTHON_PID=""
+
+resubmit_handler() {
+    echo "============================================================"
+    echo "SIGUSR1 received: wall time limit approaching in ~120 seconds."
+    echo "Flagging for resubmission. Python will finish its current epoch."
+    echo "resume_state.json will be written by train_student.py before it exits."
+    echo "============================================================"
+    RESUBMIT=1
+    # Do NOT send any signal to Python -- let it complete its current epoch.
+    # SLURM will send SIGTERM to the job ~120s later if Python has not exited.
+}
+
+trap resubmit_handler SIGUSR1
+
+
+
+# --- Log header ---
+echo "============================================================"
+echo "FW-QATD-RAC STUDENT TRAINING  (Fisher KD + RAC -- full novelties)"
+echo "MirroredStrategy -- all 8 GPUs"
+echo "============================================================"
+echo "SLURM JOB ID   : ${SLURM_JOBID}"
+echo "SLURM JOB NAME : ${SLURM_JOB_NAME}"
+echo "JOB TAG        : ${JOB_TAG}"
+echo "NODE           : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
+echo "GPUs available : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "DATA PATH      : ${DATA_PATH}"
+echo "SAVE DIR       : ${SAVE_DIR}/results/${JOB_TAG}"
+echo "SCRIPT DIR     : ${SCRIPT_DIR}"
+echo "BITS KERNEL    : ${BITS_KERNEL}"
+echo "BITS BIAS      : ${BITS_BIAS}"
+echo "BITS RECURRENT : ${BITS_RECURRENT}"
+echo "BITS ACTIVATION: ${BITS_ACTIVATION}"
+echo "BITS STATE     : ${BITS_STATE}"
+echo "STUDENT UNITS  : ${STUDENT_UNITS}"
+echo "TEACHER UNITS  : ${TEACHER_UNITS}"
+echo "TEACHER LAYERS : ${TEACHER_LAYERS}"
+echo "SEQ LEN        : ${SEQ_LEN}"
+echo "N OUT          : ${N_OUT}"
+echo "GATE WIDTH NS  : ${GATE_WIDTH_NS}"
+echo "BATCH SIZE     : ${BATCH_SIZE}"
+echo "TEACHER CKPT   : ${TEACHER_CKPT}"
+echo "RESUME FLAG    : ${RESUME_FLAG:-off}"
+echo "MIXED PREC     : ${MIXED_PRECISION_FLAG:-off}"
+echo "PYTHON         : $(which python)"
+echo "TF VERSION     : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "QKERAS VERSION : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo 'n/a')"
+echo "NUMPY VERSION  : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
+
+
+
+# --- If resuming: verify that student_best.weights.h5 exists before launching ---
+if [ "${RESUME_FLAG}" = "--resume" ]; then
+    BEST_CKPT="${SAVE_DIR}/results/${JOB_TAG}/student_best.weights.h5"
+    RESUME_STATE="${SAVE_DIR}/results/${JOB_TAG}/resume_state.json"
+    echo "RESUME MODE: checking for required files..."
+    echo "  Best weights : ${BEST_CKPT}"
+    echo "  Resume state : ${RESUME_STATE}"
+    if [ ! -f "${BEST_CKPT}" ]; then
+        echo "FATAL: --resume passed but student_best.weights.h5 not found at:"
+        echo "  ${BEST_CKPT}"
+        echo "Cannot resume without a checkpoint. Run without --resume for a fresh start."
+        exit 1
+    fi
+    if [ ! -f "${RESUME_STATE}" ]; then
+        echo "WARNING: resume_state.json not found at:"
+        echo "  ${RESUME_STATE}"
+        echo "train_student.py will handle this gracefully (loads weights, starts from epoch 0)."
+    else
+        echo "  resume_state.json found OK."
+        echo "  Contents:"
+        cat "${RESUME_STATE}"
+    fi
+    echo "============================================================"
+fi
+
+
+
+# --- GPU sanity check ---
+# Runs BEFORE python training so we fail fast if cuDNN is missing.
+GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
+echo "TF physical GPUs found : ${GPU_CHECK}"
+if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
+    echo "FATAL: TensorFlow found 0 GPUs."
+    echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
+    echo "libcudnn.so.8 location:"
+    find "${CONDA_PREFIX}/lib" -name "libcudnn.so.8" 2>/dev/null
+    exit 1
+fi
+
+
+
+# --- Script existence check ---
+if [ ! -f "${SCRIPT_DIR}/train_student.py" ]; then
+    echo "FATAL: train_student.py not found in ${SCRIPT_DIR}"
+    exit 1
+fi
+echo "train_student.py found."
+echo "Starting FW-QATD-RAC student training..."
+echo "============================================================"
+
+
+
+# ============================================================================
+# Launch Python in BACKGROUND -- this is the critical fix.
+# & runs Python as a background job so the SIGUSR1 trap above fires
+# immediately when the signal arrives, rather than being deferred until
+# Python exits. `wait $PYTHON_PID` blocks the shell here and is
+# interruptible by signals, which is exactly what we need.
+# ============================================================================
+python "${SCRIPT_DIR}/train_student.py" \
+    --data-dir           "${DATA_PATH}"        \
+    --teacher-ckpt       "${TEACHER_CKPT}"     \
+    --save-dir           "${SAVE_DIR}"         \
+    --bits-kernel        "${BITS_KERNEL}"      \
+    --bits-bias          "${BITS_BIAS}"        \
+    --bits-recurrent     "${BITS_RECURRENT}"   \
+    --bits-activation    "${BITS_ACTIVATION}"  \
+    --bits-state         "${BITS_STATE}"       \
+    --student-units      "${STUDENT_UNITS}"    \
+    --teacher-units      "${TEACHER_UNITS}"    \
+    --teacher-layers     "${TEACHER_LAYERS}"   \
+    --seq-len            "${SEQ_LEN}"          \
+    --n-out              "${N_OUT}"            \
+    --gate-width-ns      "${GATE_WIDTH_NS}"    \
+    --batch-size         "${BATCH_SIZE}"       \
+    --epochs             300                   \
+    --patience           15                    \
+    --min-delta          1e-5                  \
+    --lr                 1e-4                  \
+    --lr-factor          0.5                   \
+    --lr-patience        8                     \
+    --lr-min             1e-6                  \
+    --alpha              0.5                   \
+    --beta               0.05                  \
+    --gamma              0.1                   \
+    --shadow-sync-every  1                     \
+    --log-interval       10                    \
+    --fisher-batch       4096                  \
+    --infer-batch        8192                  \
+    --prefetch-batches   32                    \
+    --pipeline-workers   4                     \
+    --split-seed         42                    \
+    ${RESUME_FLAG}                             \
+    ${MIXED_PRECISION_FLAG}                    \
+    &
+
+PYTHON_PID=$!
+echo "Python launched in background. PID=${PYTHON_PID}"
+echo "Waiting for Python to finish (wait is interruptible by SIGUSR1)..."
+
+# wait is interruptible -- SIGUSR1 will fire resubmit_handler immediately,
+# set RESUBMIT=1, and then wait resumes automatically.
+wait ${PYTHON_PID}
+EXIT_CODE=$?
+
+echo "Python process ${PYTHON_PID} exited with code: ${EXIT_CODE}"
+
+
+
+# ============================================================================
+# SIGTERM hardening: if SLURM killed Python with SIGTERM (exit 143) and
+# RESUBMIT is still 0, this means SIGUSR1 either arrived too close to
+# SIGTERM for the trap to complete, or the epoch was still running when
+# the hard kill hit. In either case, resume_state.json from the last
+# completed epoch is intact on disk -- safe to resubmit.
+# ============================================================================
+if [ "${EXIT_CODE}" = "143" ] && [ "${RESUBMIT}" = "0" ]; then
+    echo "============================================================"
+    echo "Python was killed by SIGTERM (exit 143) without a prior SIGUSR1."
+    echo "Treating as wall-time preemption. Flagging for resubmission."
+    echo "resume_state.json from the last completed epoch will be used."
+    echo "============================================================"
+    RESUBMIT=1
+fi
+
+
+
+# ============================================================================
+# STEP 6 - Auto-resubmission block
+#
+# Resubmit decision logic:
+#
+#   RESUBMIT=1 (SIGUSR1 fired, or SIGTERM hardening):
+#     Always resubmit with --resume regardless of EXIT_CODE.
+#     resume_state.json from the last completed epoch is intact on disk.
+#
+#   RESUBMIT=0 + EXIT_CODE=0 (Python finished cleanly within wall time):
+#     Read resume_state.json to check start_epoch and patience_ct.
+#     - start_epoch < 300 AND patience_ct < 15: training not done, resubmit.
+#     - start_epoch >= 300 OR patience_ct >= 15: genuinely finished, no resubmit.
+#
+#   RESUBMIT=0 + EXIT_CODE!=0 and EXIT_CODE!=143 (hard crash):
+#     Do NOT resubmit -- a crash loop would waste queue allocations.
+#     User must inspect the error and fix it manually.
+# ============================================================================
+
+RESUME_STATE_FILE="${SAVE_DIR}/results/${JOB_TAG}/resume_state.json"
+TOTAL_EPOCHS=300
+PATIENCE_LIMIT=15
+DO_RESUBMIT=0
+
+if [ "${RESUBMIT}" = "1" ]; then
+    echo "============================================================"
+    echo "RESUBMIT reason: SIGUSR1 fired or SIGTERM preemption detected."
+    DO_RESUBMIT=1
+
+elif [ "${EXIT_CODE}" = "0" ]; then
+    # Python exited cleanly -- check resume_state.json to decide if done
+    if [ -f "${RESUME_STATE_FILE}" ]; then
+        NEXT_EPOCH=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('start_epoch', 0))" 2>/dev/null)
+        PATIENCE_CT=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('patience_ct', 0))" 2>/dev/null)
+        echo "============================================================"
+        echo "Python exited 0. Checking resume_state.json..."
+        echo "  start_epoch  = ${NEXT_EPOCH}"
+        echo "  patience_ct  = ${PATIENCE_CT}"
+        echo "  total epochs = ${TOTAL_EPOCHS}"
+        echo "  patience lim = ${PATIENCE_LIMIT}"
+        if [ -n "${NEXT_EPOCH}" ] && [ "${NEXT_EPOCH}" -lt "${TOTAL_EPOCHS}" ] && \
+           [ -n "${PATIENCE_CT}" ] && [ "${PATIENCE_CT}" -lt "${PATIENCE_LIMIT}" ]; then
+            echo "  Training not complete (${NEXT_EPOCH}/${TOTAL_EPOCHS} epochs, patience ${PATIENCE_CT}/${PATIENCE_LIMIT})."
+            echo "RESUBMIT reason: clean exit but epochs remaining."
+            DO_RESUBMIT=1
+        else
+            echo "  Training complete or early-stopped. No resubmission needed."
+            DO_RESUBMIT=0
+        fi
+    else
+        echo "============================================================"
+        echo "Python exited 0 but resume_state.json not found at:"
+        echo "  ${RESUME_STATE_FILE}"
+        echo "Cannot determine training state. Not resubmitting to avoid loop."
+        echo "If training is incomplete, resubmit manually with --resume."
+        DO_RESUBMIT=0
+    fi
+
+else
+    echo "============================================================"
+    echo "Python exited with error code ${EXIT_CODE}. Not resubmitting."
+    echo "Fix the error first, then resubmit manually with --resume."
+    DO_RESUBMIT=0
+fi
+
+
+
+# --- Execute resubmission ---
+if [ "${DO_RESUBMIT}" = "1" ]; then
+    echo "AUTO-RESUBMIT: submitting next job with --resume..."
+    echo "  Script   : ${SCRIPT_DIR}/student"
+    echo "  Job name : ${SLURM_JOB_NAME}"
+    NEW_JOB_ID=$(sbatch \
+        --parsable \
+        --job-name="${SLURM_JOB_NAME}" \
+        "${SCRIPT_DIR}/student"        \
+        "${BITS_KERNEL}"               \
+        "${BITS_BIAS}"                 \
+        "${BITS_RECURRENT}"            \
+        "${BITS_ACTIVATION}"           \
+        "${BITS_STATE}"                \
+        "${STUDENT_UNITS}"             \
+        "${TEACHER_UNITS}"             \
+        "${TEACHER_LAYERS}"            \
+        "${SEQ_LEN}"                   \
+        "${N_OUT}"                     \
+        "${GATE_WIDTH_NS}"             \
+        "${BATCH_SIZE}"                \
+        "${TEACHER_CKPT}"              \
+        "--resume"                     \
+        "${MIXED_PRECISION_FLAG}"
+    )
+    SBATCH_RC=$?
+    if [ "${SBATCH_RC}" = "0" ]; then
+        echo "  Resubmitted successfully. New SLURM job ID: ${NEW_JOB_ID}"
+        echo "  Monitor with: squeue --job ${NEW_JOB_ID}"
+    else
+        echo "  ERROR: sbatch resubmission FAILED (rc=${SBATCH_RC})"
+        echo "  Resubmit manually:"
+        echo "    sbatch --job-name=${SLURM_JOB_NAME} ${SCRIPT_DIR}/student \\"
+        echo "      ${BITS_KERNEL} ${BITS_BIAS} ${BITS_RECURRENT} ${BITS_ACTIVATION} \\"
+        echo "      ${BITS_STATE} ${STUDENT_UNITS} ${TEACHER_UNITS} ${TEACHER_LAYERS} \\"
+        echo "      ${SEQ_LEN} ${N_OUT} ${GATE_WIDTH_NS} ${BATCH_SIZE} \\"
+        echo "      ${TEACHER_CKPT} --resume ${MIXED_PRECISION_FLAG}"
+    fi
+    echo "============================================================"
+fi
+
+
+
+# --- Final summary ---
+echo "============================================================"
+echo "Training Exit Code: ${EXIT_CODE}"
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "Completed successfully."
+    echo "Results in: ${SAVE_DIR}/results/${JOB_TAG}"
+    echo "  H5s   : $(find "${SAVE_DIR}/results/${JOB_TAG}" -name "*.h5"   2>/dev/null | wc -l)"
+    echo "  PNGs  : $(find "${SAVE_DIR}/results/${JOB_TAG}" -name "*.png"  2>/dev/null | wc -l)"
+    echo "  JSONs : $(find "${SAVE_DIR}/results/${JOB_TAG}" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  CSVs  : $(find "${SAVE_DIR}/results/${JOB_TAG}" -name "*.csv"  2>/dev/null | wc -l)"
+else
+    echo "FAILED or preempted (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "Hint:"
+    echo "  grep -i 'error\|traceback\|valueerror\|modulenotfound\|assertionerror' \\"
+    echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+
+
+exit ${EXIT_CODE}

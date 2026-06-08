@@ -1,0 +1,234 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:8
+#SBATCH --cpus-per-task=8
+#SBATCH --time=06:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+# ============================================================================
+# Vanilla KD Student Training
+# All 8 GPUs used via MirroredStrategy inside train_student_vanilla_kd.py.
+#
+# Usage:
+#   sbatch --job-name=vanilla_kd_T4p0_a0p7_b8k8r8a8_gru64x2_dense32_bs512 \
+#          run_student_vanilla_kd.sh \
+#          <BITS_KERNEL> <BITS_BIAS> <BITS_RECURRENT> <BITS_ACTIVATION> \
+#          <GRU_UNITS> <NUM_GRU_LAYERS> <DENSE_UNITS> <BATCH_SIZE> \
+#          <TEMPERATURE> <ALPHA> <TEACHER_WEIGHTS> <TEACHER_CONFIG> \
+#          [--mixed-precision]
+#
+# Example (8-bit, gru64x2, bs512, T=4.0, alpha=0.7):
+#   sbatch --job-name=vanilla_kd_T4p0_a0p7_b8k8r8a8_gru64x2_dense32_bs512 \
+#          run_student_vanilla_kd.sh \
+#          8 8 8 8 64 2 32 512 4.0 0.7 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/model_config.json
+# ============================================================================
+
+BITS_KERNEL=$1
+BITS_BIAS=$2
+BITS_RECURRENT=$3
+BITS_ACTIVATION=$4
+GRU_UNITS=$5
+NUM_GRU_LAYERS=$6
+DENSE_UNITS=$7
+BATCH_SIZE=$8
+TEMPERATURE=$9
+ALPHA=${10}
+TEACHER_WEIGHTS=${11}
+TEACHER_CONFIG=${12}
+MIXED_PRECISION_FLAG=${13:-""}
+
+if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"       ] || \
+   [ -z "${BITS_RECURRENT}" ] || [ -z "${BITS_ACTIVATION}" ] || \
+   [ -z "${GRU_UNITS}"      ] || [ -z "${NUM_GRU_LAYERS}"  ] || \
+   [ -z "${DENSE_UNITS}"    ] || [ -z "${BATCH_SIZE}"      ] || \
+   [ -z "${TEMPERATURE}"    ] || [ -z "${ALPHA}"           ] || \
+   [ -z "${TEACHER_WEIGHTS}"] || [ -z "${TEACHER_CONFIG}"  ]; then
+    echo "FATAL: Missing positional arguments."
+    echo "Usage: sbatch run_student_vanilla_kd.sh BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION GRU_UNITS NUM_GRU_LAYERS DENSE_UNITS BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS TEACHER_CONFIG [--mixed-precision]"
+    exit 1
+fi
+
+if [ ! -f "${TEACHER_WEIGHTS}" ]; then
+    echo "FATAL: teacher weights not found: ${TEACHER_WEIGHTS}"
+    exit 1
+fi
+
+
+
+# ============================================================================
+# STEP 1 — modules
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+# ============================================================================
+# STEP 2 — activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+# ============================================================================
+# STEP 3 — THE FIX
+# libcudnn.so.8 is in $CONDA_PREFIX/lib but LD_LIBRARY_PATH is empty on
+# this cluster. TF cannot find cuDNN without this one export.
+# Confirmed working: 8x V100 detected after this line.
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+# ============================================================================
+# STEP 4 — GPU / TF settings
+# CUDA_VISIBLE_DEVICES must be set HERE in the shell BEFORE python launches.
+# train_student_vanilla_kd.py also guards this at import time but setting it
+# here ensures SLURM's GPU isolation does not override it silently.
+# ============================================================================
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+# Do NOT set TF_FORCE_GPU_ALLOW_GROWTH here — train_student_vanilla_kd.py
+# calls set_memory_growth() programmatically via set_memory_growth(gpu, True).
+# Setting the env var and the API call together can cause a RuntimeError.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${SCRATCH_BASE}/nmi"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# --- Results subfolder: matches build_job_name() in train_student_vanilla_kd.py exactly ---
+# vanilla_kd_T{T}_a{A}_b{K}k{B}r{R}a{ACT}_gru{U}x{L}_dense{D}_bs{BS}
+TEMP_SAFE=$(echo "${TEMPERATURE}" | tr '.' 'p')
+ALPHA_SAFE=$(echo "${ALPHA}" | tr '.' 'p')
+JOB_TAG="vanilla_kd_T${TEMPERATURE}_a${ALPHA}_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}_gru${GRU_UNITS}x${NUM_GRU_LAYERS}_dense${DENSE_UNITS}_bs${BATCH_SIZE}"
+SAVE_DIR="${SCRATCH_BASE}/nmi"
+mkdir -p "${SAVE_DIR}/${JOB_TAG}"
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+
+# --- Log ---
+echo "============================================================"
+echo "VANILLA KD STUDENT TRAINING"
+echo "MirroredStrategy — all 8 GPUs"
+echo "============================================================"
+echo "SLURM JOB ID   : ${SLURM_JOBID}"
+echo "SLURM JOB NAME : ${SLURM_JOB_NAME}"
+echo "JOB TAG        : ${JOB_TAG}"
+echo "NODE           : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
+echo "GPUs available : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "DATA PATH      : ${DATA_PATH}"
+echo "SAVE DIR       : ${SAVE_DIR}/${JOB_TAG}"
+echo "SCRIPT DIR     : ${SCRIPT_DIR}"
+echo "TEACHER WEIGHTS: ${TEACHER_WEIGHTS}"
+echo "TEACHER CONFIG : ${TEACHER_CONFIG}"
+echo "TEMPERATURE    : ${TEMPERATURE}"
+echo "ALPHA          : ${ALPHA}"
+echo "BITS KERNEL    : ${BITS_KERNEL}"
+echo "BITS BIAS      : ${BITS_BIAS}"
+echo "BITS RECURRENT : ${BITS_RECURRENT}"
+echo "BITS ACTIVATION: ${BITS_ACTIVATION}"
+echo "GRU UNITS      : ${GRU_UNITS}"
+echo "NUM GRU LAYERS : ${NUM_GRU_LAYERS}"
+echo "DENSE UNITS    : ${DENSE_UNITS}"
+echo "BATCH SIZE     : ${BATCH_SIZE}"
+echo "MIXED PREC     : ${MIXED_PRECISION_FLAG:-off}"
+echo "PYTHON         : $(which python)"
+echo "TF VERSION     : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "QKERAS VERSION : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo 'n/a')"
+echo "NUMPY VERSION  : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
+
+# --- GPU sanity check ---
+# This runs BEFORE python training so we fail fast if cuDNN is missing.
+GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
+echo "TF physical GPUs found : ${GPU_CHECK}"
+if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
+    echo "FATAL: TensorFlow found 0 GPUs."
+    echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
+    echo "libcudnn.so.8 location:"
+    find "${CONDA_PREFIX}/lib" -name "libcudnn.so.8" 2>/dev/null
+    exit 1
+fi
+
+if [ ! -f "${SCRIPT_DIR}/train_student_vanilla_kd.py" ]; then
+    echo "FATAL: train_student_vanilla_kd.py not found in ${SCRIPT_DIR}"
+    exit 1
+fi
+echo "train_student_vanilla_kd.py found."
+echo "Starting vanilla KD student training..."
+echo "============================================================"
+
+python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
+    --data-dir           "${DATA_PATH}"          \
+    --save-dir           "${SAVE_DIR}"           \
+    --teacher-ckpt       "${TEACHER_WEIGHTS}"    \
+    --teacher-units      "${TEACHER_UNITS}"      \
+    --teacher-layers     "${TEACHER_LAYERS}"     \
+    --seq-len            135                     \
+    --n-out              "${DENSE_UNITS}"        \
+    --gate-width-ns      0.09                    \
+    --temperature        "${TEMPERATURE}"        \
+    --alpha              "${ALPHA}"              \
+    --bits-kernel        "${BITS_KERNEL}"        \
+    --bits-bias          "${BITS_BIAS}"          \
+    --bits-recurrent     "${BITS_RECURRENT}"     \
+    --bits-activation    "${BITS_ACTIVATION}"    \
+    --bits-state         "${BITS_KERNEL}"        \
+    --student-units      "${STUDENT_UNITS}"      \
+    --batch-size         "${BATCH_SIZE}"         \
+    --epochs             300                     \
+    --patience           15                      \
+    --min-delta          1e-5                    \
+    --lr                 1e-4                    \
+    --lr-factor          0.5                     \
+    --lr-patience        8                       \
+    --lr-min             1e-6                    \
+    --infer-batch        8192                    \
+    --log-interval       10                      \
+    --prefetch-batches   32                      \
+    --pipeline-workers   4                       \
+    --split-seed         42                      \
+    ${MIXED_PRECISION_FLAG}
+
+
+
+EXIT_CODE=$?
+
+echo "============================================================"
+echo "Training Exit Code: ${EXIT_CODE}"
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "Completed successfully."
+    echo "Results in: ${SAVE_DIR}/${JOB_TAG}"
+    echo "  H5s   : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.h5"   2>/dev/null | wc -l)"
+    echo "  PNGs  : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.png"  2>/dev/null | wc -l)"
+    echo "  JSONs : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  CSVs  : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.csv"  2>/dev/null | wc -l)"
+else
+    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "Hint:"
+    echo "  grep -i 'error\|traceback\|valueerror\|modulenotfound\|assertionerror' \\"
+    echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+exit ${EXIT_CODE}
