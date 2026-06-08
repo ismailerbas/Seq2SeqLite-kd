@@ -195,6 +195,14 @@ def parse_args():
                        "The plateau scheduler is gated and will NOT fire during warmup. "
                        "Set to 0 to disable warmup entirely."
                    ))
+    p.add_argument("--resume", action="store_true", default=False,
+                   help=(
+                       "Resume training from student_best.weights.h5 + "
+                       "resume_state.json in the job output directory. "
+                       "Restores epoch counter, best_val, patience counter, LR, "
+                       "and full loss history so training continues exactly "
+                       "where it left off."
+                   ))
 
     args = p.parse_args()
     if args.save_dir is None:
@@ -936,7 +944,9 @@ def training_loop(
     job_dir,
     pf,
 ):
-    best_ckpt = os.path.join(job_dir, "student_best.weights.h5")
+    best_ckpt   = os.path.join(job_dir, "student_best.weights.h5")
+    resume_path = os.path.join(job_dir, "resume_state.json")
+
     history = {
         "total":     [],
         "hard":      [],
@@ -948,7 +958,52 @@ def training_loop(
     }
     best_val    = float("inf")
     patience_ct = 0
+    start_epoch = 0
     nan_warn_threshold = max(1, int(train_steps * 0.10))
+
+    # ── Resume: restore weights + full training state ─────────────────────────
+    if args.resume:
+        if os.path.exists(best_ckpt) and os.path.exists(resume_path):
+            pf(f"[RESUME] Restoring weights from: {best_ckpt}")
+            sys.stdout.flush()
+            student_model.load_weights(best_ckpt)
+            pf(f"[RESUME] Weights restored OK.")
+
+            with open(resume_path, "r") as f:
+                resume_state = json.load(f)
+
+            start_epoch = int(resume_state["epoch"])
+            best_val    = float(resume_state["best_val"])
+            patience_ct = int(resume_state["patience_ct"])
+            saved_lr    = float(resume_state["lr"])
+
+            lr_scheduler.lr_var.assign(saved_lr)
+            lr_scheduler.best = best_val
+
+            if "history" in resume_state:
+                saved_hist = resume_state["history"]
+                for key in history:
+                    if key in saved_hist:
+                        history[key] = list(saved_hist[key])
+
+            pf(
+                f"[RESUME] Resuming from epoch {start_epoch + 1}  "
+                f"best_val={best_val:.6f}  patience={patience_ct}  "
+                f"lr={saved_lr:.2e}"
+            )
+            sys.stdout.flush()
+        else:
+            missing = []
+            if not os.path.exists(best_ckpt):
+                missing.append(best_ckpt)
+            if not os.path.exists(resume_path):
+                missing.append(resume_path)
+            pf(
+                f"[RESUME] WARNING: --resume set but the following files are "
+                f"missing — starting from epoch 1 instead:\n"
+                + "\n".join(f"  {p_}" for p_ in missing)
+            )
+            sys.stdout.flush()
 
     dist_train_step = make_distributed_train_step(
         strategy, student_model, optimizer, args.temperature, args.alpha
@@ -985,9 +1040,13 @@ def training_loop(
     pf(f"  Student QGRU-{args.student_units}  {args.bits_kernel}-bit kernel")
     pf(f"  SEQ_LEN={args.seq_len}  BATCH={args.batch_size}  EPOCHS={args.epochs}")
     pf(f"  Replicas={strategy.num_replicas_in_sync}")
-    pf(f"  Global BS: {args.batch_size}  "
-       f"Per-GPU BS: {args.batch_size // max(strategy.num_replicas_in_sync, 1)}")
+    pf(
+        f"  Global BS: {args.batch_size}  "
+        f"Per-GPU BS: {args.batch_size // max(strategy.num_replicas_in_sync, 1)}"
+    )
     pf(f"  Train steps/epoch={train_steps}  Val steps/epoch={val_steps}")
+    if args.resume and start_epoch > 0:
+        pf(f"  Resuming from epoch {start_epoch + 1} / {args.epochs}")
     pf(f"  Checkpoint: {best_ckpt}")
     pf("=" * 60)
     sys.stdout.flush()
@@ -995,12 +1054,15 @@ def training_loop(
     student_model.summary(print_fn=pf)
 
     csv_path = os.path.join(job_dir, "training_history.csv")
-    with open(csv_path, "w") as csv_f:
-        csv_f.write(
-            "epoch,total,hard,soft,val_total,val_hard,val_soft,val_mae,lr\n"
-        )
 
-    for epoch in range(args.epochs):
+    # Only write the CSV header if we are NOT resuming (append mode when resuming)
+    if not args.resume or start_epoch == 0:
+        with open(csv_path, "w") as csv_f:
+            csv_f.write(
+                "epoch,total,hard,soft,val_total,val_hard,val_soft,val_mae,lr\n"
+            )
+
+    for epoch in range(start_epoch, args.epochs):
         t_epoch      = time.time()
         t_batch_zero = None
 
@@ -1103,15 +1165,6 @@ def training_loop(
             )
 
         # ── LR scheduler ──────────────────────────────────────────────────────
-        # ── Large-batch warmup ──────────────────────────────────────────────
-        # During warmup epochs we linearly ramp the LR from
-        # (args.lr / args.warmup_epochs) up to args.lr so the quantized GRU
-        # gates are not hit with a large step on the very first batch.
-        # The plateau scheduler is completely suppressed during warmup so that
-        # an artificially high initial loss cannot trigger a premature LR drop.
-        # When warmup_epochs=0 this entire block is a no-op and behaviour is
-        # identical to the original script.
-        # ───────────────────────────────────────────────────────────────────
         if args.warmup_epochs > 0 and epoch < args.warmup_epochs:
             warmup_lr = float(args.lr) * float(epoch + 1) / float(args.warmup_epochs)
             lr_scheduler.lr_var.assign(warmup_lr)
@@ -1122,6 +1175,7 @@ def training_loop(
             )
         else:
             lr_scheduler.step(val_loss, epoch, pf)
+
         # ── Checkpoint best val_loss ───────────────────────────────────────────
         if val_loss < best_val - args.min_delta:
             best_val    = val_loss
@@ -1133,10 +1187,26 @@ def training_loop(
             patience_ct += 1
             pf(f"  patience {patience_ct}/{args.patience}")
             sys.stdout.flush()
-            if patience_ct >= args.patience:
-                pf(f"Early stopping at epoch {epoch + 1}")
-                sys.stdout.flush()
-                break
+
+        # ── Write resume state after EVERY epoch ──────────────────────────────
+        # Written unconditionally so a SLURM preemption at any point leaves
+        # a valid resume_state.json pointing at the last completed epoch.
+        resume_state_out = {
+            "epoch":      epoch + 1,
+            "best_val":   float(best_val),
+            "patience_ct": patience_ct,
+            "lr":         float(lr_scheduler.current_lr),
+            "history":    {k: [float(v) for v in vals]
+                           for k, vals in history.items()},
+        }
+        with open(resume_path, "w") as f:
+            json.dump(resume_state_out, f, indent=2)
+
+        # ── Early stopping ────────────────────────────────────────────────────
+        if patience_ct >= args.patience:
+            pf(f"Early stopping at epoch {epoch + 1}")
+            sys.stdout.flush()
+            break
 
     if os.path.exists(best_ckpt):
         student_model.load_weights(best_ckpt)
