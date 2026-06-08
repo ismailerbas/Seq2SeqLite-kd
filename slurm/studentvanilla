@@ -18,10 +18,10 @@
 #   $2  BITS_BIAS
 #   $3  BITS_RECURRENT
 #   $4  BITS_ACTIVATION
-#   $5  STUDENT_UNITS       (QGRU hidden units for student)
-#   $6  TEACHER_UNITS       (GRU hidden units per layer in teacher)
-#   $7  TEACHER_LAYERS      (number of stacked GRU layers in teacher)
-#   $8  N_OUT               (number of output channels, e.g. 3)
+#   $5  BITS_STATE
+#   $6  STUDENT_UNITS       (QGRU hidden units for student)
+#   $7  TEACHER_UNITS       (GRU hidden units per layer in teacher)
+#   $8  TEACHER_LAYERS      (number of stacked GRU layers in teacher)
 #   $9  BATCH_SIZE
 #   $10 TEMPERATURE
 #   $11 ALPHA
@@ -29,10 +29,9 @@
 #   $13 WARMUP_EPOCHS       (optional, default 5)
 #   $14 --mixed-precision   (optional flag, pass literally or leave empty)
 #
-# Example (4-bit, gru32, teacher gru128x2, bs1024, T=4.0, alpha=0.7):
-#   sbatch --job-name=vanilla_kd_student \
-#          slurm/studentvanilla \
-#          4 4 4 4 32 128 2 3 1024 4.0 0.7 \
+# Example (4-bit all, gru32, teacher gru128x2, bs16384, T=4.0, alpha=0.7):
+#   sbatch studentvanilla \
+#          4 4 4 4 4 32 128 2 16384 4.0 0.7 \
 #          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
 #          5
 # ============================================================================
@@ -41,10 +40,10 @@ BITS_KERNEL=$1
 BITS_BIAS=$2
 BITS_RECURRENT=$3
 BITS_ACTIVATION=$4
-STUDENT_UNITS=$5
-TEACHER_UNITS=$6
-TEACHER_LAYERS=$7
-N_OUT=$8
+BITS_STATE=$5
+STUDENT_UNITS=$6
+TEACHER_UNITS=$7
+TEACHER_LAYERS=$8
 BATCH_SIZE=$9
 TEMPERATURE=${10}
 ALPHA=${11}
@@ -54,12 +53,12 @@ MIXED_PRECISION_FLAG=${14:-""}
 
 if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"       ] || \
    [ -z "${BITS_RECURRENT}" ] || [ -z "${BITS_ACTIVATION}" ] || \
-   [ -z "${STUDENT_UNITS}"  ] || [ -z "${TEACHER_UNITS}"   ] || \
-   [ -z "${TEACHER_LAYERS}" ] || [ -z "${N_OUT}"           ] || \
+   [ -z "${BITS_STATE}"     ] || [ -z "${STUDENT_UNITS}"   ] || \
+   [ -z "${TEACHER_UNITS}"  ] || [ -z "${TEACHER_LAYERS}"  ] || \
    [ -z "${BATCH_SIZE}"     ] || [ -z "${TEMPERATURE}"     ] || \
    [ -z "${ALPHA}"          ] || [ -z "${TEACHER_WEIGHTS}" ]; then
     echo "FATAL: Missing positional arguments."
-    echo "Usage: sbatch slurm/studentvanilla BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS N_OUT BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS [WARMUP_EPOCHS] [--mixed-precision]"
+    echo "Usage: sbatch slurm/studentvanilla BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION BITS_STATE STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS [WARMUP_EPOCHS] [--mixed-precision]"
     exit 1
 fi
 
@@ -142,8 +141,8 @@ echo "BITS KERNEL         : ${BITS_KERNEL}"
 echo "BITS BIAS           : ${BITS_BIAS}"
 echo "BITS RECURRENT      : ${BITS_RECURRENT}"
 echo "BITS ACTIVATION     : ${BITS_ACTIVATION}"
+echo "BITS STATE          : ${BITS_STATE}"
 echo "STUDENT UNITS       : ${STUDENT_UNITS}"
-echo "N_OUT               : ${N_OUT}"
 echo "BATCH SIZE          : ${BATCH_SIZE}"
 echo "WARMUP EPOCHS       : ${WARMUP_EPOCHS}"
 echo "MIXED PREC          : ${MIXED_PRECISION_FLAG:-off}"
@@ -180,7 +179,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --teacher-units      "${TEACHER_UNITS}"      \
     --teacher-layers     "${TEACHER_LAYERS}"     \
     --seq-len            135                     \
-    --n-out              "${N_OUT}"              \
+    --n-out              3                       \
     --gate-width-ns      0.09                    \
     --temperature        "${TEMPERATURE}"        \
     --alpha              "${ALPHA}"              \
@@ -188,7 +187,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --bits-bias          "${BITS_BIAS}"          \
     --bits-recurrent     "${BITS_RECURRENT}"     \
     --bits-activation    "${BITS_ACTIVATION}"    \
-    --bits-state         "${BITS_KERNEL}"        \
+    --bits-state         "${BITS_STATE}"         \
     --student-units      "${STUDENT_UNITS}"      \
     --batch-size         "${BATCH_SIZE}"         \
     --epochs             300                     \
@@ -204,6 +203,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --prefetch-batches   32                      \
     --pipeline-workers   4                       \
     --split-seed         42                      \
+    --resume                                     \
     ${MIXED_PRECISION_FLAG}
 
 EXIT_CODE=$?
