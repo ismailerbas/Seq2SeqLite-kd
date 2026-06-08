@@ -10,20 +10,27 @@
 #SBATCH --mail-user=erbasi@rpi.edu
 
 # ============================================================================
-# Teacher Seq2Seq GRU Training  (Cell 5/6/7 exact notebook replica)
+# Teacher Seq2Seq GRU Training
 # All 8 GPUs used via MirroredStrategy inside train_teacher.py.
 #
-# Architecture: stacked RNN([GRUCell(128), GRUCell(128)])
-# Layer names:  encrnn / decrnn / decdense
-# Decoder input: zeros (NOT TPSF) — Algorithm 3, lines 10-11
-# Total params: 299,139
+# Positional args:
+#   $1  SEQ_LEN            (optional, default 135)
+#   $2  N_TOTAL_M          (optional, default 8)
+#   $3  BATCH_SIZE         (optional, default 16384)
+#   $4  LR                 (optional, default 8e-3)
+#   $5  EPOCHS             (optional, default 200)
+#   $6+ TEACHER_LAYERS_LIST (optional, space-separated units per layer, default "128 128")
+#                           All remaining positional args after $5 are treated
+#                           as the layers list. e.g.: 64 16  or  128  or  45 45
 #
-# Usage:
-#   sbatch --job-name=teacher_seq2seq_gru128x2_bs16384 run_teacher.sh
-#
-# Optional positional args:
-#   sbatch --job-name=teacher_seq2seq_gru128x2_bs16384 \
-#          run_teacher.sh [SEQ_LEN] [N_TOTAL_M] [BATCH_SIZE] [LR] [EPOCHS]
+# Examples:
+#   sbatch --job-name=teacher_gru128x2_bs16384 slurm/teacher
+#   sbatch --job-name=teacher_gru64x2_bs16384  slurm/teacher 135 8 16384 8e-3 200 64 64
+#   sbatch --job-name=teacher_gru64x16_bs16384 slurm/teacher 135 8 16384 8e-3 200 64 16
+#   sbatch --job-name=teacher_gru45x2_bs16384  slurm/teacher 135 8 16384 8e-3 200 45 45
+#   sbatch --job-name=teacher_gru32x2_bs16384  slurm/teacher 135 8 16384 8e-3 200 32 32
+#   sbatch --job-name=teacher_gru16x2_bs16384  slurm/teacher 135 8 16384 8e-3 200 16 16
+#   sbatch --job-name=teacher_gru128x1_bs16384 slurm/teacher 135 8 16384 8e-3 200 128
 # ============================================================================
 
 SEQ_LEN=${1:-135}
@@ -32,10 +39,16 @@ BATCH_SIZE=${3:-16384}
 LR=${4:-8e-3}
 EPOCHS=${5:-200}
 
+# Collect all remaining positional args as the layers list
+shift 5
+if [ "$#" -gt 0 ]; then
+    LAYERS_LIST="$@"
+else
+    LAYERS_LIST="128 128"
+fi
+
 # ============================================================================
 # STEP 1 — modules
-# No cuda/cudnn modules exist on this cluster — system-installed only.
-# Only gcc is needed here.
 # ============================================================================
 module purge
 module load gcc/9.3.0/1
@@ -48,9 +61,6 @@ conda activate tf210_qkeras
 
 # ============================================================================
 # STEP 3 — THE FIX
-# libcudnn.so.8 is in $CONDA_PREFIX/lib but LD_LIBRARY_PATH is empty on
-# this cluster. TF cannot find cuDNN without this one export.
-# Confirmed working: 8x V100 detected after this line.
 # ============================================================================
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
 
@@ -79,30 +89,28 @@ mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
 
 # --- Log ---
 echo "============================================================"
-echo "TEACHER SEQ2SEQ GRU TRAINING  (notebook Cell 5/6/7 replica)"
+echo "TEACHER SEQ2SEQ GRU TRAINING"
 echo "MirroredStrategy — all 8 GPUs"
 echo "============================================================"
-echo "SLURM JOB ID   : ${SLURM_JOBID}"
-echo "SLURM JOB NAME : ${SLURM_JOB_NAME}"
-echo "NODE           : $(hostname)"
-echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
-echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
-echo "GPUs available : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
-echo "GPU names      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
-echo "DATA PATH      : ${DATA_PATH}"
-echo "SCRIPT DIR     : ${SCRIPT_DIR}"
-echo "SEQ LEN        : ${SEQ_LEN}"
-echo "N TOTAL M      : ${N_TOTAL_M}"
-echo "BATCH SIZE     : ${BATCH_SIZE}"
-echo "LR             : ${LR}"
-echo "EPOCHS         : ${EPOCHS}"
-echo "ARCHITECTURE   : encrnn/decrnn = RNN([GRUCell(128), GRUCell(128)])"
-echo "DECODER INPUT  : zeros (NOT TPSF)"
-echo "EXPECTED PARAMS: 299,139"
-echo "OUTPUTS TO     : ${DATA_PATH}/teacher_best.weights.h5"
-echo "PYTHON         : $(which python)"
-echo "TF VERSION     : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
-echo "NUMPY VERSION  : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
+echo "NODE                : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH     : ${LD_LIBRARY_PATH}"
+echo "GPUs available      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "DATA PATH           : ${DATA_PATH}"
+echo "SCRIPT DIR          : ${SCRIPT_DIR}"
+echo "SEQ LEN             : ${SEQ_LEN}"
+echo "N TOTAL M           : ${N_TOTAL_M}"
+echo "BATCH SIZE          : ${BATCH_SIZE}"
+echo "LR                  : ${LR}"
+echo "EPOCHS              : ${EPOCHS}"
+echo "LAYERS LIST         : ${LAYERS_LIST}"
+echo "PYTHON              : $(which python)"
+echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
 
 # --- GPU sanity check ---
 GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
@@ -110,12 +118,9 @@ echo "TF physical GPUs found : ${GPU_CHECK}"
 if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
     echo "FATAL: TensorFlow found 0 GPUs."
     echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
-    echo "libcudnn.so.8 location:"
     find "${CONDA_PREFIX}/lib" -name "libcudnn.so.8" 2>/dev/null
     exit 1
 fi
-
-echo "============================================================"
 
 if [ ! -f "${SCRIPT_DIR}/train_teacher.py" ]; then
     echo "FATAL: train_teacher.py not found in ${SCRIPT_DIR}"
@@ -123,25 +128,29 @@ if [ ! -f "${SCRIPT_DIR}/train_teacher.py" ]; then
 fi
 echo "train_teacher.py found."
 echo "Starting teacher training..."
+echo "============================================================"
 
 python "${SCRIPT_DIR}/train_teacher.py" \
-    --data-dir       "${DATA_PATH}"   \
-    --seq-len        "${SEQ_LEN}"     \
-    --n-total-m      "${N_TOTAL_M}"   \
-    --n-out          3                \
-    --gate-width-ns  0.09             \
-    --batch-size     "${BATCH_SIZE}"  \
-    --epochs         "${EPOCHS}"      \
-    --lr             "${LR}"          \
-    --patience       8                \
-    --min-delta      1e-5             \
-    --lr-factor      0.5              \
-    --lr-patience    4                \
-    --lr-min         1e-6             \
-    --val-frac       0.1              \
-    --test-frac      0.1              \
-    --split-seed     42               \
-    --infer-batch    8192
+    --data-dir            "${DATA_PATH}"    \
+    --seq-len             "${SEQ_LEN}"      \
+    --n-total-m           "${N_TOTAL_M}"    \
+    --n-out               3                 \
+    --gate-width-ns       0.09              \
+    --batch-size          "${BATCH_SIZE}"   \
+    --epochs              "${EPOCHS}"       \
+    --lr                  "${LR}"           \
+    --patience            8                 \
+    --min-delta           1e-5              \
+    --lr-factor           0.5              \
+    --lr-patience         4                 \
+    --lr-min              1e-6              \
+    --val-frac            0.1               \
+    --test-frac           0.1               \
+    --split-seed          42                \
+    --infer-batch         8192              \
+    --prefetch-batches    32                \
+    --pipeline-workers    16                \
+    --teacher-layers-list ${LAYERS_LIST}
 
 EXIT_CODE=$?
 
@@ -149,16 +158,14 @@ echo "============================================================"
 echo "Training Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
     echo "Completed successfully."
-    echo "Outputs in: ${DATA_PATH}"
-    echo "  H5 checkpoint : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_best.weights.h5" 2>/dev/null)"
-    echo "  Split indices : $(find "${DATA_PATH}" -maxdepth 1 -name "trainidx.npy" -o -name "validx.npy" -o -name "testidx.npy" 2>/dev/null | tr '\n' ' ')"
-    echo "  PNGs  : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_*.png"  2>/dev/null | wc -l)"
-    echo "  JSONs : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_*.json" 2>/dev/null | wc -l)"
-    echo "  CSVs  : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_*.csv"  2>/dev/null | wc -l)"
+    echo "Outputs in: ${DATA_PATH}/teacher_training/"
+    echo "  Best weights : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_best.weights.h5" 2>/dev/null)"
+    echo "  PNGs  : $(find "${DATA_PATH}/teacher_training" -name "*.png"  2>/dev/null | wc -l)"
+    echo "  JSONs : $(find "${DATA_PATH}/teacher_training" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  CSVs  : $(find "${DATA_PATH}/teacher_training" -name "*.csv"  2>/dev/null | wc -l)"
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
-    echo "Hint:"
     echo "  grep -i 'error\|traceback\|valueerror\|assertionerror' \\"
     echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
 fi
