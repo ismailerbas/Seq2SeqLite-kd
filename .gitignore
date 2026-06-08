@@ -1,0 +1,44 @@
+# ── Large data files (live on GPFS, never in git) ─────────────────────────
+*.npy
+*.npy.tmp
+
+# ── Model checkpoints & weights ───────────────────────────────────────────
+*.h5
+*.hdf5
+*.weights.h5
+resume_state.json
+resume_state.json.tmp
+
+# ── Run output directories (auto-created at runtime) ──────────────────────
+teacher_training/
+student_b*/
+vanilla_kd*/
+results/
+
+# ── Python ────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.eggs/
+*.egg-info/
+dist/
+build/
+
+# ── Jupyter (keep notebooks out — use scripts) ────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Virtual environments ──────────────────────────────────────────────────
+.env
+.venv/
+env/
+venv/
+
+# ── Editor / OS noise ─────────────────────────────────────────────────────
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db

@@ -1,0 +1,23 @@
+{
+  "_comment": "Baseline teacher hyperparameters. Copy and edit for each experiment.",
+  "seq_len": 135,
+  "n_out": 3,
+  "gate_width_ns": 0.09,
+  "teacher_units": 128,
+  "teacher_layers": 2,
+  "batch_size": 2048,
+  "epochs": 300,
+  "patience": 20,
+  "min_delta": 1e-5,
+  "lr": 1e-3,
+  "lr_factor": 0.5,
+  "lr_patience": 8,
+  "lr_min": 1e-6,
+  "split_seed": 42,
+  "val_frac": 0.10,
+  "test_frac": 0.10,
+  "infer_batch": 8192,
+  "mixed_precision": false,
+  "pipeline_workers": 16,
+  "prefetch_batches": 32
+}
