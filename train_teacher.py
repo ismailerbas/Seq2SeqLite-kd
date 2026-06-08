@@ -162,8 +162,17 @@ def parse_args():
             p.error("--teacher-layers must be >= 1")
         args.layers_teacher = [args.teacher_units] * args.teacher_layers
 
-    return args
+    # Build a short human-readable tag that uniquely identifies the architecture.
+    # Used for checkpoint filename and job_dir so parallel ablation runs never
+    # overwrite each other.
+    # Examples:
+    #   [128, 128]  →  "gru128x128"
+    #   [64, 16]    →  "gru64x16"
+    #   [128]       →  "gru128"
+    #   [45, 45]    →  "gru45x45"
+    args.ckpt_tag = "gru" + "x".join(str(u) for u in args.layers_teacher)
 
+    return args
 # ---------------------------------------------------------------------------
 # STEP 3 — GPU / Strategy setup with explicit device list
 # set_memory_growth MUST be called before ANY other TF GPU operation.
@@ -749,7 +758,7 @@ def training_loop(
     train_steps, val_steps,
     args, job_dir, pf,
 ):
-    best_ckpt   = os.path.join(args.data_dir, "teacher_best.weights.h5")
+    best_ckpt   = os.path.join(args.data_dir, f"teacher_best_{args.ckpt_tag}.weights.h5")
     history     = {"train": [], "val": []}
     best_val    = float("inf")
     patience_ct = 0
@@ -868,7 +877,7 @@ def main():
     # STEP 3 — GPU strategy (explicit device list, memory growth first)
     strategy = setup_gpus_and_strategy()
 
-    job_dir = os.path.join(args.save_dir, "teacher_training")
+    job_dir = os.path.join(args.save_dir, f"teacher_training_{args.ckpt_tag}")
     os.makedirs(job_dir, exist_ok=True)
     pf(f"Job dir: {job_dir}")
 
