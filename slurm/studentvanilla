@@ -13,44 +13,53 @@
 # Vanilla KD Student Training
 # All 8 GPUs used via MirroredStrategy inside train_student_vanilla_kd.py.
 #
-# Usage:
-#   sbatch --job-name=vanilla_kd_T4p0_a0p7_b8k8r8a8_gru64x2_dense32_bs512 \
-#          run_student_vanilla_kd.sh \
-#          <BITS_KERNEL> <BITS_BIAS> <BITS_RECURRENT> <BITS_ACTIVATION> \
-#          <GRU_UNITS> <NUM_GRU_LAYERS> <DENSE_UNITS> <BATCH_SIZE> \
-#          <TEMPERATURE> <ALPHA> <TEACHER_WEIGHTS> <TEACHER_CONFIG> \
-#          [--mixed-precision]
+# Positional args:
+#   $1  BITS_KERNEL
+#   $2  BITS_BIAS
+#   $3  BITS_RECURRENT
+#   $4  BITS_ACTIVATION
+#   $5  STUDENT_UNITS       (QGRU hidden units for student)
+#   $6  TEACHER_UNITS       (GRU hidden units per layer in teacher)
+#   $7  TEACHER_LAYERS      (number of stacked GRU layers in teacher)
+#   $8  N_OUT               (number of output channels, e.g. 3)
+#   $9  BATCH_SIZE
+#   $10 TEMPERATURE
+#   $11 ALPHA
+#   $12 TEACHER_WEIGHTS     (full path to teacher_best.weights.h5)
+#   $13 WARMUP_EPOCHS       (optional, default 5)
+#   $14 --mixed-precision   (optional flag, pass literally or leave empty)
 #
-# Example (8-bit, gru64x2, bs512, T=4.0, alpha=0.7):
-#   sbatch --job-name=vanilla_kd_T4p0_a0p7_b8k8r8a8_gru64x2_dense32_bs512 \
-#          run_student_vanilla_kd.sh \
-#          8 8 8 8 64 2 32 512 4.0 0.7 \
+# Example (4-bit, gru32, teacher gru128x2, bs1024, T=4.0, alpha=0.7):
+#   sbatch --job-name=vanilla_kd_student \
+#          slurm/studentvanilla \
+#          4 4 4 4 32 128 2 3 1024 4.0 0.7 \
 #          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
-#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/model_config.json
+#          5
 # ============================================================================
 
 BITS_KERNEL=$1
 BITS_BIAS=$2
 BITS_RECURRENT=$3
 BITS_ACTIVATION=$4
-GRU_UNITS=$5
-NUM_GRU_LAYERS=$6
-DENSE_UNITS=$7
-BATCH_SIZE=$8
-TEMPERATURE=$9
-ALPHA=${10}
-TEACHER_WEIGHTS=${11}
-TEACHER_CONFIG=${12}
-MIXED_PRECISION_FLAG=${13:-""}
+STUDENT_UNITS=$5
+TEACHER_UNITS=$6
+TEACHER_LAYERS=$7
+N_OUT=$8
+BATCH_SIZE=$9
+TEMPERATURE=${10}
+ALPHA=${11}
+TEACHER_WEIGHTS=${12}
+WARMUP_EPOCHS=${13:-5}
+MIXED_PRECISION_FLAG=${14:-""}
 
 if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"       ] || \
    [ -z "${BITS_RECURRENT}" ] || [ -z "${BITS_ACTIVATION}" ] || \
-   [ -z "${GRU_UNITS}"      ] || [ -z "${NUM_GRU_LAYERS}"  ] || \
-   [ -z "${DENSE_UNITS}"    ] || [ -z "${BATCH_SIZE}"      ] || \
-   [ -z "${TEMPERATURE}"    ] || [ -z "${ALPHA}"           ] || \
-   [ -z "${TEACHER_WEIGHTS}"] || [ -z "${TEACHER_CONFIG}"  ]; then
+   [ -z "${STUDENT_UNITS}"  ] || [ -z "${TEACHER_UNITS}"   ] || \
+   [ -z "${TEACHER_LAYERS}" ] || [ -z "${N_OUT}"           ] || \
+   [ -z "${BATCH_SIZE}"     ] || [ -z "${TEMPERATURE}"     ] || \
+   [ -z "${ALPHA}"          ] || [ -z "${TEACHER_WEIGHTS}" ]; then
     echo "FATAL: Missing positional arguments."
-    echo "Usage: sbatch run_student_vanilla_kd.sh BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION GRU_UNITS NUM_GRU_LAYERS DENSE_UNITS BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS TEACHER_CONFIG [--mixed-precision]"
+    echo "Usage: sbatch slurm/studentvanilla BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS N_OUT BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS [WARMUP_EPOCHS] [--mixed-precision]"
     exit 1
 fi
 
@@ -58,8 +67,6 @@ if [ ! -f "${TEACHER_WEIGHTS}" ]; then
     echo "FATAL: teacher weights not found: ${TEACHER_WEIGHTS}"
     exit 1
 fi
-
-
 
 # ============================================================================
 # STEP 1 — modules
@@ -100,15 +107,8 @@ export OPENBLAS_NUM_THREADS=1
 # --- Paths ---
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 DATA_PATH="${SCRATCH_BASE}/nmi"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-
-# --- Results subfolder: matches build_job_name() in train_student_vanilla_kd.py exactly ---
-# vanilla_kd_T{T}_a{A}_b{K}k{B}r{R}a{ACT}_gru{U}x{L}_dense{D}_bs{BS}
-TEMP_SAFE=$(echo "${TEMPERATURE}" | tr '.' 'p')
-ALPHA_SAFE=$(echo "${ALPHA}" | tr '.' 'p')
-JOB_TAG="vanilla_kd_T${TEMPERATURE}_a${ALPHA}_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}_gru${GRU_UNITS}x${NUM_GRU_LAYERS}_dense${DENSE_UNITS}_bs${BATCH_SIZE}"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 SAVE_DIR="${SCRATCH_BASE}/nmi"
-mkdir -p "${SAVE_DIR}/${JOB_TAG}"
 
 # --- Scratch / cache dirs ---
 export TMPDIR="${SCRATCH_BASE}/tmp_pip"
@@ -123,34 +123,34 @@ echo "============================================================"
 echo "VANILLA KD STUDENT TRAINING"
 echo "MirroredStrategy — all 8 GPUs"
 echo "============================================================"
-echo "SLURM JOB ID   : ${SLURM_JOBID}"
-echo "SLURM JOB NAME : ${SLURM_JOB_NAME}"
-echo "JOB TAG        : ${JOB_TAG}"
-echo "NODE           : $(hostname)"
-echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
-echo "LD_LIBRARY_PATH: ${LD_LIBRARY_PATH}"
-echo "GPUs available : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
-echo "GPU names      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
-echo "DATA PATH      : ${DATA_PATH}"
-echo "SAVE DIR       : ${SAVE_DIR}/${JOB_TAG}"
-echo "SCRIPT DIR     : ${SCRIPT_DIR}"
-echo "TEACHER WEIGHTS: ${TEACHER_WEIGHTS}"
-echo "TEACHER CONFIG : ${TEACHER_CONFIG}"
-echo "TEMPERATURE    : ${TEMPERATURE}"
-echo "ALPHA          : ${ALPHA}"
-echo "BITS KERNEL    : ${BITS_KERNEL}"
-echo "BITS BIAS      : ${BITS_BIAS}"
-echo "BITS RECURRENT : ${BITS_RECURRENT}"
-echo "BITS ACTIVATION: ${BITS_ACTIVATION}"
-echo "GRU UNITS      : ${GRU_UNITS}"
-echo "NUM GRU LAYERS : ${NUM_GRU_LAYERS}"
-echo "DENSE UNITS    : ${DENSE_UNITS}"
-echo "BATCH SIZE     : ${BATCH_SIZE}"
-echo "MIXED PREC     : ${MIXED_PRECISION_FLAG:-off}"
-echo "PYTHON         : $(which python)"
-echo "TF VERSION     : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
-echo "QKERAS VERSION : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo 'n/a')"
-echo "NUMPY VERSION  : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
+echo "NODE                : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH     : ${LD_LIBRARY_PATH}"
+echo "GPUs available      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "DATA PATH           : ${DATA_PATH}"
+echo "SAVE DIR            : ${SAVE_DIR}"
+echo "SCRIPT DIR          : ${SCRIPT_DIR}"
+echo "TEACHER WEIGHTS     : ${TEACHER_WEIGHTS}"
+echo "TEACHER UNITS       : ${TEACHER_UNITS}"
+echo "TEACHER LAYERS      : ${TEACHER_LAYERS}"
+echo "TEMPERATURE         : ${TEMPERATURE}"
+echo "ALPHA               : ${ALPHA}"
+echo "BITS KERNEL         : ${BITS_KERNEL}"
+echo "BITS BIAS           : ${BITS_BIAS}"
+echo "BITS RECURRENT      : ${BITS_RECURRENT}"
+echo "BITS ACTIVATION     : ${BITS_ACTIVATION}"
+echo "STUDENT UNITS       : ${STUDENT_UNITS}"
+echo "N_OUT               : ${N_OUT}"
+echo "BATCH SIZE          : ${BATCH_SIZE}"
+echo "WARMUP EPOCHS       : ${WARMUP_EPOCHS}"
+echo "MIXED PREC          : ${MIXED_PRECISION_FLAG:-off}"
+echo "PYTHON              : $(which python)"
+echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "QKERAS VERSION      : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo 'n/a')"
+echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
 echo "============================================================"
 
 # --- GPU sanity check ---
@@ -169,7 +169,7 @@ if [ ! -f "${SCRIPT_DIR}/train_student_vanilla_kd.py" ]; then
     echo "FATAL: train_student_vanilla_kd.py not found in ${SCRIPT_DIR}"
     exit 1
 fi
-echo "train_student_vanilla_kd.py found."
+echo "train_student_vanilla_kd.py found at ${SCRIPT_DIR}/train_student_vanilla_kd.py"
 echo "Starting vanilla KD student training..."
 echo "============================================================"
 
@@ -180,7 +180,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --teacher-units      "${TEACHER_UNITS}"      \
     --teacher-layers     "${TEACHER_LAYERS}"     \
     --seq-len            135                     \
-    --n-out              "${DENSE_UNITS}"        \
+    --n-out              "${N_OUT}"              \
     --gate-width-ns      0.09                    \
     --temperature        "${TEMPERATURE}"        \
     --alpha              "${ALPHA}"              \
@@ -198,6 +198,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --lr-factor          0.5                     \
     --lr-patience        8                       \
     --lr-min             1e-6                    \
+    --warmup-epochs      "${WARMUP_EPOCHS}"      \
     --infer-batch        8192                    \
     --log-interval       10                      \
     --prefetch-batches   32                      \
@@ -205,19 +206,17 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --split-seed         42                      \
     ${MIXED_PRECISION_FLAG}
 
-
-
 EXIT_CODE=$?
 
 echo "============================================================"
 echo "Training Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
     echo "Completed successfully."
-    echo "Results in: ${SAVE_DIR}/${JOB_TAG}"
-    echo "  H5s   : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.h5"   2>/dev/null | wc -l)"
-    echo "  PNGs  : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.png"  2>/dev/null | wc -l)"
-    echo "  JSONs : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.json" 2>/dev/null | wc -l)"
-    echo "  CSVs  : $(find "${SAVE_DIR}/${JOB_TAG}" -name "*.csv"  2>/dev/null | wc -l)"
+    echo "Results in: ${SAVE_DIR}/results/"
+    echo "  H5s   : $(find "${SAVE_DIR}/results" -name "*.h5"   2>/dev/null | wc -l)"
+    echo "  PNGs  : $(find "${SAVE_DIR}/results" -name "*.png"  2>/dev/null | wc -l)"
+    echo "  JSONs : $(find "${SAVE_DIR}/results" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  CSVs  : $(find "${SAVE_DIR}/results" -name "*.csv"  2>/dev/null | wc -l)"
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"

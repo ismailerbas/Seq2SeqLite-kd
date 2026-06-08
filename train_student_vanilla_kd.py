@@ -184,6 +184,14 @@ def parse_args():
                    help="num_parallel_calls for tf.data map().")
     p.add_argument("--split-seed",        type=int,   default=42,
                    help="RNG seed passed to tf.keras.utils.set_random_seed.")
+    # --- warmup ---
+    p.add_argument("--warmup-epochs", type=int, default=5,
+                   help=(
+                       "Number of linear LR warmup epochs. During warmup the LR is "
+                       "ramped from (args.lr / warmup_epochs) up to args.lr linearly. "
+                       "The plateau scheduler is gated and will NOT fire during warmup. "
+                       "Set to 0 to disable warmup entirely."
+                   ))
 
     args = p.parse_args()
     if args.save_dir is None:
@@ -1084,8 +1092,25 @@ def training_loop(
             )
 
         # ── LR scheduler ──────────────────────────────────────────────────────
-        lr_scheduler.step(val_loss, epoch, pf)
-
+        # ── Large-batch warmup ──────────────────────────────────────────────
+        # During warmup epochs we linearly ramp the LR from
+        # (args.lr / args.warmup_epochs) up to args.lr so the quantized GRU
+        # gates are not hit with a large step on the very first batch.
+        # The plateau scheduler is completely suppressed during warmup so that
+        # an artificially high initial loss cannot trigger a premature LR drop.
+        # When warmup_epochs=0 this entire block is a no-op and behaviour is
+        # identical to the original script.
+        # ───────────────────────────────────────────────────────────────────
+        if args.warmup_epochs > 0 and epoch < args.warmup_epochs:
+            warmup_lr = float(args.lr) * float(epoch + 1) / float(args.warmup_epochs)
+            lr_scheduler.lr_var.assign(warmup_lr)
+            pf(
+                f"  [WARMUP] epoch {epoch + 1}/{args.warmup_epochs}  "
+                f"lr={warmup_lr:.3e}  "
+                f"(plateau scheduler suppressed during warmup)"
+            )
+        else:
+            lr_scheduler.step(val_loss, epoch, pf)
         # ── Checkpoint best val_loss ───────────────────────────────────────────
         if val_loss < best_val - args.min_delta:
             best_val    = val_loss
