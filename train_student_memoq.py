@@ -88,6 +88,7 @@ import json
 import os
 import sys
 import time
+import math
 
 # ── Force GPU visibility BEFORE any TF import ────────────────────────────────
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
@@ -278,25 +279,37 @@ def find_data_files(data_dir, seq_len):
             matches = glob.glob(os.path.join(data_dir, pat))
             if matches:
                 return sorted(matches)[0]
-        raise FileNotFoundError(f"Cannot find {desc} in {data_dir}. Tried: {patterns}")
+        raise FileNotFoundError(
+            f"Cannot find {desc} in {data_dir}. Tried: {patterns}"
+        )
 
-    file_input  = find_one([f"tpsf_seq_L{seq_len}_*.npy"], "encoder input (tpsf_seq)")
-    file_res    = find_one([f"res_L{seq_len}_*.npy"],       "decoder target (res)")
-    file_labels = find_one([f"labels_3ch_L{seq_len}_*.npy"], "labels (labels_3ch)")
+    file_input = find_one(
+        [f"tpsf_seq_L{seq_len}_*.npy"],
+        "encoder input",
+    )
+    file_res = find_one(
+        [f"res_L{seq_len}_*.npy"],
+        "decoder target",
+    )
+    file_labels = find_one(
+        [f"labels_3ch_L{seq_len}_*.npy"],
+        "labels_3ch",
+    )
 
     def find_idx(names, desc):
         for name in names:
             path = os.path.join(data_dir, name)
             if os.path.exists(path):
                 return path
-        raise FileNotFoundError(f"{desc} not found in {data_dir}. Tried: {names}")
+        raise FileNotFoundError(
+            f"{desc} not found in {data_dir}. Tried: {names}"
+        )
 
     file_train = find_idx(["trainidx.npy", "train_idx.npy"], "train index")
-    file_val   = find_idx(["validx.npy",   "val_idx.npy"],   "val index")
+    file_val   = find_idx(["validx.npy",   "val_idx.npy"],   "validation index")
     file_test  = find_idx(["testidx.npy",  "test_idx.npy"],  "test index")
 
     return file_input, file_res, file_labels, file_train, file_val, file_test
-
 
 # ==============================================================================
 # Teacher model
@@ -1930,6 +1943,17 @@ def make_dist_memoq_val_final(
 
     return dist_val_step
 
+def set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, stage):
+    q_h = quantized_bits(args.bits_kernel,     0, 1, alpha=1.0)
+    q_r = quantized_bits(args.bits_recurrent,  0, 1, alpha=1.0)
+    q_z = quantized_bits(args.bits_kernel,     0, 1, alpha=1.0)
+    q_s = quantized_bits(args.bits_state,      0, 1, alpha=1.0)
+
+    for cell in [enc_cell_p2, dec_cell_p2]:
+        cell.quantizer_h     = q_h if stage in ("P2A", "P2B", "P2C", "P3") else None
+        cell.quantizer_r     = q_r if stage in ("P2B", "P2C", "P3")        else None
+        cell.quantizer_z     = q_z if stage in ("P2C", "P3")               else None
+        cell.quantizer_state = q_s if stage in ("P3",)                     else None
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
@@ -2113,6 +2137,8 @@ def training_loop_memoq(
         transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_p2, pf)
         sys.stdout.flush()
 
+
+
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2A — Candidate gate (h) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
@@ -2120,7 +2146,9 @@ def training_loop_memoq(
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2A — Candidate gate h 4-bit ({args.memoq_stage2a_epochs} epochs)")
         pf("  Quantising W_h, U_h only. z and r gates float.")
-        pf("=" * 60)
+        if should_run("P2A"):
+            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2A")
+            pf("=" * 60)
         sys.stdout.flush()
 
         qbits_h = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
@@ -2208,6 +2236,9 @@ def training_loop_memoq(
     # PHASE 2B — Reset gate (r) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2B"):
+        if should_run("P2B"):
+            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2B")
+            pf("=" * 60)
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2B — Reset gate r 4-bit ({args.memoq_stage2b_epochs} epochs)")
         pf("  Quantising W_r, U_r. z gate float. h gate already 4-bit.")
@@ -2289,6 +2320,9 @@ def training_loop_memoq(
     # PHASE 2C — Update gate (z) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2C"):
+        if should_run("P2C"):
+            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2C")
+            pf("=" * 60)
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2C — Update gate z 4-bit ({args.memoq_stage2c_epochs} epochs)")
         pf("  All gates now 4-bit. Activating L_zsat.")
@@ -2400,15 +2434,16 @@ def training_loop_memoq(
             dist_train_p3 = make_dist_memoq_train_final(
                 strategy, final_qkeras_student, opt_p3,
                 0.5, channel_scales, args.memoq_huber_delta,
-                0.03, 0.002, 0.001, 0.0005,
+                0.03, 0.002, 0.0, 0.0005,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
                 clipnorm=0.5,
             )
+
             dist_val_p3 = make_dist_memoq_val_final(
                 strategy, final_qkeras_student,
                 0.5, channel_scales, args.memoq_huber_delta,
-                0.03, 0.002, 0.001, 0.0005,
+                0.03, 0.002, 0.0, 0.0005,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
             )
@@ -2664,7 +2699,11 @@ class MemoQGRUCell(keras.layers.Layer):
             + r * (tf.matmul(h_prev, U_h) + self.b_h_rec)
         )
 
-        h_t = (1.0 - z) * h_prev + z * h_candidate
+        h_prev_q = h_prev
+        if self._quantizer_state is not None:
+            h_prev_q = self._quantizer_state(h_prev_q)
+
+        h_t = z * h_prev_q + (1.0 - z) * h_candidate
 
         if self._quantizer_state is not None:
             h_t = self._quantizer_state(h_t)
@@ -2792,7 +2831,10 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
     enc_hidden_seq, enc_z_logit_seq, enc_final_h = enc_unroll(enc_inputs)
 
     enc_initial_h   = enc_final_h
-    enc_initial_z   = tf.zeros_like(enc_initial_h)
+    enc_initial_z = keras.layers.Lambda(
+        lambda x: tf.zeros_like(x),
+        name="enc_initial_z_zero",
+    )(enc_initial_h)
 
     dec_hidden_seq, dec_z_logit_seq, _ = dec_unroll(
         dec_inputs,
@@ -3210,30 +3252,18 @@ def make_dist_memoq_val(
 # ==============================================================================
 
 def build_final_hidden_model(final_qkeras_student):
-    """
-    Builds a side model that outputs the decoder hidden sequence from
-    the final_qkeras_student. Shares all weights (same layer objects).
+    dec_out = final_qkeras_student.get_layer("sdecgru").output
 
-    Returns Model(inputs=[enc, dec], outputs=[seq_out, dec_h_seq]).
-    The dec_h_seq comes from the sdecgru layer output[0] (return_sequences=True).
-    """
-    enc_in = final_qkeras_student.get_layer("senc_input").input
-    dec_in = final_qkeras_student.get_layer("sdec_input").input
-
-    enc_layer = final_qkeras_student.get_layer("sencgru")
-    dec_layer = final_qkeras_student.get_layer("sdecgru")
-    dense_layer = final_qkeras_student.get_layer("sdec_dense")
-
-    enc_out, enc_state = enc_layer(enc_in)
-    dec_hid_seq, _ = dec_layer(dec_in, initial_state=enc_state)
-    seq_out = dense_layer(dec_hid_seq)
+    if isinstance(dec_out, (list, tuple)):
+        dec_hid_seq = dec_out[0]
+    else:
+        dec_hid_seq = dec_out
 
     return keras.models.Model(
-        inputs=[enc_in, dec_in],
-        outputs=[seq_out, dec_hid_seq],
+        inputs=final_qkeras_student.inputs,
+        outputs=[final_qkeras_student.output, dec_hid_seq],
         name="memoq_final_hidden_model",
     )
-
 
 def make_dist_memoq_train_final(
     strategy,
@@ -3849,80 +3879,60 @@ def materialise_memoq_buffers(
 # recurrent_kernel (H, 3*H) in columns [z, r, h] order.
 # ==============================================================================
 
-def transfer_float_to_phase2(float_student, enc_cell_p2, dec_cell_p2, student_units, pf):
-    pf("[P1->P2 TRANSFER] Unpacking float GRU weights into split gate cells...")
-    H = student_units
+def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_p2, pf):
+    pf("[P1->P2 TRANSFER] Unpacking float GRU weights into split-gate cells...")
 
     def unpack_and_set(gru_layer_name, cell):
-        try:
-            layer = float_student.get_layer(gru_layer_name)
-        except ValueError:
-            pf(f"[P1->P2 TRANSFER]   WARNING: layer {gru_layer_name!r} not found in float student — skipping")
-            return
-        w = layer.get_weights()
+        layer   = float_student.get_layer(gru_layer_name)
+        weights = layer.get_weights()
+        H = cell.units
 
-        if len(w) == 3:
-            packed_kernel, packed_recurrent, packed_bias = w
+        if len(weights) != 3:
+            raise ValueError(
+                f"{gru_layer_name} expected 3 Keras GRU tensors "
+                f"[kernel, recurrent_kernel, bias], got {len(weights)}"
+            )
+
+        packed_kernel, packed_recurrent, packed_bias = weights
+
+        if packed_bias.ndim == 2:
+            packed_bias_inp = packed_bias[0]
+            packed_bias_rec = packed_bias[1]
+        else:
             packed_bias_inp = packed_bias
             packed_bias_rec = np.zeros_like(packed_bias)
-        elif len(w) == 4:
-            packed_kernel, packed_recurrent, packed_bias_inp, packed_bias_rec = w
-        else:
-            pf(f"[P1->P2 TRANSFER]   WARNING: {gru_layer_name} has {len(w)} weight tensors — expected 3 or 4, skipping")
-            return
 
-        W_z = packed_kernel[:, 0:H]
-        W_r = packed_kernel[:, H:2*H]
-        W_h = packed_kernel[:, 2*H:3*H]
-        U_z = packed_recurrent[:, 0:H]
-        U_r = packed_recurrent[:, H:2*H]
-        U_h = packed_recurrent[:, 2*H:3*H]
-        b_z_inp = packed_bias_inp[0:H]
-        b_r_inp = packed_bias_inp[H:2*H]
-        b_h_inp = packed_bias_inp[2*H:3*H]
-        b_z_rec = packed_bias_rec[0:H]
-        b_r_rec = packed_bias_rec[H:2*H]
-        b_h_rec = packed_bias_rec[2*H:3*H]
+        cell.W_z.assign(packed_kernel[:, 0:H])
+        cell.W_r.assign(packed_kernel[:, H:2 * H])
+        cell.W_h.assign(packed_kernel[:, 2 * H:3 * H])
 
-        cell.W_z.assign(W_z)
-        cell.W_r.assign(W_r)
-        cell.W_h.assign(W_h)
-        cell.U_z.assign(U_z)
-        cell.U_r.assign(U_r)
-        cell.U_h.assign(U_h)
-        cell.b_z_inp.assign(b_z_inp)
-        cell.b_r_inp.assign(b_r_inp)
-        cell.b_h_inp.assign(b_h_inp)
-        cell.b_z_rec.assign(b_z_rec)
-        cell.b_r_rec.assign(b_r_rec)
-        cell.b_h_rec.assign(b_h_rec)
+        cell.U_z.assign(packed_recurrent[:, 0:H])
+        cell.U_r.assign(packed_recurrent[:, H:2 * H])
+        cell.U_h.assign(packed_recurrent[:, 2 * H:3 * H])
+
+        cell.b_z_inp.assign(packed_bias_inp[0:H])
+        cell.b_r_inp.assign(packed_bias_inp[H:2 * H])
+        cell.b_h_inp.assign(packed_bias_inp[2 * H:3 * H])
+
+        cell.b_z_rec.assign(packed_bias_rec[0:H])
+        cell.b_r_rec.assign(packed_bias_rec[H:2 * H])
+        cell.b_h_rec.assign(packed_bias_rec[2 * H:3 * H])
 
         pf(
-            f"[P1->P2 TRANSFER]   {gru_layer_name} -> cell  "
-            f"W_z={W_z.shape}  U_z={U_z.shape}  "
-            f"b_z_inp={b_z_inp.shape}  b_z_rec={b_z_rec.shape}"
+            f"[P1->P2 TRANSFER] {gru_layer_name}: "
+            f"W={packed_kernel.shape}, U={packed_recurrent.shape}, "
+            f"bias_inp={packed_bias_inp.shape}, bias_rec={packed_bias_rec.shape}"
         )
 
     unpack_and_set("sencgru", enc_cell_p2)
     unpack_and_set("sdecgru", dec_cell_p2)
 
-    try:
-        src = float_student.get_layer("sdec_dense")
-    except ValueError:
-        pf("[P1->P2 TRANSFER]   WARNING: sdec_dense not found in float student — dense not transferred")
-        return
-
-    try:
-        dst = None
-        for layer in [float_student]:
-            pass
-
-        pf("[P1->P2 TRANSFER]   sdec_dense: transferred via phase2_model reference (done at call site)")
-    except Exception as exc:
-        pf(f"[P1->P2 TRANSFER]   sdec_dense skipped: {exc}")
+    src_dense = float_student.get_layer("sdec_dense")
+    dst_dense = phase2_model.get_layer("sdec_dense")
+    dst_dense.set_weights(src_dense.get_weights())
+    pf("[P1->P2 TRANSFER] sdec_dense transferred.")
 
     sys.stdout.flush()
-
 
 # ==============================================================================
 # save_loss_curves_memoq:
@@ -4155,75 +4165,92 @@ def parse_args():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--data-dir",           type=str,   required=True)
-    p.add_argument("--save-dir",           type=str,   default=None)
-    p.add_argument("--seq-len",            type=int,   default=135)
-    p.add_argument("--n-out",              type=int,   default=3)
-    p.add_argument("--gate-width-ns",      type=float, default=0.09)
+    p.add_argument("--data-dir",      type=str, required=True)
+    p.add_argument("--save-dir",      type=str, default=None)
+    p.add_argument("--seq-len",       type=int, default=135)
+    p.add_argument("--n-out",         type=int, default=3)
+    p.add_argument("--gate-width-ns", type=float, default=0.09)
 
-    p.add_argument("--teacher-ckpt",       type=str,   required=True)
-    p.add_argument("--teacher-units",      type=int,   default=128)
-    p.add_argument("--teacher-layers",     type=int,   default=2)
+    p.add_argument("--teacher-ckpt",   type=str, required=True)
+    p.add_argument("--teacher-units",  type=int, default=128)
+    p.add_argument("--teacher-layers", type=int, default=2)
 
-    p.add_argument("--temperature",        type=float, default=4.0)
-    p.add_argument("--alpha",              type=float, default=0.7)
+    p.add_argument("--temperature", type=float, default=4.0)
+    p.add_argument("--alpha",       type=float, default=0.7)
 
-    p.add_argument("--bits-kernel",        type=int,   default=4)
-    p.add_argument("--bits-bias",          type=int,   default=4)
-    p.add_argument("--bits-recurrent",     type=int,   default=4)
-    p.add_argument("--bits-activation",    type=int,   default=4)
-    p.add_argument("--bits-state",         type=int,   default=4)
+    p.add_argument("--bits-kernel",     type=int, default=4)
+    p.add_argument("--bits-bias",       type=int, default=4)
+    p.add_argument("--bits-recurrent",  type=int, default=4)
+    p.add_argument("--bits-activation", type=int, default=4)
+    p.add_argument("--bits-state",      type=int, default=4)
 
-    p.add_argument("--student-units",      type=int,   default=32)
+    p.add_argument("--student-units", type=int, default=32)
 
-    p.add_argument("--memoq-stage1-epochs",  type=int,   default=40)
-    p.add_argument("--memoq-stage2a-epochs", type=int,   default=30)
-    p.add_argument("--memoq-stage2b-epochs", type=int,   default=30)
-    p.add_argument("--memoq-stage2c-epochs", type=int,   default=30)
-    p.add_argument("--memoq-stage3-epochs",  type=int,   default=200)
-    p.add_argument("--memoq-innov-burnin",   type=int,   default=5)
-    p.add_argument("--memoq-lambda-innov",   type=float, default=0.005)
+    p.add_argument(
+        "--memoq-warmup-epochs", "--memoq-stage1-epochs",
+        dest="memoq_warmup_epochs", type=int, default=40,
+    )
+    p.add_argument("--memoq-stage2a-epochs", type=int, default=30)
+    p.add_argument("--memoq-stage2b-epochs", type=int, default=30)
+    p.add_argument("--memoq-stage2c-epochs", type=int, default=30)
+    p.add_argument(
+        "--memoq-finetune-epochs", "--memoq-stage3-epochs",
+        dest="memoq_stage3_epochs", type=int, default=170,
+    )
+
+    p.add_argument("--memoq-lambda-mem",   type=float, default=0.03)
+    p.add_argument("--memoq-lambda-innov", type=float, default=0.005)
+    p.add_argument("--memoq-lambda-zsat",  type=float, default=0.002)
+    p.add_argument("--memoq-lambda-rail",  type=float, default=0.001)
+
     p.add_argument("--memoq-huber-delta",    type=float, default=0.1)
+    p.add_argument("--memoq-rho-z",          type=float, default=0.98)
     p.add_argument("--memoq-rho-rail",       type=float, default=0.88)
     p.add_argument("--memoq-mu-rail",        type=float, default=0.9)
-    p.add_argument("--memoq-phase3-lr-factor", type=float, default=0.05)
+    p.add_argument("--memoq-innov-burnin",   type=int,   default=5)
 
-    p.add_argument("--batch-size",         type=int,   default=1024)
-    p.add_argument("--epochs",             type=int,   default=330)
-    p.add_argument("--lr",                 type=float, default=1e-4)
-    p.add_argument("--ref-batch-size",     type=int,   default=1024)
-    p.add_argument("--no-lr-scaling",      action="store_true", default=False)
-    p.add_argument("--lr-factor",          type=float, default=0.5)
-    p.add_argument("--lr-patience",        type=int,   default=8)
-    p.add_argument("--lr-min",             type=float, default=1e-6)
-    p.add_argument("--patience",           type=int,   default=25)
-    p.add_argument("--min-delta",          type=float, default=1e-5)
-    p.add_argument("--infer-batch",        type=int,   default=8192)
-    p.add_argument("--mixed-precision",    action="store_true", default=False)
-    p.add_argument("--log-interval",       type=int,   default=10)
-    p.add_argument("--prefetch-batches",   type=int,   default=32)
-    p.add_argument("--pipeline-workers",   type=int,   default=4)
-    p.add_argument("--split-seed",         type=int,   default=42)
-    p.add_argument("--warmup-epochs",      type=int,   default=5)
-    p.add_argument("--accumulation-steps", type=int,   default=1)
-    p.add_argument("--resume",             action="store_true", default=False)
+    p.add_argument("--memoq-phase3-lr",        type=float, default=5e-6)
+    p.add_argument("--memoq-phase3-lr-factor", type=float, default=1.0)
+
+    p.add_argument("--batch-size",        type=int,   default=1024)
+    p.add_argument("--epochs",            type=int,   default=330)
+    p.add_argument("--lr",                type=float, default=1e-4)
+    p.add_argument("--ref-batch-size",    type=int,   default=1024)
+    p.add_argument("--no-lr-scaling",     action="store_true", default=False)
+    p.add_argument("--lr-factor",         type=float, default=0.5)
+    p.add_argument("--lr-patience",       type=int,   default=8)
+    p.add_argument("--lr-min",            type=float, default=1e-6)
+    p.add_argument("--patience",          type=int,   default=30)
+    p.add_argument("--min-delta",         type=float, default=1e-5)
+    p.add_argument("--infer-batch",       type=int,   default=8192)
+    p.add_argument("--mixed-precision",   action="store_true", default=False)
+    p.add_argument("--log-interval",      type=int,   default=10)
+    p.add_argument("--prefetch-batches",  type=int,   default=32)
+    p.add_argument("--pipeline-workers",  type=int,   default=4)
+    p.add_argument("--split-seed",        type=int,   default=42)
+    p.add_argument("--warmup-epochs",     type=int,   default=5)
+    p.add_argument("--accumulation-steps", type=int,  default=1)
+    p.add_argument("--resume",            action="store_true", default=False)
 
     args = p.parse_args()
+
     if args.save_dir is None:
         args.save_dir = args.data_dir
 
+    args.memoq_stage1_epochs   = args.memoq_warmup_epochs
+    args.memoq_finetune_epochs = args.memoq_stage3_epochs
+
     scale = float(args.batch_size) / float(args.ref_batch_size)
     if args.no_lr_scaling:
-        args.effective_lr = args.lr
-        args.effective_lr_patience = args.lr_patience
-        args.effective_warmup_epochs = args.warmup_epochs
+        args.effective_lr             = args.lr
+        args.effective_lr_patience    = args.lr_patience
+        args.effective_warmup_epochs  = args.warmup_epochs
     else:
-        args.effective_lr = args.lr * scale
-        args.effective_lr_patience = max(1, int(round(args.lr_patience / scale)))
-        args.effective_warmup_epochs = max(1, int(round(args.warmup_epochs * scale)))
+        args.effective_lr             = args.lr * scale
+        args.effective_lr_patience    = max(1, int(round(args.lr_patience / scale)))
+        args.effective_warmup_epochs  = max(1, int(round(args.warmup_epochs * scale)))
 
     return args
-
 
 # ==============================================================================
 # make_job_name
@@ -4491,8 +4518,11 @@ def main():
     channel_scales = compute_channel_scales(teacher_predictions[train_idx], args.n_out, pf)
 
     # ── epsilon_innov ──────────────────────────────────────────────────────────
-    epsilon_innov = compute_epsilon_innov(teacher_hidden[train_idx], pf)
-
+    epsilon_innov = compute_epsilon_innov(
+    teacher_hidden[train_idx],
+    args.seq_len,
+    pf=pf,
+)
     # ── Materialise buffers ────────────────────────────────────────────────────
     pf("[DATA] Materialising split buffers...")
     sys.stdout.flush()
