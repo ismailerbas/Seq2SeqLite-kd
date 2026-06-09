@@ -150,8 +150,11 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SAVE_DIR="${SCRATCH_BASE}/nmi"
 
 # --- Results subfolder: deterministic tag matching train_student_vanilla_kd.py ---
-# vanilla_b{K}k{K}r{R}a{A}s{S}_gru{U}x1_dense3_bs{B}
-JOB_TAG="vanilla_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_gru${STUDENT_UNITS}x1_dense3_bs${BATCH_SIZE}"
+# make_job_name in Python now embeds effective_lr which is computed as
+# lr * (batch_size / ref_batch_size) = 1e-4 * (BATCH_SIZE / MICRO_BATCH_SIZE).
+# JOB_TAG mirrors that so mkdir -p pre-creates the correct folder and the
+# resume check path below is consistent with what Python produces.
+JOB_TAG="vanilla_kd_T${TEMPERATURE}_a${ALPHA}_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}_gru${STUDENT_UNITS}x1_dense${3}_bs${BATCH_SIZE}_lr$(python -c "print(f'{1e-4 * ${BATCH_SIZE} / ${MICRO_BATCH_SIZE}:.0e}')" 2>/dev/null || echo "1e-4")"
 mkdir -p "${SAVE_DIR}/results/${JOB_TAG}"
 
 # --- Scratch / cache dirs ---
@@ -211,11 +214,13 @@ echo "STUDENT UNITS       : ${STUDENT_UNITS}"
 echo "TEACHER UNITS       : ${TEACHER_UNITS}"
 echo "TEACHER LAYERS      : ${TEACHER_LAYERS}"
 echo "BATCH SIZE          : ${BATCH_SIZE}"
+echo "MICRO BATCH SIZE    : ${MICRO_BATCH_SIZE}"
+echo "REF BATCH SIZE      : ${MICRO_BATCH_SIZE}"
+echo "ACCUMULATION STEPS  : ${ACCUMULATION_STEPS}"
 echo "TEMPERATURE         : ${TEMPERATURE}"
 echo "ALPHA               : ${ALPHA}"
 echo "TEACHER WEIGHTS     : ${TEACHER_WEIGHTS}"
 echo "WARMUP EPOCHS       : ${WARMUP_EPOCHS}"
-echo "ACCUMULATION STEPS  : ${ACCUMULATION_STEPS}"
 echo "RESUME FLAG         : ${RESUME_FLAG:-off}"
 echo "MIXED PREC          : ${MIXED_PRECISION_FLAG:-off}"
 echo "PYTHON              : $(which python)"
@@ -299,6 +304,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --patience           15                      \
     --min-delta          1e-5                    \
     --lr                 1e-4                    \
+    --ref-batch-size     "${MICRO_BATCH_SIZE}"   \
     --lr-factor          0.5                     \
     --lr-patience        8                       \
     --lr-min             1e-6                    \
