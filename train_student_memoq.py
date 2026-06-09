@@ -152,26 +152,25 @@ def parse_args():
     p.add_argument("--student-units",  type=int, default=32)
 
     # ── MemoQ curriculum hyper-parameters ─────────────────────────────────────
-    p.add_argument("--memoq-warmup-epochs",   type=int,   default=40)
-    p.add_argument("--memoq-stage2a-epochs",  type=int,   default=30)
-    p.add_argument("--memoq-stage2b-epochs",  type=int,   default=30)
-    p.add_argument("--memoq-stage2c-epochs",  type=int,   default=30)
-    p.add_argument("--memoq-finetune-epochs", type=int,   default=170)
-    p.add_argument("--memoq-lambda-mem",      type=float, default=0.03)
-    p.add_argument("--memoq-lambda-innov",    type=float, default=0.005)
-    p.add_argument("--memoq-lambda-zsat",     type=float, default=0.002)
-    p.add_argument("--memoq-lambda-rail",     type=float, default=0.001)
-    p.add_argument("--memoq-huber-delta",     type=float, default=0.1)
-    p.add_argument("--memoq-rho-z",           type=float, default=0.98,
-                   help="Saturation barrier threshold for update gate values.")
-    p.add_argument("--memoq-rho-rail",        type=float, default=0.88,
-                   help="Rail margin threshold for hidden state.")
-    p.add_argument("--memoq-mu-rail",         type=float, default=0.9,
-                   help="Velocity weight in predictive rail loss.")
-    p.add_argument("--memoq-innov-burnin",    type=int,   default=5,
-                   help="Epochs of 2A before L_innov is activated.")
-    p.add_argument("--memoq-phase3-lr",       type=float, default=5e-6,
+    p.add_argument("--memoq-warmup-epochs",      type=int,   default=40)
+    p.add_argument("--memoq-stage2a-epochs",     type=int,   default=30)
+    p.add_argument("--memoq-stage2b-epochs",     type=int,   default=30)
+    p.add_argument("--memoq-stage2c-epochs",     type=int,   default=30)
+    p.add_argument("--memoq-finetune-epochs",    type=int,   default=170,
+                   help="Phase 3 hard 4-bit polish epochs.")
+    p.add_argument("--memoq-lambda-mem",         type=float, default=0.03)
+    p.add_argument("--memoq-lambda-innov",       type=float, default=0.005)
+    p.add_argument("--memoq-lambda-zsat",        type=float, default=0.002)
+    p.add_argument("--memoq-lambda-rail",        type=float, default=0.001)
+    p.add_argument("--memoq-huber-delta",        type=float, default=0.1)
+    p.add_argument("--memoq-rho-z",              type=float, default=0.98)
+    p.add_argument("--memoq-rho-rail",           type=float, default=0.88)
+    p.add_argument("--memoq-mu-rail",            type=float, default=0.9)
+    p.add_argument("--memoq-innov-burnin",       type=int,   default=5)
+    p.add_argument("--memoq-phase3-lr",          type=float, default=5e-6,
                    help="Fixed LR for Phase 3 hard fine-tune.")
+    p.add_argument("--memoq-phase3-lr-factor",   type=float, default=1.0,
+                   help="Multiplier on effective_lr to set Phase 3 LR; result capped at --memoq-phase3-lr.")
 
     # ── Training ──────────────────────────────────────────────────────────────
     p.add_argument("--batch-size",       type=int,   default=1024)
@@ -197,6 +196,9 @@ def parse_args():
     if args.save_dir is None:
         args.save_dir = args.data_dir
 
+    # memoq_stage3_epochs is an alias for memoq_finetune_epochs for clarity
+    args.memoq_stage3_epochs = args.memoq_finetune_epochs
+
     # ── Derived scalars ───────────────────────────────────────────────────────
     if args.no_lr_scaling:
         args.effective_lr = args.lr
@@ -209,7 +211,6 @@ def parse_args():
         args.effective_warmup_epochs = max(1, int(round(args.warmup_epochs * ratio)))
 
     return args
-
 
 # ==============================================================================
 # Job naming
@@ -767,12 +768,15 @@ def build_qkeras_student_with_hidden(seq_len, n_out, student_units,
 
 def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
     """
-    Transfer float student weights to the Phase 2 split-gate model.
-    Float student has standard GRU layers named sencgru, sdecgru with
-    packed kernels of shape (input_dim, 3*units), (units, 3*units), (2, 3*units).
-    We split them into gate variables on the split-gate cells.
+    Transfer float student weights to the Phase 2 MemoQGRUCell split-gate model.
+
+    Float student has standard GRU layers named sencgru and sdecgru with
+    packed kernels of shape (input_dim, 3*units), (units, 3*units) and
+    reset_after=True bias of shape (2, 3*units).
+
+    We split them into the separate MemoQGRUCell gate weight variables.
     """
-    pf("[TRANSFER P1->P2] Splitting packed float GRU weights into split-gate cells...")
+    pf("[TRANSFER P1->P2] Splitting packed float GRU weights into MemoQGRUCell variables...")
     units = enc_cell.units
 
     for layer_name, cell in [("sencgru", enc_cell), ("sdecgru", dec_cell)]:
@@ -783,15 +787,16 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
             continue
 
         fw = fl.get_weights()
-        # Standard Keras GRU reset_after=True: [kernel (d,3h), recurrent_kernel (h,3h), bias (2,3h)]
+        # Standard Keras GRU reset_after=True: [kernel (d,3H), recurrent_kernel (H,3H), bias (2,3H)]
         if len(fw) < 3:
             pf(f"  SKIP {layer_name} — unexpected weight count {len(fw)}")
             continue
 
-        kernel_packed     = fw[0]   # (input_dim, 3*units)
-        recurrent_packed  = fw[1]   # (units, 3*units)
-        bias_packed       = fw[2]   # (2, 3*units)
+        kernel_packed    = fw[0]   # (input_dim, 3*units)
+        recurrent_packed = fw[1]   # (units, 3*units)
+        bias_packed      = fw[2]   # (2, 3*units)
 
+        # Keras/QKeras GRU packed order: [z | r | h]
         W_z = kernel_packed[:, :units]
         W_r = kernel_packed[:, units:2*units]
         W_h = kernel_packed[:, 2*units:]
@@ -800,9 +805,14 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
         U_r = recurrent_packed[:, units:2*units]
         U_h = recurrent_packed[:, 2*units:]
 
-        b_z = bias_packed[:, :units]
-        b_r = bias_packed[:, units:2*units]
-        b_h = bias_packed[:, 2*units:]
+        # bias_packed[0] = input biases [b_z_inp | b_r_inp | b_h_inp]
+        # bias_packed[1] = recurrent biases [b_z_rec | b_r_rec | b_h_rec]
+        b_z_inp = bias_packed[0, :units]
+        b_r_inp = bias_packed[0, units:2*units]
+        b_h_inp = bias_packed[0, 2*units:]
+        b_z_rec = bias_packed[1, :units]
+        b_r_rec = bias_packed[1, units:2*units]
+        b_h_rec = bias_packed[1, 2*units:]
 
         cell.W_z.assign(W_z)
         cell.W_r.assign(W_r)
@@ -810,22 +820,27 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
         cell.U_z.assign(U_z)
         cell.U_r.assign(U_r)
         cell.U_h.assign(U_h)
-        cell.b_z.assign(b_z)
-        cell.b_r.assign(b_r)
-        cell.b_h.assign(b_h)
-        pf(f"  OK {layer_name}: kernel={kernel_packed.shape} rec={recurrent_packed.shape} bias={bias_packed.shape}")
+        cell.b_z_inp.assign(b_z_inp)
+        cell.b_r_inp.assign(b_r_inp)
+        cell.b_h_inp.assign(b_h_inp)
+        cell.b_z_rec.assign(b_z_rec)
+        cell.b_r_rec.assign(b_r_rec)
+        cell.b_h_rec.assign(b_h_rec)
 
-    # Transfer sdec_dense weights by name
+        pf(
+            f"  OK {layer_name}: kernel={kernel_packed.shape} "
+            f"rec={recurrent_packed.shape} bias={bias_packed.shape}"
+        )
+
     try:
-        float_dense  = float_model.get_layer("sdec_dense")
-        split_dense  = phase2_model.get_layer("sdec_dense")
+        float_dense = float_model.get_layer("sdec_dense")
+        split_dense = phase2_model.get_layer("sdec_dense")
         split_dense.set_weights(float_dense.get_weights())
         pf("  OK sdec_dense")
     except Exception as e:
         pf(f"  SKIP sdec_dense: {e}")
 
     sys.stdout.flush()
-
 
 def transfer_phase2_to_qkeras(enc_cell, dec_cell, phase2_model, qkeras_model, pf):
     """
@@ -1046,17 +1061,16 @@ def make_kd_dataset(enc_arr, tgt_arr, tpred_arr, thid_arr,
         tgt_b.set_shape([micro_batch_size, seq_len, n_out])
         thid_b.set_shape([micro_batch_size, seq_len, teacher_hidden_dim])
         batchx = {
-            "enc_input": enc_b,
-            "dec_input": dec_b,
-            "tpred": tpred_b,
-            "thid": thid_b,
+            "enc_input":      enc_b,
+            "dec_input":      dec_b,
+            "tpred":          tpred_b,
+            "teacher_hidden": thid_b,
         }
         return batchx, tgt_b
 
     ds = ds.map(set_shapes, num_parallel_calls=pipeline_workers)
     ds = ds.prefetch(prefetch_batches)
     return ds
-
 
 # ==============================================================================
 # Channel-normalised Huber loss
@@ -1559,219 +1573,6 @@ def make_dist_memoq_val(strategy, model,
     return step
 
 
-# ==============================================================================
-# Generic epoch runner — handles all phases.
-# For Phase 1: step fn returns (total, l_seq, l_kd, nan_flag)
-# For Phase 2/3: step fn returns (total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, nan_flag)
-# ==============================================================================
-
-def run_epoch(
-    phase_tag,
-    epoch,
-    total_epochs,
-    dist_train_dataset,
-    dist_val_dataset,
-    train_steps,
-    val_steps,
-    dist_train_step_fn,
-    dist_val_step_fn,
-    lr_scheduler,
-    effective_warmup_epochs,
-    effective_lr,
-    history,
-    best_val,
-    patience_ct,
-    patience_max,
-    min_delta,
-    best_ckpt_path,
-    model_to_save,
-    csv_path,
-    log_interval,
-    nan_warn_threshold,
-    pf,
-    epoch_in_phase=0,
-):
-    t_epoch = time.time()
-    t_batch_zero = None
-
-    acc = {
-        "total": 0.0, "seq": 0.0, "kd": 0.0,
-        "mem": 0.0, "innov": 0.0, "zsat": 0.0, "rail": 0.0,
-    }
-    acc_steps = 0
-    nan_count = 0
-
-    pf(f"\n[{phase_tag} EPOCH {epoch+1}/{total_epochs}] Training  lr={lr_scheduler.current_lr:.2e}")
-    sys.stdout.flush()
-
-    for step, (bx, by) in enumerate(dist_train_dataset):
-        if step == 0:
-            t_batch_zero = time.time()
-
-        out = dist_train_step_fn(bx, by)
-
-        # Phase 1 returns 4 values; Phase 2/3 returns 8 values
-        if len(out) == 4:
-            total, l_seq, l_kd, nan_flag = out
-            l_mem = l_innov = l_zsat = l_rail = 0.0
-        else:
-            total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, nan_flag = out
-
-        acc["total"] += float(total)
-        acc["seq"]   += float(l_seq)
-        acc["kd"]    += float(l_kd)
-        acc["mem"]   += float(l_mem)
-        acc["innov"] += float(l_innov)
-        acc["zsat"]  += float(l_zsat)
-        acc["rail"]  += float(l_rail)
-        acc_steps    += 1
-
-        if bool(nan_flag):
-            nan_count += 1
-
-        if (step + 1) % log_interval == 0 or (step + 1) == train_steps:
-            n = max(acc_steps, 1)
-            metrics_dict = {
-                "tot":  acc["total"] / n,
-                "seq":  acc["seq"]   / n,
-                "kd":   acc["kd"]    / n,
-            }
-            if acc["mem"] > 0.0:
-                metrics_dict["mem"]   = acc["mem"]   / n
-            if acc["innov"] > 0.0:
-                metrics_dict["innov"] = acc["innov"] / n
-            if acc["zsat"] > 0.0:
-                metrics_dict["zsat"]  = acc["zsat"]  / n
-            if acc["rail"] > 0.0:
-                metrics_dict["rail"]  = acc["rail"]  / n
-            bar(
-                step + 1,
-                train_steps,
-                metrics_dict,
-                epoch_start_time=t_batch_zero if t_batch_zero is not None else t_epoch,
-            )
-
-    n = max(acc_steps, 1)
-    train_total = acc["total"] / n
-    train_seq   = acc["seq"]   / n
-    train_kd    = acc["kd"]    / n
-    train_mem   = acc["mem"]   / n
-    train_innov = acc["innov"] / n
-    train_zsat  = acc["zsat"]  / n
-    train_rail  = acc["rail"]  / n
-
-    if nan_count > nan_warn_threshold:
-        pf(
-            f"\n  *** WARNING: {nan_count}/{acc_steps} batches had NaN gradients "
-            f"({100.*nan_count/n:.1f}%). Check --lr and lambda values. ***"
-        )
-        sys.stdout.flush()
-
-    # ── Validation ────────────────────────────────────────────────────────────
-    pf(f"\n[{phase_tag} EPOCH {epoch+1}/{total_epochs}] Validation...")
-    sys.stdout.flush()
-
-    vacc = {
-        "total": 0.0, "seq": 0.0, "kd": 0.0,
-        "mem": 0.0, "innov": 0.0, "zsat": 0.0, "rail": 0.0, "mae": 0.0,
-    }
-    vdone = 0
-
-    for bx, by in dist_val_dataset:
-        vout = dist_val_step_fn(bx, by)
-
-        if len(vout) == 4:
-            vt, vs, vk, vmae = vout
-            vm = vi = vz = vr = 0.0
-        else:
-            vt, vs, vk, vm, vi, vz, vr, vmae = vout
-
-        vacc["total"] += float(vt)
-        vacc["seq"]   += float(vs)
-        vacc["kd"]    += float(vk)
-        vacc["mem"]   += float(vm)
-        vacc["innov"] += float(vi)
-        vacc["zsat"]  += float(vz)
-        vacc["rail"]  += float(vr)
-        vacc["mae"]   += float(vmae)
-        vdone += 1
-
-    vn = max(vdone, 1)
-    val_total = vacc["total"] / vn
-    val_seq   = vacc["seq"]   / vn
-    val_kd    = vacc["kd"]    / vn
-    val_mem   = vacc["mem"]   / vn
-    val_innov = vacc["innov"] / vn
-    val_zsat  = vacc["zsat"]  / vn
-    val_rail  = vacc["rail"]  / vn
-    val_mae   = vacc["mae"]   / vn
-
-    elapsed = time.time() - t_epoch
-
-    history["total"].append(train_total)
-    history["seq"].append(train_seq)
-    history["kd"].append(train_kd)
-    history["mem"].append(train_mem)
-    history["innov"].append(train_innov)
-    history["zsat"].append(train_zsat)
-    history["rail"].append(train_rail)
-    history["val_total"].append(val_total)
-    history["val_seq"].append(val_seq)
-    history["val_kd"].append(val_kd)
-    history["val_mem"].append(val_mem)
-    history["val_innov"].append(val_innov)
-    history["val_zsat"].append(val_zsat)
-    history["val_rail"].append(val_rail)
-    history["val_mae"].append(val_mae)
-    history["phase"].append(phase_tag)
-
-    pf(
-        f"[{phase_tag}] ep {epoch+1:3d}/{total_epochs}  "
-        f"train={train_total:.6f}  val={val_total:.6f}  "
-        f"seq={train_seq:.6f}  kd={train_kd:.6f}  "
-        f"mem={train_mem:.6f}  innov={train_innov:.6f}  "
-        f"zsat={train_zsat:.6f}  rail={train_rail:.6f}  "
-        f"val_mae={val_mae:.6f}  lr={lr_scheduler.current_lr:.2e}  "
-        f"NaN={nan_count}  t={elapsed:.1f}s"
-    )
-    sys.stdout.flush()
-
-    with open(csv_path, "a") as f:
-        f.write(
-            f"{epoch+1},{phase_tag},"
-            f"{train_total:.8f},{train_seq:.8f},{train_kd:.8f},"
-            f"{train_mem:.8f},{train_innov:.8f},{train_zsat:.8f},{train_rail:.8f},"
-            f"{val_total:.8f},{val_seq:.8f},{val_kd:.8f},"
-            f"{val_mem:.8f},{val_innov:.8f},{val_zsat:.8f},{val_rail:.8f},"
-            f"{val_mae:.8f},{lr_scheduler.current_lr:.2e}\n"
-        )
-
-    # ── LR warmup / plateau ───────────────────────────────────────────────────
-    if effective_warmup_epochs > 0 and epoch_in_phase < effective_warmup_epochs:
-        warmup_lr = float(effective_lr) * (epoch_in_phase + 1) / float(effective_warmup_epochs)
-        lr_scheduler.lr_var.assign(warmup_lr)
-        pf(f"  [WARMUP] ep_in_phase={epoch_in_phase+1}/{effective_warmup_epochs} lr={warmup_lr:.3e}")
-    else:
-        lr_scheduler.step(val_total, epoch, pf)
-
-    # ── Checkpoint ────────────────────────────────────────────────────────────
-    early_stop = False
-    if val_total < best_val - min_delta:
-        best_val = val_total
-        patience_ct = 0
-        model_to_save.save_weights(best_ckpt_path)
-        pf(f"  ✓ [{phase_tag}] New best val={best_val:.6f}  -> {best_ckpt_path}")
-        sys.stdout.flush()
-    else:
-        patience_ct += 1
-        pf(f"  patience {patience_ct}/{patience_max}")
-        sys.stdout.flush()
-        if patience_ct >= patience_max:
-            pf(f"[{phase_tag}] Early stop at epoch {epoch+1}")
-            sys.stdout.flush()
-            early_stop = True
-
-    return history, best_val, patience_ct, early_stop
 
 
 # ==============================================================================
@@ -1781,9 +1582,7 @@ def run_epoch(
 def training_loop_memoq(
     strategy,
     float_student,
-    float_student_hidden,
-    qkeras_student,
-    qkeras_student_hidden,
+    final_qkeras_student,
     enc_cell_p2,
     dec_cell_p2,
     phase2_model,
@@ -1817,24 +1616,25 @@ def training_loop_memoq(
         + args.memoq_stage2a_epochs
         + args.memoq_stage2b_epochs
         + args.memoq_stage2c_epochs
-        + args.memoq_finetune_epochs
+        + args.memoq_stage3_epochs
     )
     global_epoch = 0
     nan_warn_threshold = max(1, int(train_steps * 0.10))
 
-    # ── Resume state ──────────────────────────────────────────────────────────
     resume_stage = "P1"
     resume_epoch_in_stage = 0
-    best_vals = {"P1": float("inf"), "P2A": float("inf"), "P2B": float("inf"),
-                 "P2C": float("inf"), "P3": float("inf")}
+    best_vals = {
+        "P1": float("inf"), "P2A": float("inf"), "P2B": float("inf"),
+        "P2C": float("inf"), "P3": float("inf"),
+    }
     patience_cts = {"P1": 0, "P2A": 0, "P2B": 0, "P2C": 0, "P3": 0}
 
     if args.resume and os.path.exists(resume_path):
         pf(f"[RESUME] {resume_path}")
         with open(resume_path) as f:
             rs = json.load(f)
-        resume_stage         = rs.get("stage", "P1")
-        resume_epoch_in_stage= int(rs.get("epoch_in_stage", 0))
+        resume_stage          = rs.get("stage", "P1")
+        resume_epoch_in_stage = int(rs.get("epoch_in_stage", 0))
         best_vals.update({k: float(v) for k, v in rs.get("best_vals", {}).items()})
         patience_cts.update({k: int(v) for k, v in rs.get("patience_cts", {}).items()})
         if "history" in rs:
@@ -1842,21 +1642,19 @@ def training_loop_memoq(
                 if key in rs["history"]:
                     history[key] = list(rs["history"][key])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage}")
-        # Load appropriate checkpoints
         stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
         stage_idx = stage_order.index(resume_stage)
         if stage_idx >= 1 and os.path.exists(p1_ckpt):
             float_student.load_weights(p1_ckpt)
-            pf(f"[RESUME] Loaded P1 weights for float_student")
+            pf("[RESUME] Loaded P1 weights for float_student")
         if stage_idx >= 2:
             ckpt = p2a_ckpt if stage_idx == 2 else (p2b_ckpt if stage_idx == 3 else p2c_ckpt)
             if os.path.exists(ckpt):
                 phase2_model.load_weights(ckpt)
                 pf(f"[RESUME] Loaded P2 weights for phase2_model from {ckpt}")
         if stage_idx >= 4 and os.path.exists(p3_ckpt):
-            qkeras_student.load_weights(p3_ckpt)
-            qkeras_student_hidden.load_weights(p3_ckpt)
-            pf(f"[RESUME] Loaded P3 weights for qkeras_student")
+            final_qkeras_student.load_weights(p3_ckpt)
+            pf("[RESUME] Loaded P3 weights for final_qkeras_student")
         sys.stdout.flush()
 
     csv_path = os.path.join(job_dir, "training_history.csv")
@@ -1872,12 +1670,14 @@ def training_loop_memoq(
 
     def save_resume(stage_tag, ep_in_stage):
         state = {
-            "stage":             stage_tag,
-            "epoch_in_stage":    ep_in_stage,
-            "best_vals":         {k: float(v) for k, v in best_vals.items()},
-            "patience_cts":      {k: int(v)   for k, v in patience_cts.items()},
-            "history":           {k: ([float(x) for x in v] if k != "phase" else list(v))
-                                  for k, v in history.items()},
+            "stage":          stage_tag,
+            "epoch_in_stage": ep_in_stage,
+            "best_vals":      {k: float(v) for k, v in best_vals.items()},
+            "patience_cts":   {k: int(v)   for k, v in patience_cts.items()},
+            "history":        {
+                k: ([float(x) for x in v] if k != "phase" else list(v))
+                for k, v in history.items()
+            },
         }
         with open(resume_path, "w") as f:
             json.dump(state, f, indent=2)
@@ -1960,18 +1760,14 @@ def training_loop_memoq(
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2A — Candidate gate (h) 4-bit quantization
-    # Quantize W_h, U_h to 4-bit. W_z, W_r, U_z, U_r remain float.
-    # L = L_seq + alpha*L_KD + 0.01*L_mem + 0.0005*L_rail
-    # After memoq_innov_burnin epochs, add L_innov with lambda=0.005
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2A"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2A — Candidate gate h 4-bit ({args.memoq_stage2a_epochs} epochs)")
-        pf(f"  Quantising W_h, U_h only. z and r gates float.")
+        pf("  Quantising W_h, U_h only. z and r gates float.")
         pf("=" * 60)
         sys.stdout.flush()
 
-        # Activate h-gate quantizer; z and r remain None (float)
         qbits_h = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
         enc_cell_p2.quantizer_h = qbits_h
         dec_cell_p2.quantizer_h = qbits_h
@@ -1999,7 +1795,7 @@ def training_loop_memoq(
             dist_train_p2a = make_dist_memoq_train(
                 strategy, phase2_model, opt_p2a,
                 args.alpha, channel_scales, args.memoq_huber_delta,
-                0.01,        lambda_i_2a,  0.0,   0.0005,
+                0.01, lambda_i_2a, 0.0, 0.0005,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
                 use_mem=True, use_innov=innov_active,
@@ -2047,6 +1843,7 @@ def training_loop_memoq(
             save_resume("P2A", ep_in_phase + 1)
             if early_stop:
                 break
+
         if os.path.exists(p2a_ckpt):
             phase2_model.load_weights(p2a_ckpt)
             pf(f"[P2A] Loaded best weights from {p2a_ckpt}")
@@ -2054,13 +1851,11 @@ def training_loop_memoq(
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2B — Reset gate (r) 4-bit quantization
-    # Quantize W_r, U_r to 4-bit. W_z, U_z remain float. W_h, U_h 4-bit.
-    # L = L_seq + alpha*L_KD + 0.03*L_mem + 0.005*L_innov + 0.001*L_rail
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2B"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2B — Reset gate r 4-bit ({args.memoq_stage2b_epochs} epochs)")
-        pf(f"  Quantising W_r, U_r. z gate float. h gate already 4-bit.")
+        pf("  Quantising W_r, U_r. z gate float. h gate already 4-bit.")
         pf("=" * 60)
         sys.stdout.flush()
 
@@ -2081,7 +1876,7 @@ def training_loop_memoq(
             dist_train_p2b = make_dist_memoq_train(
                 strategy, phase2_model, opt_p2b,
                 args.alpha, channel_scales, args.memoq_huber_delta,
-                0.03,        0.005,        0.0,   0.001,
+                0.03, 0.005, 0.0, 0.001,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
                 use_mem=True, use_innov=True,
@@ -2137,14 +1932,11 @@ def training_loop_memoq(
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2C — Update gate (z) 4-bit quantization
-    # All gate sub-matrices now 4-bit. Activate L_zsat.
-    # L = L_seq + alpha*L_KD + 0.05*L_mem + 0.005*L_innov
-    #     + 0.002*L_zsat + 0.001*L_rail
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2C"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2C — Update gate z 4-bit ({args.memoq_stage2c_epochs} epochs)")
-        pf(f"  All gates now 4-bit. Activating L_zsat.")
+        pf("  All gates now 4-bit. Activating L_zsat.")
         pf("=" * 60)
         sys.stdout.flush()
 
@@ -2165,7 +1957,7 @@ def training_loop_memoq(
             dist_train_p2c = make_dist_memoq_train(
                 strategy, phase2_model, opt_p2c,
                 args.alpha, channel_scales, args.memoq_huber_delta,
-                0.05,        0.005,        0.002, 0.001,
+                0.05, 0.005, 0.002, 0.001,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
                 use_mem=True, use_innov=True,
@@ -2220,35 +2012,27 @@ def training_loop_memoq(
             sys.stdout.flush()
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Weight export from phase2_model to final hard QKeras student.
-    # Pack split gate variables back into [W_z | W_r | W_h] per Keras GRU
-    # convention and load into standard QGRU layers.
+    # Export Phase 2 split-gate weights into final hard QKeras student
     # ══════════════════════════════════════════════════════════════════════════
     pf("=" * 60)
     pf("[EXPORT] Packing split gate weights into standard QKeras QGRU format...")
     pf("=" * 60)
     sys.stdout.flush()
 
-    transfer_splitgate_to_qkeras(
-        enc_cell_p2, dec_cell_p2, final_qkeras_student, pf
-    )
+    transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, phase2_model, final_qkeras_student, pf)
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 3 — Hard 4-bit QKeras polish
-    # All components (kernel, recurrent, bias, activation, state) hard 4-bit.
-    # L = L_seq + 0.5*L_KD + 0.03*L_mem + 0.002*L_innov
-    #     + 0.001*L_zsat + 0.0005*L_rail
-    # LR = 5e-6. clipnorm = 0.5.
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P3"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 3 — Hard 4-bit QKeras polish ({args.memoq_stage3_epochs} epochs)")
-        pf(f"  All QGRU/QDense weights hard 4-bit. LR=5e-6. clipnorm=0.5.")
-        pf(f"  Loss: L_seq+0.5*L_KD+0.03*L_mem+0.002*L_innov+0.001*L_zsat+0.0005*L_rail")
+        pf("  All QGRU/QDense weights hard 4-bit. LR=5e-6. clipnorm=0.5.")
+        pf("  Loss: L_seq+0.5*L_KD+0.03*L_mem+0.002*L_innov+0.001*L_zsat+0.0005*L_rail")
         pf("=" * 60)
         sys.stdout.flush()
 
-        lr_p3 = min(args.effective_lr * args.memoq_phase3_lr_factor, 5e-6)
+        lr_p3 = min(args.effective_lr * args.memoq_phase3_lr_factor, args.memoq_phase3_lr)
         opt_p3 = keras.optimizers.Adam(learning_rate=lr_p3)
         sched_p3 = ReduceLROnPlateau(
             opt_p3, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
@@ -2310,8 +2094,15 @@ def training_loop_memoq(
             pf(f"[P3] Loaded best phase3 weights from {p3_ckpt}")
             sys.stdout.flush()
 
-    return history, best_vals.get("P3", best_vals.get("P2C", best_vals.get("P2B", best_vals.get("P2A", best_vals.get("P1", float("inf"))))))
-
+    return history, best_vals.get(
+        "P3", best_vals.get(
+            "P2C", best_vals.get(
+                "P2B", best_vals.get(
+                    "P2A", best_vals.get("P1", float("inf"))
+                )
+            )
+        )
+    )
 
 # ==============================================================================
 # transfer_splitgate_to_qkeras:
@@ -2331,18 +2122,20 @@ def training_loop_memoq(
 #   bias[1] = recurrent bias [z|r|h]
 # ==============================================================================
 
-def transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, final_qkeras_student, pf):
+def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_student, pf):
     """
     Packs split-gate cell weights from MemoQGRUCell instances into
-    packed Keras/QKeras GRU weight format and loads into final_qkeras_student.
+    packed Keras/QKeras GRU weight format [z|r|h] and loads into
+    final_qkeras_student.
 
-    enc_cell_p2 : MemoQGRUCell used for encoder in phase2_model
-    dec_cell_p2 : MemoQGRUCell used for decoder in phase2_model
-    final_qkeras_student : Model with QGRU layers named sencgru and sdecgru
+    enc_cell              : MemoQGRUCell for encoder
+    dec_cell              : MemoQGRUCell for decoder
+    phase2_model          : the phase2 Model (used only to transfer sdec_dense)
+    final_qkeras_student  : Model with QGRU layers named sencgru and sdecgru
     """
     pf("[EXPORT] transfer_splitgate_to_qkeras: packing [W_z|W_r|W_h] / [U_z|U_r|U_h]...")
 
-    def pack_cell(cell, layer_name, model):
+    def pack_and_load(cell, layer_name, target_model):
         W_z = cell.W_z.numpy()
         W_r = cell.W_r.numpy()
         W_h = cell.W_h.numpy()
@@ -2356,52 +2149,49 @@ def transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, final_qkeras_student,
         b_r_rec = cell.b_r_rec.numpy()
         b_h_rec = cell.b_h_rec.numpy()
 
-        packed_kernel     = np.concatenate([W_z, W_r, W_h], axis=1)
-        packed_recurrent  = np.concatenate([U_z, U_r, U_h], axis=1)
-        packed_bias_inp   = np.concatenate([b_z_inp, b_r_inp, b_h_inp], axis=0)
-        packed_bias_rec   = np.concatenate([b_z_rec, b_r_rec, b_h_rec], axis=0)
-        packed_bias       = np.stack([packed_bias_inp, packed_bias_rec], axis=0)
+        packed_kernel    = np.concatenate([W_z, W_r, W_h], axis=1)
+        packed_recurrent = np.concatenate([U_z, U_r, U_h], axis=1)
+        # Keras GRU reset_after=True bias shape: (2, 3*units)
+        # row 0 = input bias [z|r|h], row 1 = recurrent bias [z|r|h]
+        packed_bias_inp  = np.concatenate([b_z_inp, b_r_inp, b_h_inp], axis=0)  # (3*units,)
+        packed_bias_rec  = np.concatenate([b_z_rec, b_r_rec, b_h_rec], axis=0)  # (3*units,)
+        packed_bias      = np.stack([packed_bias_inp, packed_bias_rec], axis=0)  # (2, 3*units)
 
-        target_layer = model.get_layer(layer_name)
+        try:
+            target_layer = target_model.get_layer(layer_name)
+        except ValueError:
+            pf(f"[EXPORT]   SKIP {layer_name} — not found in target model")
+            return
+
         q_weights = target_layer.get_weights()
+        n_w = len(q_weights)
 
-        if len(q_weights) == 3:
-            # kernel, recurrent_kernel, bias (no reset_after split)
-            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias_inp])
-            pf(f"[EXPORT]   {layer_name}: set 3 weights (no reset_after split detected)")
-        elif len(q_weights) == 4:
-            # reset_after=True: kernel, recurrent_kernel, bias_inp, bias_rec
+        if n_w == 3:
+            # kernel, recurrent_kernel, bias (2, 3*units) packed
+            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
+            pf(f"[EXPORT]   {layer_name}: set 3 weights (packed bias shape {packed_bias.shape})")
+        elif n_w == 4:
+            # Some QKeras builds expose kernel, recurrent_kernel, bias_inp (3*units,), bias_rec (3*units,)
             target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias_inp, packed_bias_rec])
-            pf(f"[EXPORT]   {layer_name}: set 4 weights (reset_after=True)")
+            pf(f"[EXPORT]   {layer_name}: set 4 weights (split bias_inp/bias_rec)")
         else:
             pf(
-                f"[EXPORT]   WARNING: {layer_name} has {len(q_weights)} weight tensors, "
-                f"expected 3 or 4. Attempting best-effort set with 4-tensor convention."
+                f"[EXPORT]   WARNING: {layer_name} has {n_w} weight tensors, "
+                f"attempting 3-weight convention."
             )
-            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias_inp, packed_bias_rec])
+            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
 
         pf(
             f"[EXPORT]   {layer_name}  kernel={packed_kernel.shape}  "
-            f"recurrent={packed_recurrent.shape}  bias_inp={packed_bias_inp.shape}  "
-            f"bias_rec={packed_bias_rec.shape}"
+            f"recurrent={packed_recurrent.shape}  bias={packed_bias.shape}"
         )
 
-    pack_cell(enc_cell_p2, "sencgru", final_qkeras_student)
-    pack_cell(dec_cell_p2, "sdecgru", final_qkeras_student)
+    pack_and_load(enc_cell, "sencgru", final_qkeras_student)
+    pack_and_load(dec_cell, "sdecgru", final_qkeras_student)
 
-    sdec_dense_src = None
-    for layer in [enc_cell_p2, dec_cell_p2]:
-        pass
-    for src_name in ["sdec_dense_cell", "sdec_dense"]:
-        try:
-            sdec_dense_src = phase2_model_ref[0].get_layer(src_name)
-            break
-        except Exception:
-            pass
-
-    pf("[EXPORT] Dense head (sdec_dense): transferring from phase2_model by layer name...")
+    pf("[EXPORT] Dense head (sdec_dense): transferring from phase2_model...")
     try:
-        src_dense = phase2_model_ref[0].get_layer("sdec_dense")
+        src_dense = phase2_model.get_layer("sdec_dense")
         dst_dense = final_qkeras_student.get_layer("sdec_dense")
         src_w = src_dense.get_weights()
         dst_w = dst_dense.get_weights()
@@ -2410,14 +2200,13 @@ def transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, final_qkeras_student,
             pf(f"[EXPORT]   sdec_dense: transferred {len(src_w)} tensors OK")
         else:
             pf(
-                f"[EXPORT]   sdec_dense: shape mismatch src={[w.shape for w in src_w]} "
-                f"dst={[w.shape for w in dst_w]} — SKIPPED"
+                f"[EXPORT]   sdec_dense: shape mismatch "
+                f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]} — SKIPPED"
             )
     except Exception as exc:
         pf(f"[EXPORT]   sdec_dense: transfer failed ({exc}) — skipped")
 
     sys.stdout.flush()
-
 
 # ==============================================================================
 # MemoQGRUCell — custom training-time GRU cell with split gate variables.
@@ -2459,29 +2248,32 @@ class MemoQGRUCell(keras.layers.Layer):
         self._quantizer_r = quantizer_r
         self._quantizer_h = quantizer_h
         self._quantizer_state = quantizer_state
-        self.state_size = units
+        # state_size must be a list so Keras RNN allocates two state tensors:
+        #   states[0] = h_prev (B, units)
+        #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
+        self.state_size = [units, units]
         self.output_size = units
 
     def build(self, input_shape):
         d = self.input_dim
         H = self.units
 
-        init = keras.initializers.GlorotUniform()
+        init  = keras.initializers.GlorotUniform()
         orth  = keras.initializers.Orthogonal()
         zeros = keras.initializers.Zeros()
 
-        self.W_z = self.add_weight(name="W_z", shape=(d, H), initializer=init,  trainable=True)
-        self.W_r = self.add_weight(name="W_r", shape=(d, H), initializer=init,  trainable=True)
-        self.W_h = self.add_weight(name="W_h", shape=(d, H), initializer=init,  trainable=True)
-        self.U_z = self.add_weight(name="U_z", shape=(H, H), initializer=orth,  trainable=True)
-        self.U_r = self.add_weight(name="U_r", shape=(H, H), initializer=orth,  trainable=True)
-        self.U_h = self.add_weight(name="U_h", shape=(H, H), initializer=orth,  trainable=True)
-        self.b_z_inp = self.add_weight(name="b_z_inp", shape=(H,), initializer=zeros, trainable=True)
-        self.b_r_inp = self.add_weight(name="b_r_inp", shape=(H,), initializer=zeros, trainable=True)
-        self.b_h_inp = self.add_weight(name="b_h_inp", shape=(H,), initializer=zeros, trainable=True)
-        self.b_z_rec = self.add_weight(name="b_z_rec", shape=(H,), initializer=zeros, trainable=True)
-        self.b_r_rec = self.add_weight(name="b_r_rec", shape=(H,), initializer=zeros, trainable=True)
-        self.b_h_rec = self.add_weight(name="b_h_rec", shape=(H,), initializer=zeros, trainable=True)
+        self.W_z     = self.add_weight(name="W_z",     shape=(d, H), initializer=init,  trainable=True)
+        self.W_r     = self.add_weight(name="W_r",     shape=(d, H), initializer=init,  trainable=True)
+        self.W_h     = self.add_weight(name="W_h",     shape=(d, H), initializer=init,  trainable=True)
+        self.U_z     = self.add_weight(name="U_z",     shape=(H, H), initializer=orth,  trainable=True)
+        self.U_r     = self.add_weight(name="U_r",     shape=(H, H), initializer=orth,  trainable=True)
+        self.U_h     = self.add_weight(name="U_h",     shape=(H, H), initializer=orth,  trainable=True)
+        self.b_z_inp = self.add_weight(name="b_z_inp", shape=(H,),   initializer=zeros, trainable=True)
+        self.b_r_inp = self.add_weight(name="b_r_inp", shape=(H,),   initializer=zeros, trainable=True)
+        self.b_h_inp = self.add_weight(name="b_h_inp", shape=(H,),   initializer=zeros, trainable=True)
+        self.b_z_rec = self.add_weight(name="b_z_rec", shape=(H,),   initializer=zeros, trainable=True)
+        self.b_r_rec = self.add_weight(name="b_r_rec", shape=(H,),   initializer=zeros, trainable=True)
+        self.b_h_rec = self.add_weight(name="b_h_rec", shape=(H,),   initializer=zeros, trainable=True)
         self.built = True
 
     def _apply_quantizer(self, q, w):
@@ -2490,7 +2282,8 @@ class MemoQGRUCell(keras.layers.Layer):
         return q(w)
 
     def call(self, inputs, states):
-        h_prev = states[0]
+        h_prev     = states[0]   # (B, units)
+        # states[1] is z_logit_prev — carried but not used in forward pass
 
         W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
         W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
@@ -2511,17 +2304,17 @@ class MemoQGRUCell(keras.layers.Layer):
         z = tf.sigmoid(z_logit)
         r = tf.sigmoid(r_logit)
 
-        h_candidate_logit = (
+        h_candidate = tf.tanh(
             tf.matmul(inputs, W_h) + self.b_h_inp
             + r * (tf.matmul(h_prev, U_h) + self.b_h_rec)
         )
-        h_candidate = tf.tanh(h_candidate_logit)
 
         h_t = (1.0 - z) * h_prev + z * h_candidate
 
         if self._quantizer_state is not None:
             h_t = self._quantizer_state(h_t)
 
+        # Return h_t as output; carry [h_t, z_logit] as states
         return h_t, [h_t, z_logit]
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
@@ -2566,7 +2359,6 @@ class MemoQGRUCell(keras.layers.Layer):
     def quantizer_state(self, q):
         self._quantizer_state = q
 
-
 # ==============================================================================
 # build_phase2_model:
 # Constructs the training-time phase2 model using MemoQGRUCell instances.
@@ -2576,6 +2368,53 @@ class MemoQGRUCell(keras.layers.Layer):
 #   dec_h_seq      : (batch, T, units) — decoder hidden trajectory for mem/innov/rail
 #   dec_z_logit_seq: (batch, T, units) — decoder z gate logits for L_zsat
 # ==============================================================================
+
+class MemoQRNNUnroll(keras.layers.Layer):
+    """
+    Manually unrolls a MemoQGRUCell over a sequence and exposes
+    both the hidden trajectory and the z_logit trajectory.
+
+    Inputs : (batch, T, input_dim)
+    Outputs: (hidden_seq (B,T,units), z_logit_seq (B,T,units), final_h (B,units))
+    """
+    def __init__(self, cell, name=None, **kwargs):
+        super().__init__(name=name, **kwargs)
+        self.cell = cell
+
+    def call(self, inputs, initial_state=None, training=None):
+        batch_size = tf.shape(inputs)[0]
+        seq_len    = tf.shape(inputs)[1]
+        units      = self.cell.units
+
+        if initial_state is None:
+            h     = tf.zeros((batch_size, units), dtype=tf.float32)
+            z_log = tf.zeros((batch_size, units), dtype=tf.float32)
+        else:
+            h     = initial_state[0]
+            z_log = initial_state[1]
+
+        h_ta = tf.TensorArray(dtype=tf.float32, size=seq_len, dynamic_size=False,
+                               element_shape=(None, units))
+        z_ta = tf.TensorArray(dtype=tf.float32, size=seq_len, dynamic_size=False,
+                               element_shape=(None, units))
+
+        for t in tf.range(seq_len):
+            x_t = inputs[:, t, :]
+            h_out, new_states = self.cell(x_t, [h, z_log], training=training)
+            h     = new_states[0]
+            z_log = new_states[1]
+            h_ta  = h_ta.write(t, h_out)
+            z_ta  = z_ta.write(t, z_log)
+
+        hidden_seq   = tf.transpose(h_ta.stack(),  [1, 0, 2])
+        z_logit_seq  = tf.transpose(z_ta.stack(),  [1, 0, 2])
+        final_h      = hidden_seq[:, -1, :]
+        return hidden_seq, z_logit_seq, final_h
+
+    def get_config(self):
+        cfg = super().get_config()
+        return cfg
+
 
 def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
     enc_cell = MemoQGRUCell(
@@ -2589,49 +2428,31 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
         name="memoq_dec_cell",
     )
 
+    enc_unroll = MemoQRNNUnroll(enc_cell, name="sencgru_unroll")
+    dec_unroll = MemoQRNNUnroll(dec_cell, name="sdecgru_unroll")
+
     enc_inputs = keras.layers.Input(shape=(None, input_dim), name="senc_input")
     dec_inputs = keras.layers.Input(shape=(None, input_dim), name="sdec_input")
 
-    enc_rnn = keras.layers.RNN(
-        enc_cell,
-        return_state=True,
-        return_sequences=False,
-        name="sencgru_rnn",
-    )
-    enc_out_and_states = enc_rnn(enc_inputs)
-    enc_h = enc_out_and_states[0]
+    enc_hidden_seq, enc_z_logit_seq, enc_final_h = enc_unroll(enc_inputs)
 
-    dec_rnn = keras.layers.RNN(
-        dec_cell,
-        return_state=True,
-        return_sequences=True,
-        name="sdecgru_rnn",
-    )
+    enc_initial_h   = enc_final_h
+    enc_initial_z   = tf.zeros_like(enc_initial_h)
 
-    initial_h = enc_h
-    initial_z_logit = tf.zeros_like(enc_h)
-    dec_outputs_and_states = dec_rnn(
+    dec_hidden_seq, dec_z_logit_seq, _ = dec_unroll(
         dec_inputs,
-        initial_state=[initial_h, initial_z_logit],
+        initial_state=[enc_initial_h, enc_initial_z],
     )
 
-    dec_h_seq_packed = dec_outputs_and_states[0]
-    dec_h_seq = dec_h_seq_packed[:, :, :student_units]
-    dec_z_logit_seq = dec_h_seq_packed[:, :, student_units:]
-
-    dec_dense_layer = keras.layers.Dense(
-        n_out, activation="linear", name="sdec_dense"
-    )
-    seq_output = dec_dense_layer(dec_h_seq)
+    seq_output = keras.layers.Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
 
     model = keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
-        outputs=[seq_output, dec_h_seq, dec_z_logit_seq],
+        outputs=[seq_output, dec_hidden_seq, dec_z_logit_seq],
         name="memoq_phase2_model",
     )
 
     return model, enc_cell, dec_cell
-
 
 # ==============================================================================
 # build_final_qkeras_student:
@@ -3352,41 +3173,46 @@ def run_epoch(
     )
     sys.stdout.flush()
 
-    with open(csv_path, "a") as csv_f:
+       with open(csv_path, "a") as csv_f:
         csv_f.write(
             f"{epoch + 1},{phase_tag},"
-            f"{train_metrics['total']:.8f},"
-            f"{train_metrics['seq']:.8f},{train_metrics['kd']:.8f},"
-            f"{train_metrics['mem']:.8f},{train_metrics['innov']:.8f},"
-            f"{train_metrics['zsat']:.8f},{train_metrics['rail']:.8f},"
-            f"{val_loss:.8f},{val_metrics['mae']:.8f},"
-            f"{lr_scheduler.current_lr:.2e}\n"
+            f"{train_metrics['total']:.8f},{train_metrics['seq']:.8f},"
+            f"{train_metrics['kd']:.8f},{train_metrics['mem']:.8f},"
+            f"{train_metrics['innov']:.8f},{train_metrics['zsat']:.8f},"
+            f"{train_metrics['rail']:.8f},"
+            f"{val_metrics['total']:.8f},{val_metrics['seq']:.8f},"
+            f"{val_metrics['kd']:.8f},{val_metrics['mem']:.8f},"
+            f"{val_metrics['innov']:.8f},{val_metrics['zsat']:.8f},"
+            f"{val_metrics['rail']:.8f},"
+            f"{val_metrics['mae']:.8f},{lr_scheduler.current_lr:.2e}\n"
         )
 
+    # ── LR warmup / plateau ───────────────────────────────────────────────────
     if effective_warmup_epochs > 0 and epoch_in_phase < effective_warmup_epochs:
-        warmup_lr = float(effective_lr) * float(epoch_in_phase + 1) / float(effective_warmup_epochs)
+        warmup_lr = float(effective_lr) * (epoch_in_phase + 1) / float(effective_warmup_epochs)
         lr_scheduler.lr_var.assign(warmup_lr)
+        pf(f"  [WARMUP] ep_in_phase={epoch_in_phase + 1}/{effective_warmup_epochs} lr={warmup_lr:.3e}")
     else:
         lr_scheduler.step(val_loss, epoch, pf)
 
+    # ── Checkpoint ────────────────────────────────────────────────────────────
     early_stop = False
     if val_loss < best_val - min_delta:
         best_val = val_loss
         patience_ct = 0
         model_to_save.save_weights(best_ckpt_path)
-        pf(f"  ✓ [{phase_tag}] New best val={best_val:.6f}  saved → {best_ckpt_path}")
+        pf(f"  ✓ [{phase_tag}] New best val={best_val:.6f}  -> {best_ckpt_path}")
         sys.stdout.flush()
     else:
         patience_ct += 1
         pf(f"  patience {patience_ct}/{patience_max}")
         sys.stdout.flush()
         if patience_ct >= patience_max:
-            pf(f"[{phase_tag}] Early stopping at epoch {epoch + 1}")
+            pf(f"[{phase_tag}] Early stop at epoch {epoch + 1}")
             sys.stdout.flush()
             early_stop = True
 
     return history, best_val, patience_ct, early_stop
-
 
 # ==============================================================================
 # cache_teacher_hidden:
@@ -4159,3 +3985,261 @@ def find_data_files(data_dir, seq_len):
     def find_idx(names, desc):
         for name in names:
             c = os
+
+
+
+
+# ==============================================================================
+# main
+# ==============================================================================
+
+def main():
+    args = parse_args()
+    pf = print
+
+    strategy = setup_gpus_and_strategy(args.mixed_precision)
+
+    # ── Job directory ──────────────────────────────────────────────────────────
+    job_name = make_job_name(args)
+    job_dir  = os.path.join(args.save_dir, "results", job_name)
+    os.makedirs(job_dir, exist_ok=True)
+    pf(f"[JOB] {job_name}")
+    pf(f"[JOB] Output dir: {job_dir}")
+    sys.stdout.flush()
+
+    with open(os.path.join(job_dir, "student_args.json"), "w") as f:
+        json.dump(vars(args), f, indent=2)
+
+    # ── Data loading ──────────────────────────────────────────────────────────
+    file_input, file_res, file_labels, file_train, file_val, file_test = find_data_files(
+        args.data_dir, args.seq_len
+    )
+    pf(f"[DATA] enc_input : {file_input}")
+    pf(f"[DATA] dec_target: {file_res}")
+    pf(f"[DATA] labels    : {file_labels}")
+    sys.stdout.flush()
+
+    raw_input = np.load(file_input,  mmap_mode="r")
+    raw_res   = np.load(file_res,    mmap_mode="r")
+    raw_labels = np.load(file_labels, mmap_mode="r")
+    train_idx  = np.load(file_train)
+    val_idx    = np.load(file_val)
+    test_idx   = np.load(file_test)
+
+    N = raw_input.shape[0]
+    pf(f"[DATA] total={N:,}  train={len(train_idx):,}  val={len(val_idx):,}  test={len(test_idx):,}")
+    sys.stdout.flush()
+
+    # ── Normalise encoder input ────────────────────────────────────────────────
+    pf("[DATA] Normalising encoder input...")
+    train_enc = raw_input[train_idx]
+    mu_enc    = float(np.mean(train_enc))
+    std_enc   = float(np.std(train_enc))
+    std_enc   = max(std_enc, 1e-6)
+    pf(f"[DATA] enc mu={mu_enc:.6f}  std={std_enc:.6f}")
+    sys.stdout.flush()
+
+    # Expand dims: (N, seq_len) -> (N, seq_len, 1)
+    if raw_input.ndim == 2:
+        normalized_input = ((raw_input.astype(np.float32) - mu_enc) / std_enc)[:, :, np.newaxis]
+    else:
+        normalized_input = (raw_input.astype(np.float32) - mu_enc) / std_enc
+
+    # res shape: (N, seq_len, n_out)
+    res = raw_res.astype(np.float32)
+
+    # ── Build teacher + cache ──────────────────────────────────────────────────
+    pf("[TEACHER] Building teacher model...")
+    sys.stdout.flush()
+
+    with strategy.scope():
+        teacher_model = build_teacher(
+            args.seq_len, args.n_out, args.teacher_units, args.teacher_layers
+        )
+
+    teacher_model.load_weights(args.teacher_ckpt)
+    pf(f"[TEACHER] Loaded weights from {args.teacher_ckpt}")
+    sys.stdout.flush()
+
+    teacher_hidden_model = build_teacher_hidden_model(teacher_model)
+
+    teacher_predictions, teacher_hidden = cache_teacher_predictions_and_hidden(
+        teacher_model=teacher_model,
+        teacher_hidden_model=teacher_hidden_model,
+        normalized_input=normalized_input,
+        seq_len=args.seq_len,
+        n_out=args.n_out,
+        teacher_units=args.teacher_units,
+        n_samples=N,
+        infer_batch=args.infer_batch,
+        data_dir=args.data_dir,
+        pf=pf,
+    )
+
+    # ── Channel scales ─────────────────────────────────────────────────────────
+    channel_scales = compute_channel_scales(teacher_predictions[train_idx], args.n_out, pf)
+
+    # ── epsilon_innov ──────────────────────────────────────────────────────────
+    epsilon_innov = compute_epsilon_innov(teacher_hidden[train_idx], pf)
+
+    # ── Materialise buffers ────────────────────────────────────────────────────
+    pf("[DATA] Materialising split buffers...")
+    sys.stdout.flush()
+
+    enc_train, tgt_train, tpred_train, thid_train = materialise_buffers(
+        normalized_input, res, teacher_predictions, teacher_hidden,
+        train_idx, args.seq_len, args.n_out, "train", pf
+    )
+    enc_val, tgt_val, tpred_val, thid_val = materialise_buffers(
+        normalized_input, res, teacher_predictions, teacher_hidden,
+        val_idx, args.seq_len, args.n_out, "val", pf
+    )
+
+    teacher_hidden_dim = teacher_hidden.shape[2]
+
+    # ── tf.data pipelines ─────────────────────────────────────────────────────
+    pf("[DATA] Building tf.data pipelines...")
+    sys.stdout.flush()
+
+    train_ds = make_kd_dataset(
+        enc_train, tgt_train, tpred_train, thid_train,
+        args.batch_size, args.seq_len, args.n_out, teacher_hidden_dim,
+        shuffle=True, seed=args.split_seed,
+        prefetch_batches=args.prefetch_batches,
+        pipeline_workers=args.pipeline_workers,
+    )
+    val_ds = make_kd_dataset(
+        enc_val, tgt_val, tpred_val, thid_val,
+        args.batch_size, args.seq_len, args.n_out, teacher_hidden_dim,
+        shuffle=False, seed=args.split_seed,
+        prefetch_batches=args.prefetch_batches,
+        pipeline_workers=args.pipeline_workers,
+    )
+
+    train_steps = len(enc_train) // args.batch_size
+    val_steps   = len(enc_val)   // args.batch_size
+
+    dist_train_ds = strategy.experimental_distribute_dataset(train_ds)
+    dist_val_ds   = strategy.experimental_distribute_dataset(val_ds)
+
+    pf(f"[DATA] train_steps={train_steps}  val_steps={val_steps}")
+    sys.stdout.flush()
+
+    # ── Build models ──────────────────────────────────────────────────────────
+    pf("[MODEL] Building float student (Phase 1)...")
+    sys.stdout.flush()
+
+    with strategy.scope():
+        float_student = build_float_student(args.seq_len, args.n_out, args.student_units)
+
+    pf("[MODEL] Building Phase 2 split-gate model...")
+    sys.stdout.flush()
+
+    with strategy.scope():
+        phase2_model, enc_cell_p2, dec_cell_p2 = build_phase2_model(
+            args.seq_len, args.n_out, args.student_units, input_dim=1
+        )
+
+    pf("[MODEL] Building final hard 4-bit QKeras student (Phase 3 / export)...")
+    sys.stdout.flush()
+
+    with strategy.scope():
+        final_qkeras_student = build_final_qkeras_student(
+            args.seq_len, args.n_out, args.student_units,
+            args.bits_kernel, args.bits_recurrent, args.bits_bias,
+            args.bits_activation, args.bits_state,
+        )
+
+    # ── Build models (print summaries) ────────────────────────────────────────
+    pf("\n[MODEL] Float student summary:")
+    float_student.summary(print_fn=pf)
+    pf("\n[MODEL] Phase2 model summary:")
+    phase2_model.summary(print_fn=pf)
+    pf("\n[MODEL] Final QKeras student summary:")
+    final_qkeras_student.summary(print_fn=pf)
+    sys.stdout.flush()
+
+    # ── Training ──────────────────────────────────────────────────────────────
+    history, best_val = training_loop_memoq(
+        strategy=strategy,
+        float_student=float_student,
+        final_qkeras_student=final_qkeras_student,
+        enc_cell_p2=enc_cell_p2,
+        dec_cell_p2=dec_cell_p2,
+        phase2_model=phase2_model,
+        args=args,
+        dist_train_dataset=dist_train_ds,
+        dist_val_dataset=dist_val_ds,
+        train_steps=train_steps,
+        val_steps=val_steps,
+        channel_scales=channel_scales,
+        epsilon_innov=epsilon_innov,
+        job_dir=job_dir,
+        pf=pf,
+    )
+
+    pf(f"[DONE] Best val loss: {best_val:.6f}")
+    sys.stdout.flush()
+
+    # ── Save final weights ─────────────────────────────────────────────────────
+    final_save = os.path.join(job_dir, "student_final.weights.h5")
+    final_qkeras_student.save_weights(final_save)
+    pf(f"[SAVE] Final weights: {final_save}")
+    sys.stdout.flush()
+
+    # ── Plot training history ──────────────────────────────────────────────────
+    try:
+        fig, axes = plt.subplots(2, 4, figsize=(20, 8))
+        axes = axes.flatten()
+        keys_to_plot = ["total", "seq", "kd", "mem", "innov", "zsat", "rail", "val_mae"]
+        for i, key in enumerate(keys_to_plot):
+            if key in history and history[key]:
+                axes[i].plot(history[key], label=key)
+            val_key = f"val_{key}" if not key.startswith("val_") else key
+            if val_key in history and history[val_key]:
+                axes[i].plot(history[val_key], label=val_key, linestyle="--")
+            axes[i].set_title(key)
+            axes[i].legend(fontsize=7)
+            axes[i].grid(True, alpha=0.3)
+        plt.tight_layout()
+        hist_png = os.path.join(job_dir, "training_history.png")
+        plt.savefig(hist_png, dpi=120, bbox_inches="tight")
+        plt.close(fig)
+        pf(f"[PLOT] Training history: {hist_png}")
+    except Exception as e:
+        pf(f"[PLOT] Warning: could not save history plot: {e}")
+    sys.stdout.flush()
+
+    # ── Test evaluation ────────────────────────────────────────────────────────
+    pf("[TEST] Evaluating on test set...")
+    sys.stdout.flush()
+
+    enc_test = normalized_input[test_idx]
+    dec_test = np.zeros((len(test_idx), args.seq_len, 1), dtype=np.float32)
+    tgt_test = res[test_idx]
+
+    n_test   = len(test_idx)
+    preds    = np.empty((n_test, args.seq_len, args.n_out), dtype=np.float32)
+    n_batches = int(np.ceil(n_test / args.infer_batch))
+
+    for b in range(n_batches):
+        s = b * args.infer_batch
+        e = min(s + args.infer_batch, n_test)
+        enc_b = tf.constant(enc_test[s:e], dtype=tf.float32)
+        dec_b = tf.constant(dec_test[s:e], dtype=tf.float32)
+        out   = final_qkeras_student([enc_b, dec_b], training=False)
+        preds[s:e] = out.numpy()
+
+    mae_test  = float(np.mean(np.abs(preds - tgt_test)))
+    rmse_test = float(np.sqrt(np.mean((preds - tgt_test) ** 2)))
+    pf(f"[TEST] MAE={mae_test:.6f}  RMSE={rmse_test:.6f}")
+
+    test_metrics = {"mae": mae_test, "rmse": rmse_test}
+    with open(os.path.join(job_dir, "test_metrics.json"), "w") as f:
+        json.dump(test_metrics, f, indent=2)
+    pf(f"[TEST] Metrics saved to {os.path.join(job_dir, 'test_metrics.json')}")
+    sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
