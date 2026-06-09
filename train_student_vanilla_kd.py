@@ -24,6 +24,9 @@ Advanced infrastructure (same as fw-qatd-rac):
   - bar() progress bar with ETA
   - evaluate_and_save: extract_lifetimes, compute_metrics, hexbin scatters
   - save_loss_curves: multi-panel PNG + CSV
+  - Linear LR scaling: lr is auto-scaled by (batch_size / ref_batch_size)
+    so large-batch runs match small-batch convergence quality.
+    lr_patience and warmup_epochs are also scaled proportionally.
 
 NOT included (fw-qatd-rac specific):
   - Fisher diagonal computation
@@ -41,12 +44,18 @@ Usage example:
       --bits-activation 4 --bits-state 4 \\
       --student-units 32 --teacher-units 128 --teacher-layers 2 \\
       --seq-len 135 --n-out 3 --gate-width-ns 0.09 \\
-      --batch-size 1024 --epochs 300 --patience 15 \\
-      --lr 1e-4 --lr-factor 0.5 --lr-patience 8 --lr-min 1e-6 \\
+      --batch-size 16384 --epochs 300 --patience 15 \\
+      --lr 1e-4 --ref-batch-size 1024 \\
+      --lr-factor 0.5 --lr-patience 8 --lr-min 1e-6 \\
       --temperature 4.0 --alpha 0.7 \\
       --log-interval 10 --infer-batch 8192 \\
       --prefetch-batches 32 --pipeline-workers 4 \\
       --split-seed 42
+
+  With --batch-size 16384 and --ref-batch-size 1024 the effective LR becomes
+  1e-4 * (16384 / 1024) = 1.6e-3, lr_patience becomes 8 * (16384/1024) = 128,
+  and warmup_epochs becomes 5 * (16384/1024) = 80.
+  Pass --no-lr-scaling to disable automatic scaling and use --lr as-is.
 
 Outputs (all inside --save-dir / results / job_name /):
   student_best.weights.h5
@@ -164,11 +173,31 @@ def parse_args():
                    help="Global batch size across all GPUs.")
     p.add_argument("--epochs",            type=int,   default=300)
     p.add_argument("--lr",                type=float, default=1e-4,
-                   help="Initial Adam learning rate.")
+                   help=(
+                       "Base learning rate at --ref-batch-size. "
+                       "Automatically scaled by (batch_size / ref_batch_size) "
+                       "unless --no-lr-scaling is set."
+                   ))
+    p.add_argument("--ref-batch-size",    type=int,   default=1024,
+                   help=(
+                       "Reference batch size for linear LR scaling. "
+                       "The effective LR = lr * (batch_size / ref_batch_size). "
+                       "Set equal to --batch-size to disable scaling, "
+                       "or use --no-lr-scaling."
+                   ))
+    p.add_argument("--no-lr-scaling",     action="store_true", default=False,
+                   help=(
+                       "Disable automatic linear LR / lr_patience / warmup_epochs "
+                       "scaling based on batch size ratio. Use --lr exactly as given."
+                   ))
     p.add_argument("--lr-factor",         type=float, default=0.5,
                    help="LR reduction factor on plateau.")
     p.add_argument("--lr-patience",       type=int,   default=8,
-                   help="Epochs without improvement before LR reduction.")
+                   help=(
+                       "Epochs without improvement before LR reduction "
+                       "(at ref_batch_size=1024). Scaled up proportionally "
+                       "when batch_size > ref_batch_size unless --no-lr-scaling."
+                   ))
     p.add_argument("--lr-min",            type=float, default=1e-6,
                    help="Minimum learning rate floor.")
     p.add_argument("--patience",          type=int,   default=15,
@@ -190,9 +219,10 @@ def parse_args():
     # --- warmup ---
     p.add_argument("--warmup-epochs", type=int, default=5,
                    help=(
-                       "Number of linear LR warmup epochs. During warmup the LR is "
-                       "ramped from (args.lr / warmup_epochs) up to args.lr linearly. "
-                       "The plateau scheduler is gated and will NOT fire during warmup. "
+                       "Number of linear LR warmup epochs at ref_batch_size=1024. "
+                       "Automatically scaled up by (batch_size / ref_batch_size) "
+                       "unless --no-lr-scaling is set, so warmup covers the same "
+                       "number of gradient updates regardless of batch size. "
                        "Set to 0 to disable warmup entirely."
                    ))
     p.add_argument("--accumulation-steps", type=int, default=1,
@@ -202,7 +232,7 @@ def parse_args():
                        "batch_size=16384 to match update frequency of batch_size=1024. "
                        "Each step processes batch_size / accumulation_steps samples "
                        "before calling apply_gradients."
-                   ))    
+                   ))
     p.add_argument("--resume", action="store_true", default=False,
                    help=(
                        "Resume training from student_best.weights.h5 + "
@@ -231,6 +261,7 @@ def make_job_name(args) -> str:
         f"_gru{args.student_units}x1"
         f"_dense{args.n_out}"
         f"_bs{args.batch_size}"
+        f"_lr{args.effective_lr:.0e}"
     )
 
 
@@ -1068,8 +1099,11 @@ def training_loop(
     pf("VANILLA KD STUDENT TRAINING")
     pf(f"  Accumulation steps : {args.accumulation_steps}")
     pf(f"  Effective batch size: {args.batch_size * args.accumulation_steps}")
-    pf(f"  LR NOTE: with accum_steps={args.accumulation_steps} and lr={args.lr:.2e}")
-    pf(f"  effective LR per real update is unchanged — accumulation handles scaling")
+    pf(f"  Base LR (at ref BS {args.ref_batch_size}): {args.lr:.2e}")
+    pf(f"  Effective LR (scaled): {args.effective_lr:.2e}")
+    pf(f"  LR scaling ratio: {args.batch_size / args.ref_batch_size:.4f}  (batch_size / ref_batch_size)")
+    pf(f"  LR patience (scaled): {args.effective_lr_patience}")
+    pf(f"  Warmup epochs (scaled): {args.effective_warmup_epochs}")
     pf(f"  alpha={args.alpha}  temperature={args.temperature}")
     pf(f"  Student QGRU-{args.student_units}  {args.bits_kernel}-bit kernel")
     pf(f"  SEQ_LEN={args.seq_len}  BATCH={args.batch_size}  EPOCHS={args.epochs}")
@@ -1199,11 +1233,11 @@ def training_loop(
             )
 
         # ── LR scheduler ──────────────────────────────────────────────────────
-        if args.warmup_epochs > 0 and epoch < args.warmup_epochs:
-            warmup_lr = float(args.lr) * float(epoch + 1) / float(args.warmup_epochs)
+        if args.effective_warmup_epochs > 0 and epoch < args.effective_warmup_epochs:
+            warmup_lr = float(args.effective_lr) * float(epoch + 1) / float(args.effective_warmup_epochs)
             lr_scheduler.lr_var.assign(warmup_lr)
             pf(
-                f"  [WARMUP] epoch {epoch + 1}/{args.warmup_epochs}  "
+                f"  [WARMUP] epoch {epoch + 1}/{args.effective_warmup_epochs}  "
                 f"lr={warmup_lr:.3e}  "
                 f"(plateau scheduler suppressed during warmup)"
             )
@@ -1287,7 +1321,8 @@ def save_loss_curves(history, best_val_loss, args, job_dir, job_name, pf):
         f"Student QGRU hidden={args.student_units}  {args.bits_kernel}-bit kernel\n"
         f"bits: k={args.bits_kernel} r={args.bits_recurrent} "
         f"b={args.bits_bias} a={args.bits_activation} s={args.bits_state}\n"
-        f"Batch size={args.batch_size}\n"
+        f"Batch size={args.batch_size}  ref_batch_size={args.ref_batch_size}\n"
+        f"Base LR={args.lr:.2e}  Effective LR={args.effective_lr:.2e}\n"
         f"Best val loss={best_val_loss:.6f}\n"
         f"Epochs run={len(history['total'])}",
         fontsize=9,
@@ -1594,6 +1629,55 @@ def main():
     args = parse_args()
     pf   = lambda s: print(s, flush=True)
 
+    # ── Linear LR scaling based on batch size ratio ───────────────────────────
+    # The linear scaling rule: when batch size increases by factor k, multiply
+    # LR by k so each gradient update sees the same expected gradient magnitude.
+    # lr_patience and warmup_epochs are scaled by the same ratio so the plateau
+    # scheduler and warmup cover the same number of gradient updates regardless
+    # of batch size.
+    #
+    # With --no-lr-scaling: use --lr, --lr-patience, --warmup-epochs exactly.
+    # With scaling (default): scale all three by (batch_size / ref_batch_size).
+    #
+    # Example: --batch-size 16384 --ref-batch-size 1024 --lr 1e-4
+    #   scaling ratio = 16384 / 1024 = 16.0
+    #   effective_lr  = 1e-4 * 16.0  = 1.6e-3
+    #   effective_lr_patience  = 8  * 16 = 128
+    #   effective_warmup_epochs = 5 * 16 = 80
+    # ─────────────────────────────────────────────────────────────────────────
+    if args.no_lr_scaling:
+        args.effective_lr             = args.lr
+        args.effective_lr_patience    = args.lr_patience
+        args.effective_warmup_epochs  = args.warmup_epochs
+        pf(
+            f"[LR SCALING] Disabled (--no-lr-scaling).  "
+            f"lr={args.effective_lr:.2e}  "
+            f"lr_patience={args.effective_lr_patience}  "
+            f"warmup_epochs={args.effective_warmup_epochs}"
+        )
+    else:
+        scaling_ratio                 = args.batch_size / args.ref_batch_size
+        args.effective_lr             = args.lr * scaling_ratio
+        args.effective_lr_patience    = max(1, round(args.lr_patience    * scaling_ratio))
+        args.effective_warmup_epochs  = max(0, round(args.warmup_epochs  * scaling_ratio))
+        pf(
+            f"[LR SCALING] batch_size={args.batch_size}  "
+            f"ref_batch_size={args.ref_batch_size}  "
+            f"ratio={scaling_ratio:.4f}"
+        )
+        pf(
+            f"[LR SCALING] base lr={args.lr:.2e}  "
+            f"→  effective lr={args.effective_lr:.2e}"
+        )
+        pf(
+            f"[LR SCALING] base lr_patience={args.lr_patience}  "
+            f"→  effective lr_patience={args.effective_lr_patience}"
+        )
+        pf(
+            f"[LR SCALING] base warmup_epochs={args.warmup_epochs}  "
+            f"→  effective warmup_epochs={args.effective_warmup_epochs}"
+        )
+
     tf.keras.utils.set_random_seed(args.split_seed)
     pf(f"Global random seed set to {args.split_seed}")
 
@@ -1690,11 +1774,11 @@ def main():
             args.bits_kernel, args.bits_recurrent, args.bits_bias,
             args.bits_activation, args.bits_state,
         )
-        optimizer    = keras.optimizers.Adam(learning_rate=args.lr)
+        optimizer    = keras.optimizers.Adam(learning_rate=args.effective_lr)
         lr_scheduler = ReduceLROnPlateau(
             optimizer,
             factor    = args.lr_factor,
-            patience  = args.lr_patience,
+            patience  = args.effective_lr_patience,
             min_lr    = args.lr_min,
             min_delta = args.min_delta,
         )
@@ -1749,6 +1833,11 @@ def main():
         f"Quantization bits : kernel={args.bits_kernel}  "
         f"recurrent={args.bits_recurrent}  bias={args.bits_bias}  "
         f"activation={args.bits_activation}  state={args.bits_state}"
+    )
+    pf(
+        f"LR scaling        : base={args.lr:.2e}  "
+        f"effective={args.effective_lr:.2e}  "
+        f"ratio={args.batch_size / args.ref_batch_size:.4f}"
     )
 
     # ── 8. Training loop ──────────────────────────────────────────────────────
