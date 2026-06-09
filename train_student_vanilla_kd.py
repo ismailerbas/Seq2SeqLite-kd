@@ -207,7 +207,13 @@ def parse_args():
     p.add_argument("--infer-batch",       type=int,   default=8192,
                    help="Batch size for teacher cache inference and test evaluation.")
     p.add_argument("--mixed-precision",   action="store_true", default=False,
-                   help="Enable float16 mixed precision training.")
+                   help=(
+                       "DISABLED — accepted for CLI compatibility but has no effect. "
+                       "QKeras QGRU/QDense layers are incompatible with mixed_float16 "
+                       "policy on TF 2.10: the quantized kernel stays float32 while "
+                       "activations become float16, causing a MatMul dtype mismatch. "
+                       "Training always runs in float32 regardless of this flag."
+                   ))
     p.add_argument("--log-interval",      type=int,   default=10,
                    help="Print progress bar every N steps.")
     p.add_argument("--prefetch-batches",  type=int,   default=32,
@@ -246,7 +252,6 @@ def parse_args():
     if args.save_dir is None:
         args.save_dir = args.data_dir
     return args
-
 
 # ==============================================================================
 # Job naming / output directory
@@ -307,11 +312,30 @@ def setup_gpus_and_strategy(mixed_precision: bool):
         print("[STEP 2] No logical GPUs available — falling back to CPU.", flush=True)
         return tf.distribute.get_strategy()
 
+    # ── Mixed precision guard ─────────────────────────────────────────────────
+    # QKeras QGRU and QDense layers are INCOMPATIBLE with mixed_float16 policy
+    # on TF 2.10. When mixed_float16 is active, Keras casts layer inputs to
+    # float16 but QKeras materialises its quantized kernels as float32 and does
+    # not override compute_dtype. This produces a MatMul dtype mismatch:
+    #   TypeError: Input 'b' of 'MatMul' Op has type float32 that does not
+    #   match type float16 of argument 'a'.
+    # The only safe option is float32 for any model that contains QGRU/QDense.
+    # --mixed-precision is accepted on the CLI so existing slurm scripts do not
+    # break, but it is silently forced off here with a loud warning.
     if mixed_precision:
-        keras.mixed_precision.set_global_policy("mixed_float16")
-        print("[STEP 2] Mixed-precision policy: mixed_float16", flush=True)
-    else:
-        keras.mixed_precision.set_global_policy("float32")
+        print(
+            "[STEP 2] WARNING: --mixed-precision was requested but is DISABLED "
+            "for this model. QKeras QGRU/QDense layers are incompatible with "
+            "mixed_float16 policy on TF 2.10 — the quantized kernel stays "
+            "float32 while activations become float16, causing a MatMul dtype "
+            "mismatch at runtime. Forcing float32 policy. "
+            "Remove --mixed-precision from your sbatch command to silence this warning.",
+            flush=True,
+        )
+        mixed_precision = False
+
+    keras.mixed_precision.set_global_policy("float32")
+    print("[STEP 2] Mixed-precision policy: float32 (always, QKeras requirement)", flush=True)
 
     gpu_devices = [f"GPU:{i}" for i in range(len(logical_gpus))]
     strategy = tf.distribute.MirroredStrategy(devices=gpu_devices)
@@ -331,7 +355,6 @@ def setup_gpus_and_strategy(mixed_precision: bool):
         )
 
     return strategy
-
 
 # ==============================================================================
 # File discovery — glob-based, supports both index filename conventions
