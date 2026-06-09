@@ -40,22 +40,30 @@
 #   $11 ALPHA
 #   $12 TEACHER_WEIGHTS     (full path to teacher_best.weights.h5)
 #   $13 WARMUP_EPOCHS       (optional, default 5)
-#   $14 --resume            (optional, pass literally or leave empty)
-#   $15 --mixed-precision   (optional, pass literally or leave empty)
+#   $14 ACCUMULATION_STEPS  (optional, default 1; set to 16 for bs=16384 effective=1024)
+#   $15 --resume            (optional, pass literally or leave empty)
+#   $16 --mixed-precision   (optional, pass literally or leave empty)
 #
-# Example fresh run (8-bit, gru32, teacher gru128x2, bs16384, T=4.0, alpha=0.7):
+# Example fresh run no accumulation (8-bit, gru32, teacher gru128x2, bs=1024, T=4.0, alpha=0.7):
+#   sbatch --job-name=vanilla_b8k8r8a8s8_gru32x1_dense3_bs1024 \
+#          slurm/studentvanilla \
+#          8 8 8 8 8 32 128 2 1024 4.0 0.7 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
+#          5 1
+#
+# Example fresh run with accumulation (bs=16384, effective=1024, 16x faster epochs):
 #   sbatch --job-name=vanilla_b8k8r8a8s8_gru32x1_dense3_bs16384 \
 #          slurm/studentvanilla \
 #          8 8 8 8 8 32 128 2 16384 4.0 0.7 \
 #          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
-#          5
+#          5 16
 #
 # Example resume:
 #   sbatch --job-name=vanilla_b8k8r8a8s8_gru32x1_dense3_bs16384 \
 #          slurm/studentvanilla \
 #          8 8 8 8 8 32 128 2 16384 4.0 0.7 \
 #          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
-#          5 --resume
+#          5 16 --resume
 # ============================================================================
 
 # --- Positional arguments ---
@@ -72,8 +80,9 @@ TEMPERATURE=${10}
 ALPHA=${11}
 TEACHER_WEIGHTS=${12}
 WARMUP_EPOCHS=${13:-5}
-RESUME_FLAG=${14:-""}
-MIXED_PRECISION_FLAG=${15:-""}
+ACCUMULATION_STEPS=${14:-1}
+RESUME_FLAG=${15:-""}
+MIXED_PRECISION_FLAG=${16:-""}
 
 # --- Required argument check ---
 if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"       ] || \
@@ -83,7 +92,7 @@ if [ -z "${BITS_KERNEL}"    ] || [ -z "${BITS_BIAS}"       ] || \
    [ -z "${BATCH_SIZE}"     ] || [ -z "${TEMPERATURE}"     ] || \
    [ -z "${ALPHA}"          ] || [ -z "${TEACHER_WEIGHTS}" ]; then
     echo "FATAL: Missing positional arguments."
-    echo "Usage: sbatch slurm/studentvanilla BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION BITS_STATE STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS [WARMUP_EPOCHS] [--resume] [--mixed-precision]"
+    echo "Usage: sbatch slurm/studentvanilla BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION BITS_STATE STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS BATCH_SIZE TEMPERATURE ALPHA TEACHER_WEIGHTS [WARMUP_EPOCHS] [ACCUMULATION_STEPS] [--resume] [--mixed-precision]"
     exit 1
 fi
 
@@ -97,7 +106,7 @@ fi
 if [ -n "${RESUME_FLAG}" ] && \
    [ "${RESUME_FLAG}" != "--resume" ] && \
    [ "${RESUME_FLAG}" != "--mixed-precision" ]; then
-    echo "FATAL: argument 14 must be --resume or --mixed-precision, got: ${RESUME_FLAG}"
+    echo "FATAL: argument 15 must be --resume or --mixed-precision, got: ${RESUME_FLAG}"
     exit 1
 fi
 
@@ -205,6 +214,7 @@ echo "TEMPERATURE         : ${TEMPERATURE}"
 echo "ALPHA               : ${ALPHA}"
 echo "TEACHER WEIGHTS     : ${TEACHER_WEIGHTS}"
 echo "WARMUP EPOCHS       : ${WARMUP_EPOCHS}"
+echo "ACCUMULATION STEPS  : ${ACCUMULATION_STEPS}"
 echo "RESUME FLAG         : ${RESUME_FLAG:-off}"
 echo "MIXED PREC          : ${MIXED_PRECISION_FLAG:-off}"
 echo "PYTHON              : $(which python)"
@@ -283,6 +293,7 @@ python "${SCRIPT_DIR}/train_student_vanilla_kd.py" \
     --bits-state         "${BITS_STATE}"         \
     --student-units      "${STUDENT_UNITS}"      \
     --batch-size         "${BATCH_SIZE}"         \
+    --accumulation-steps "${ACCUMULATION_STEPS}" \
     --epochs             300                     \
     --patience           15                      \
     --min-delta          1e-5                    \
@@ -392,6 +403,7 @@ if [ "${DO_RESUBMIT}" = "1" ]; then
         "${ALPHA}"                     \
         "${TEACHER_WEIGHTS}"           \
         "${WARMUP_EPOCHS}"             \
+        "${ACCUMULATION_STEPS}"        \
         "--resume"                     \
         "${MIXED_PRECISION_FLAG}"
     )
@@ -406,7 +418,7 @@ if [ "${DO_RESUBMIT}" = "1" ]; then
         echo "      ${BITS_KERNEL} ${BITS_BIAS} ${BITS_RECURRENT} ${BITS_ACTIVATION} \\"
         echo "      ${BITS_STATE} ${STUDENT_UNITS} ${TEACHER_UNITS} ${TEACHER_LAYERS} \\"
         echo "      ${BATCH_SIZE} ${TEMPERATURE} ${ALPHA} ${TEACHER_WEIGHTS} \\"
-        echo "      ${WARMUP_EPOCHS} --resume ${MIXED_PRECISION_FLAG}"
+        echo "      ${WARMUP_EPOCHS} ${ACCUMULATION_STEPS} --resume ${MIXED_PRECISION_FLAG}"
     fi
     echo "============================================================"
 fi
