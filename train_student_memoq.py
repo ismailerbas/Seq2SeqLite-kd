@@ -1573,7 +1573,362 @@ def make_dist_memoq_val(strategy, model,
     return step
 
 
+def build_final_qkeras_hidden_model(final_qkeras_student):
+    """
+    Build a side model from the hard QKeras student that exposes
+    [seq_output, dec_hidden_seq] so Phase 3 recurrent losses can fire.
 
+    The final QKeras student has layers named sencgru, sdecgru, sdec_dense.
+    sdecgru with return_sequences=True returns shape (B, T, units).
+    We extract that as the dec_hidden_seq.
+    """
+    enc_input  = final_qkeras_student.get_layer("senc_input").output
+    dec_input  = final_qkeras_student.get_layer("sdec_input").output
+
+    enc_layer  = final_qkeras_student.get_layer("sencgru")
+    dec_layer  = final_qkeras_student.get_layer("sdecgru")
+    dense_layer = final_qkeras_student.get_layer("sdec_dense")
+
+    enc_out_full = enc_layer(enc_layer.input)
+    if isinstance(enc_out_full, (list, tuple)):
+        enc_seq  = enc_out_full[0]
+        enc_final = enc_out_full[1]
+    else:
+        enc_seq   = enc_out_full
+        enc_final = enc_seq[:, -1, :]
+
+    dec_out_full = dec_layer(dec_input, initial_state=[enc_final])
+    if isinstance(dec_out_full, (list, tuple)):
+        dec_hidden_seq = dec_out_full[0]
+    else:
+        dec_hidden_seq = dec_out_full
+
+    seq_output = dense_layer(dec_hidden_seq)
+
+    hidden_model = keras.models.Model(
+        inputs=[enc_layer.input, dec_layer.input],
+        outputs=[seq_output, dec_hidden_seq],
+        name="final_qkeras_hidden_model",
+    )
+    return hidden_model
+
+
+def make_dist_memoq_train_final(
+    strategy,
+    final_qkeras_student,
+    optimizer,
+    alpha,
+    channel_scales,
+    huber_delta,
+    lambda_mem,
+    lambda_innov,
+    lambda_zsat,
+    lambda_rail,
+    epsilon_innov,
+    seq_len,
+    rho_rail,
+    mu_rail,
+    clipnorm=0.5,
+):
+    """
+    Distributed train step for Phase 3 hard 4-bit QKeras polish.
+
+    The final QKeras model is called with training=True.
+    To extract dec_hidden_seq for recurrent losses, we call the encoder
+    and decoder QGRU layers explicitly so we can intercept the hidden sequence.
+
+    Loss:
+      L = L_seq + 0.5*L_KD + lambda_mem*L_mem + lambda_innov*L_innov
+          + lambda_zsat*L_zsat + lambda_rail*L_railpred
+    """
+    enc_layer   = final_qkeras_student.get_layer("sencgru")
+    dec_layer   = final_qkeras_student.get_layer("sdecgru")
+    dense_layer = final_qkeras_student.get_layer("sdec_dense")
+
+    channel_scales_t = tf.constant(channel_scales, dtype=tf.float32)
+    lags             = [1, 2, 4, 8, 16, 32, 64]
+    T_f              = tf.cast(seq_len, tf.float32)
+
+    def per_replica_step(batch_x, batch_y):
+        enc_inp        = batch_x["enc_input"]
+        dec_inp        = batch_x["dec_input"]
+        t_pred         = batch_x["tpred"]
+        t_hidden       = batch_x["teacher_hidden"]
+        ground_truth   = batch_y
+
+        with tf.GradientTape() as tape:
+            # ── Forward: encoder ──────────────────────────────────────────────
+            enc_result = enc_layer(enc_inp, training=True)
+            if isinstance(enc_result, (list, tuple)):
+                enc_seq   = enc_result[0]
+                enc_final = enc_result[1] if len(enc_result) > 1 else enc_seq[:, -1, :]
+            else:
+                enc_seq   = enc_result
+                enc_final = enc_seq[:, -1, :]
+
+            # ── Forward: decoder ──────────────────────────────────────────────
+            dec_result = dec_layer(dec_inp, initial_state=[enc_final], training=True)
+            if isinstance(dec_result, (list, tuple)):
+                dec_hidden_seq = dec_result[0]
+                z_logit_seq    = dec_result[1] if len(dec_result) > 1 else None
+            else:
+                dec_hidden_seq = dec_result
+                z_logit_seq    = None
+
+            seq_output = dense_layer(dec_hidden_seq, training=True)
+
+            # ── L_seq: channel-normalised Huber ───────────────────────────────
+            diff_seq  = (seq_output - ground_truth) / (channel_scales_t + 1e-8)
+            abs_diff  = tf.abs(diff_seq)
+            huber_seq = tf.where(
+                abs_diff <= huber_delta,
+                0.5 * tf.square(diff_seq),
+                huber_delta * (abs_diff - 0.5 * huber_delta),
+            )
+            l_seq = tf.reduce_mean(huber_seq)
+
+            # ── L_KD: channel-normalised Huber vs teacher preds ───────────────
+            diff_kd  = (seq_output - t_pred) / (channel_scales_t + 1e-8)
+            abs_kd   = tf.abs(diff_kd)
+            huber_kd = tf.where(
+                abs_kd <= huber_delta,
+                0.5 * tf.square(diff_kd),
+                huber_delta * (abs_kd - 0.5 * huber_delta),
+            )
+            l_kd = tf.reduce_mean(huber_kd)
+
+            # ── L_mem: lagged temporal memory kernel distillation ─────────────
+            l_mem = tf.constant(0.0, dtype=tf.float32)
+            if lambda_mem > 0.0:
+                for lag in lags:
+                    if lag >= seq_len:
+                        continue
+                    lag_f  = tf.cast(lag, tf.float32)
+                    w_ell  = (1.0 / tf.sqrt(lag_f)) * ((T_f - lag_f) / T_f)
+                    s_a    = dec_hidden_seq[:, lag:, :]
+                    s_b    = dec_hidden_seq[:, :-lag, :]
+                    t_a    = t_hidden[:, lag:, :]
+                    t_b    = t_hidden[:, :-lag, :]
+                    eps_cs = 1e-8
+                    s_dot  = tf.reduce_sum(s_a * s_b, axis=-1)
+                    s_na   = tf.norm(s_a, axis=-1)
+                    s_nb   = tf.norm(s_b, axis=-1)
+                    m_s    = tf.reduce_mean(s_dot / (s_na * s_nb + eps_cs))
+                    t_dot  = tf.reduce_sum(t_a * t_b, axis=-1)
+                    t_na   = tf.norm(t_a, axis=-1)
+                    t_nb   = tf.norm(t_b, axis=-1)
+                    m_t    = tf.reduce_mean(t_dot / (t_na * t_nb + eps_cs))
+                    l_mem  = l_mem + w_ell * tf.square(m_s - m_t)
+
+            # ── L_innov: temporal innovation-profile matching ─────────────────
+            l_innov = tf.constant(0.0, dtype=tf.float32)
+            if lambda_innov > 0.0:
+                s_diff  = dec_hidden_seq[:, 1:, :] - dec_hidden_seq[:, :-1, :]
+                t_diff  = t_hidden[:, 1:, :] - t_hidden[:, :-1, :]
+                v_s     = tf.reduce_mean(tf.square(s_diff), axis=-1)
+                v_t     = tf.reduce_mean(tf.square(t_diff), axis=-1)
+                eps_inv = tf.cast(epsilon_innov, tf.float32)
+                log_ratio = tf.math.log(
+                    (v_s + eps_inv) / (v_t + eps_inv + 1e-30)
+                )
+                l_innov = tf.reduce_mean(tf.square(log_ratio))
+
+            # ── L_zsat: update-gate saturation barrier (logit form) ───────────
+            l_zsat = tf.constant(0.0, dtype=tf.float32)
+            if lambda_zsat > 0.0 and z_logit_seq is not None:
+                l_zsat = tf.reduce_mean(
+                    tf.square(tf.nn.relu(tf.abs(z_logit_seq) - 3.0))
+                )
+
+            # ── L_railpred: recurrent state rail-margin regularisation ─────────
+            l_rail = tf.constant(0.0, dtype=tf.float32)
+            if lambda_rail > 0.0:
+                h_t   = dec_hidden_seq[:, 1:, :]
+                h_tm1 = dec_hidden_seq[:, :-1, :]
+                rho_t = tf.cast(rho_rail, tf.float32)
+                mu_t  = tf.cast(mu_rail, tf.float32)
+                l_rail = tf.reduce_mean(
+                    tf.square(
+                        tf.nn.relu(
+                            tf.abs(h_t) + mu_t * tf.abs(h_t - h_tm1) - rho_t
+                        )
+                    )
+                )
+
+            # ── Total loss ────────────────────────────────────────────────────
+            l_total = (
+                l_seq
+                + alpha * l_kd
+                + lambda_mem   * l_mem
+                + lambda_innov * l_innov
+                + lambda_zsat  * l_zsat
+                + lambda_rail  * l_rail
+            )
+
+        trainable_vars = final_qkeras_student.trainable_variables
+        grads          = tape.gradient(l_total, trainable_vars)
+        grads_clipped, _ = tf.clip_by_global_norm(grads, clipnorm)
+        optimizer.apply_gradients(zip(grads_clipped, trainable_vars))
+
+        mae = tf.reduce_mean(tf.abs(seq_output - ground_truth))
+        return l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae
+
+    @tf.function
+    def dist_step(batch_x, batch_y):
+        per_rep = strategy.run(per_replica_step, args=(batch_x, batch_y))
+        return tuple(
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, t, axis=None)
+            for t in per_rep
+        )
+
+    return dist_step
+
+
+def make_dist_memoq_val_final(
+    strategy,
+    final_qkeras_student,
+    alpha,
+    channel_scales,
+    huber_delta,
+    lambda_mem,
+    lambda_innov,
+    lambda_zsat,
+    lambda_rail,
+    epsilon_innov,
+    seq_len,
+    rho_rail,
+    mu_rail,
+):
+    """
+    Distributed validation step for Phase 3 hard 4-bit QKeras polish.
+    No gradient tape. Same loss decomposition as train step.
+    """
+    enc_layer   = final_qkeras_student.get_layer("sencgru")
+    dec_layer   = final_qkeras_student.get_layer("sdecgru")
+    dense_layer = final_qkeras_student.get_layer("sdec_dense")
+
+    channel_scales_t = tf.constant(channel_scales, dtype=tf.float32)
+    lags             = [1, 2, 4, 8, 16, 32, 64]
+    T_f              = tf.cast(seq_len, tf.float32)
+
+    def per_replica_val(batch_x, batch_y):
+        enc_inp      = batch_x["enc_input"]
+        dec_inp      = batch_x["dec_input"]
+        t_pred       = batch_x["tpred"]
+        t_hidden     = batch_x["teacher_hidden"]
+        ground_truth = batch_y
+
+        enc_result = enc_layer(enc_inp, training=False)
+        if isinstance(enc_result, (list, tuple)):
+            enc_seq   = enc_result[0]
+            enc_final = enc_result[1] if len(enc_result) > 1 else enc_seq[:, -1, :]
+        else:
+            enc_seq   = enc_result
+            enc_final = enc_seq[:, -1, :]
+
+        dec_result = dec_layer(dec_inp, initial_state=[enc_final], training=False)
+        if isinstance(dec_result, (list, tuple)):
+            dec_hidden_seq = dec_result[0]
+            z_logit_seq    = dec_result[1] if len(dec_result) > 1 else None
+        else:
+            dec_hidden_seq = dec_result
+            z_logit_seq    = None
+
+        seq_output = dense_layer(dec_hidden_seq, training=False)
+
+        diff_seq  = (seq_output - ground_truth) / (channel_scales_t + 1e-8)
+        abs_diff  = tf.abs(diff_seq)
+        huber_seq = tf.where(
+            abs_diff <= huber_delta,
+            0.5 * tf.square(diff_seq),
+            huber_delta * (abs_diff - 0.5 * huber_delta),
+        )
+        l_seq = tf.reduce_mean(huber_seq)
+
+        diff_kd  = (seq_output - t_pred) / (channel_scales_t + 1e-8)
+        abs_kd   = tf.abs(diff_kd)
+        huber_kd = tf.where(
+            abs_kd <= huber_delta,
+            0.5 * tf.square(diff_kd),
+            huber_delta * (abs_kd - 0.5 * huber_delta),
+        )
+        l_kd = tf.reduce_mean(huber_kd)
+
+        l_mem = tf.constant(0.0, dtype=tf.float32)
+        if lambda_mem > 0.0:
+            for lag in lags:
+                if lag >= seq_len:
+                    continue
+                lag_f  = tf.cast(lag, tf.float32)
+                w_ell  = (1.0 / tf.sqrt(lag_f)) * ((T_f - lag_f) / T_f)
+                s_a    = dec_hidden_seq[:, lag:, :]
+                s_b    = dec_hidden_seq[:, :-lag, :]
+                t_a    = t_hidden[:, lag:, :]
+                t_b    = t_hidden[:, :-lag, :]
+                eps_cs = 1e-8
+                s_dot  = tf.reduce_sum(s_a * s_b, axis=-1)
+                s_na   = tf.norm(s_a, axis=-1)
+                s_nb   = tf.norm(s_b, axis=-1)
+                m_s    = tf.reduce_mean(s_dot / (s_na * s_nb + eps_cs))
+                t_dot  = tf.reduce_sum(t_a * t_b, axis=-1)
+                t_na   = tf.norm(t_a, axis=-1)
+                t_nb   = tf.norm(t_b, axis=-1)
+                m_t    = tf.reduce_mean(t_dot / (t_na * t_nb + eps_cs))
+                l_mem  = l_mem + w_ell * tf.square(m_s - m_t)
+
+        l_innov = tf.constant(0.0, dtype=tf.float32)
+        if lambda_innov > 0.0:
+            s_diff  = dec_hidden_seq[:, 1:, :] - dec_hidden_seq[:, :-1, :]
+            t_diff  = t_hidden[:, 1:, :] - t_hidden[:, :-1, :]
+            v_s     = tf.reduce_mean(tf.square(s_diff), axis=-1)
+            v_t     = tf.reduce_mean(tf.square(t_diff), axis=-1)
+            eps_inv = tf.cast(epsilon_innov, tf.float32)
+            log_ratio = tf.math.log(
+                (v_s + eps_inv) / (v_t + eps_inv + 1e-30)
+            )
+            l_innov = tf.reduce_mean(tf.square(log_ratio))
+
+        l_zsat = tf.constant(0.0, dtype=tf.float32)
+        if lambda_zsat > 0.0 and z_logit_seq is not None:
+            l_zsat = tf.reduce_mean(
+                tf.square(tf.nn.relu(tf.abs(z_logit_seq) - 3.0))
+            )
+
+        l_rail = tf.constant(0.0, dtype=tf.float32)
+        if lambda_rail > 0.0:
+            h_t   = dec_hidden_seq[:, 1:, :]
+            h_tm1 = dec_hidden_seq[:, :-1, :]
+            rho_t = tf.cast(rho_rail, tf.float32)
+            mu_t  = tf.cast(mu_rail, tf.float32)
+            l_rail = tf.reduce_mean(
+                tf.square(
+                    tf.nn.relu(
+                        tf.abs(h_t) + mu_t * tf.abs(h_t - h_tm1) - rho_t
+                    )
+                )
+            )
+
+        l_total = (
+            l_seq
+            + alpha * l_kd
+            + lambda_mem   * l_mem
+            + lambda_innov * l_innov
+            + lambda_zsat  * l_zsat
+            + lambda_rail  * l_rail
+        )
+
+        mae = tf.reduce_mean(tf.abs(seq_output - ground_truth))
+        return l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae
+
+    @tf.function
+    def dist_val_step(batch_x, batch_y):
+        per_rep = strategy.run(per_replica_val, args=(batch_x, batch_y))
+        return tuple(
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, t, axis=None)
+            for t in per_rep
+        )
+
+    return dist_val_step
 
 # ==============================================================================
 # Main MemoQ training loop
@@ -3037,7 +3392,6 @@ def make_dist_memoq_val_final(
 # Identical calling convention to run_epoch in train_student_sqkd.py but
 # handles (total, l_seq, l_kd, l_m, l_i, l_z, l_r, nan_flag) tuples.
 # ==============================================================================
-
 def run_epoch(
     phase_tag,
     epoch,
@@ -3064,116 +3418,167 @@ def run_epoch(
     pf,
     epoch_in_phase=0,
 ):
-    t_epoch = time.time()
-    t_batch_zero = None
+    t_epoch       = time.time()
+    t_batch_zero  = None
 
-    acc = {k: 0.0 for k in ("total","seq","kd","mem","innov","zsat","rail")}
-    acc_steps = 0
-    nan_count = 0
+    train_acc = {
+        "total": 0.0, "seq": 0.0, "kd":    0.0,
+        "mem":   0.0, "innov": 0.0, "zsat": 0.0, "rail": 0.0, "mae": 0.0,
+    }
+    train_steps_done = 0
+    nan_count_train  = 0
 
     pf(
-        f"\n[{phase_tag} EPOCH {epoch + 1}/{total_epochs}] Training  "
-        f"lr={lr_scheduler.current_lr:.2e}"
+        f"\n[{phase_tag} EPOCH {epoch + 1}/{total_epochs}]"
+        f"  Training  lr={lr_scheduler.current_lr:.2e}"
     )
     sys.stdout.flush()
 
-    for step, (bx, by) in enumerate(dist_train_dataset):
-        if step == 0:
-            t_batch_zero = time.time()
+    for step, (batch_x, batch_y) in enumerate(dist_train_dataset):
+        if train_steps_done >= train_steps:
+            break
 
-        step_out = dist_train_step_fn(bx, by)
-        step_out = [float(v) for v in step_out]
+        t0 = time.time()
+        result = dist_train_step_fn(batch_x, batch_y)
 
-        if len(step_out) == 8:
-            total_l, seq_l, kd_l, mem_l, innov_l, zsat_l, rail_l, nan_f = step_out
-        elif len(step_out) == 4:
-            total_l, hard_l, soft_l, nan_f = step_out
-            seq_l, kd_l, mem_l, innov_l, zsat_l, rail_l = hard_l, soft_l, 0.0, 0.0, 0.0, 0.0
+        if t_batch_zero is None:
+            t_batch_zero = time.time() - t0
+
+        if len(result) == 8:
+            l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae = result
+        elif len(result) == 4:
+            l_total, l_seq, l_kd, mae = result
+            l_mem = l_innov = l_zsat = l_rail = tf.constant(0.0)
         else:
-            total_l = step_out[0]
-            seq_l = kd_l = mem_l = innov_l = zsat_l = rail_l = 0.0
-            nan_f = step_out[-1]
+            l_total = result[0]
+            l_seq = result[1] if len(result) > 1 else tf.constant(0.0)
+            l_kd  = result[2] if len(result) > 2 else tf.constant(0.0)
+            l_mem = l_innov = l_zsat = l_rail = tf.constant(0.0)
+            mae   = result[-1] if len(result) > 3 else tf.constant(0.0)
 
-        acc["total"] += total_l
-        acc["seq"]   += seq_l
-        acc["kd"]    += kd_l
-        acc["mem"]   += mem_l
-        acc["innov"] += innov_l
-        acc["zsat"]  += zsat_l
-        acc["rail"]  += rail_l
-        acc_steps += 1
+        for v, k in zip(
+            [l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae],
+            ["total", "seq", "kd", "mem", "innov", "zsat", "rail", "mae"],
+        ):
+            val_py = float(v)
+            if not math.isfinite(val_py):
+                nan_count_train += 1
+                val_py = 0.0
+            train_acc[k] += val_py
 
-        if nan_f > 0.0:
-            nan_count += 1
+        train_steps_done += 1
 
-        if (step + 1) % log_interval == 0 or (step + 1) == train_steps:
-            bar(
-                step + 1,
-                train_steps,
-                {k: acc[k] / acc_steps for k in ("total","seq","kd","mem","innov","zsat","rail")},
-                epoch_start_time=t_batch_zero if t_batch_zero is not None else t_epoch,
+        if (step + 1) % log_interval == 0:
+            pf(
+                f"  step {train_steps_done}/{train_steps}"
+                f"  loss={train_acc['total'] / train_steps_done:.5f}"
+                f"  seq={train_acc['seq'] / train_steps_done:.5f}"
+                f"  kd={train_acc['kd'] / train_steps_done:.5f}"
+                f"  mem={train_acc['mem'] / train_steps_done:.5f}"
+                f"  innov={train_acc['innov'] / train_steps_done:.5f}"
+                f"  zsat={train_acc['zsat'] / train_steps_done:.5f}"
+                f"  rail={train_acc['rail'] / train_steps_done:.5f}"
             )
+            sys.stdout.flush()
 
-    train_metrics = {k: acc[k] / max(acc_steps, 1) for k in acc}
-
-    if nan_count > nan_warn_threshold:
+    if nan_count_train >= nan_warn_threshold:
         pf(
-            f"\n  *** WARNING: {nan_count}/{acc_steps} batches had NaN gradients. "
-            f"Consider reducing LR or lambda values. ***"
+            f"  [WARNING] {nan_count_train}/{train_steps_done} NaN/Inf steps in training."
         )
         sys.stdout.flush()
 
-    pf(f"\n[{phase_tag} EPOCH {epoch + 1}/{total_epochs}] Validation...")
+    n_tr = max(train_steps_done, 1)
+    train_metrics = {k: v / n_tr for k, v in train_acc.items()}
+
+    # ── Validation loop ───────────────────────────────────────────────────────
+    pf(f"  Validation...")
     sys.stdout.flush()
 
-    val_acc = {k: 0.0 for k in ("total","seq","kd","mem","innov","zsat","rail","mae")}
-    val_done = 0
+    val_acc = {
+        "total": 0.0, "seq": 0.0, "kd":    0.0,
+        "mem":   0.0, "innov": 0.0, "zsat": 0.0, "rail": 0.0, "mae": 0.0,
+    }
+    val_steps_done = 0
+    nan_count_val  = 0
 
-    for bx, by in dist_val_dataset:
-        v_out = dist_val_step_fn(bx, by)
-        v_out = [float(v) for v in v_out]
-        if len(v_out) == 8:
-            vt, vsq, vkd, vm, vi, vz, vr, vmae = v_out
-        elif len(v_out) == 4:
-            vt, vsq, vkd, vmae = v_out
-            vm = vi = vz = vr = 0.0
+    for step, (batch_x, batch_y) in enumerate(dist_val_dataset):
+        if val_steps_done >= val_steps:
+            break
+
+        result = dist_val_step_fn(batch_x, batch_y)
+
+        if len(result) == 8:
+            l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae = result
+        elif len(result) == 4:
+            l_total, l_seq, l_kd, mae = result
+            l_mem = l_innov = l_zsat = l_rail = tf.constant(0.0)
         else:
-            vt = v_out[0]; vmae = v_out[-1]
-            vsq = vkd = vm = vi = vz = vr = 0.0
+            l_total = result[0]
+            l_seq = result[1] if len(result) > 1 else tf.constant(0.0)
+            l_kd  = result[2] if len(result) > 2 else tf.constant(0.0)
+            l_mem = l_innov = l_zsat = l_rail = tf.constant(0.0)
+            mae   = result[-1] if len(result) > 3 else tf.constant(0.0)
 
-        val_acc["total"] += vt
-        val_acc["seq"]   += vsq
-        val_acc["kd"]    += vkd
-        val_acc["mem"]   += vm
-        val_acc["innov"] += vi
-        val_acc["zsat"]  += vz
-        val_acc["rail"]  += vr
-        val_acc["mae"]   += vmae
-        val_done += 1
+        for v, k in zip(
+            [l_total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_rail, mae],
+            ["total", "seq", "kd", "mem", "innov", "zsat", "rail", "mae"],
+        ):
+            val_py = float(v)
+            if not math.isfinite(val_py):
+                nan_count_val += 1
+                val_py = 0.0
+            val_acc[k] += val_py
 
-    val_metrics = {k: val_acc[k] / max(val_done, 1) for k in val_acc}
-    val_loss = val_metrics["total"]
+        val_steps_done += 1
 
-    elapsed_epoch = time.time() - t_epoch
+    if nan_count_val >= max(1, int(val_steps * 0.10)):
+        pf(
+            f"  [WARNING] {nan_count_val}/{val_steps_done} NaN/Inf steps in validation."
+        )
+        sys.stdout.flush()
 
-    for k in ("total","seq","kd","mem","innov","zsat","rail"):
-        history.setdefault(k, []).append(train_metrics[k])
-    for k in ("total","seq","kd","mem","innov","zsat","rail","mae"):
-        history.setdefault(f"val_{k}", []).append(val_metrics[k])
-    history.setdefault("phase", []).append(phase_tag)
+    n_vl = max(val_steps_done, 1)
+    val_metrics = {k: v / n_vl for k, v in val_acc.items()}
+    val_loss     = val_metrics["total"]
 
+    t_elapsed = time.time() - t_epoch
     pf(
-        f"[{phase_tag}] Ep {epoch + 1:3d}/{total_epochs}  "
-        f"tot={train_metrics['total']:.5f}  vtot={val_loss:.5f}  "
-        f"seq={train_metrics['seq']:.5f}  kd={train_metrics['kd']:.5f}  "
-        f"mem={train_metrics['mem']:.5f}  inn={train_metrics['innov']:.5f}  "
-        f"zsat={train_metrics['zsat']:.5f}  rail={train_metrics['rail']:.5f}  "
-        f"vmae={val_metrics['mae']:.5f}  "
-        f"lr={lr_scheduler.current_lr:.2e}  NaN={nan_count}  t={elapsed_epoch:.1f}s"
+        f"  [{phase_tag} EPOCH {epoch + 1}]"
+        f"  train_loss={train_metrics['total']:.6f}"
+        f"  val_loss={val_loss:.6f}"
+        f"  val_mae={val_metrics['mae']:.6f}"
+        f"  train_seq={train_metrics['seq']:.6f}"
+        f"  train_kd={train_metrics['kd']:.6f}"
+        f"  train_mem={train_metrics['mem']:.6f}"
+        f"  train_innov={train_metrics['innov']:.6f}"
+        f"  train_zsat={train_metrics['zsat']:.6f}"
+        f"  train_rail={train_metrics['rail']:.6f}"
+        f"  lr={lr_scheduler.current_lr:.2e}"
+        f"  t={t_elapsed:.1f}s"
+        f"  (first_batch={t_batch_zero:.2f}s)" if t_batch_zero is not None else ""
     )
     sys.stdout.flush()
 
-       with open(csv_path, "a") as csv_f:
+    # ── History accumulation ──────────────────────────────────────────────────
+    history.setdefault("total",     []).append(train_metrics["total"])
+    history.setdefault("seq",       []).append(train_metrics["seq"])
+    history.setdefault("kd",        []).append(train_metrics["kd"])
+    history.setdefault("mem",       []).append(train_metrics["mem"])
+    history.setdefault("innov",     []).append(train_metrics["innov"])
+    history.setdefault("zsat",      []).append(train_metrics["zsat"])
+    history.setdefault("rail",      []).append(train_metrics["rail"])
+    history.setdefault("val_total", []).append(val_metrics["total"])
+    history.setdefault("val_seq",   []).append(val_metrics["seq"])
+    history.setdefault("val_kd",    []).append(val_metrics["kd"])
+    history.setdefault("val_mem",   []).append(val_metrics["mem"])
+    history.setdefault("val_innov", []).append(val_metrics["innov"])
+    history.setdefault("val_zsat",  []).append(val_metrics["zsat"])
+    history.setdefault("val_rail",  []).append(val_metrics["rail"])
+    history.setdefault("val_mae",   []).append(val_metrics["mae"])
+    history.setdefault("phase",     []).append(phase_tag)
+
+    # ── CSV logging ───────────────────────────────────────────────────────────
+    with open(csv_path, "a") as csv_f:
         csv_f.write(
             f"{epoch + 1},{phase_tag},"
             f"{train_metrics['total']:.8f},{train_metrics['seq']:.8f},"
@@ -3191,17 +3596,23 @@ def run_epoch(
     if effective_warmup_epochs > 0 and epoch_in_phase < effective_warmup_epochs:
         warmup_lr = float(effective_lr) * (epoch_in_phase + 1) / float(effective_warmup_epochs)
         lr_scheduler.lr_var.assign(warmup_lr)
-        pf(f"  [WARMUP] ep_in_phase={epoch_in_phase + 1}/{effective_warmup_epochs} lr={warmup_lr:.3e}")
+        pf(
+            f"  [WARMUP] ep_in_phase={epoch_in_phase + 1}/{effective_warmup_epochs}"
+            f"  lr={warmup_lr:.3e}"
+        )
     else:
         lr_scheduler.step(val_loss, epoch, pf)
 
     # ── Checkpoint ────────────────────────────────────────────────────────────
     early_stop = False
     if val_loss < best_val - min_delta:
-        best_val = val_loss
+        best_val    = val_loss
         patience_ct = 0
         model_to_save.save_weights(best_ckpt_path)
-        pf(f"  ✓ [{phase_tag}] New best val={best_val:.6f}  -> {best_ckpt_path}")
+        pf(
+            f"  ✓ [{phase_tag}] New best val={best_val:.6f}"
+            f"  -> {best_ckpt_path}"
+        )
         sys.stdout.flush()
     else:
         patience_ct += 1
