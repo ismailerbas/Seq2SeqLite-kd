@@ -195,6 +195,14 @@ def parse_args():
                        "The plateau scheduler is gated and will NOT fire during warmup. "
                        "Set to 0 to disable warmup entirely."
                    ))
+    p.add_argument("--accumulation-steps", type=int, default=1,
+                   help=(
+                       "Gradient accumulation steps. Effective batch size = "
+                       "batch_size * accumulation_steps. Set to 16 when using "
+                       "batch_size=16384 to match update frequency of batch_size=1024. "
+                       "Each step processes batch_size / accumulation_steps samples "
+                       "before calling apply_gradients."
+                   ))    
     p.add_argument("--resume", action="store_true", default=False,
                    help=(
                        "Resume training from student_best.weights.h5 + "
@@ -723,6 +731,7 @@ def train_step_per_replica(
     optimizer,
     temperature,
     alpha,
+    accumulation_steps,
 ):
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
@@ -731,37 +740,57 @@ def train_step_per_replica(
 
     alpha_f = tf.cast(alpha, tf.float32)
 
-    with tf.GradientTape() as tape:
-        student_output = student_model([enc_b, dec_b], training=True)
+    full_batch_size = tf.shape(enc_b)[0]
+    micro_size      = full_batch_size // accumulation_steps
 
-        hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_b))
-        soft_loss  = mse_kd_loss(tpred_b, student_output)
-        total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
+    accum_grads = [tf.zeros_like(v) for v in student_model.trainable_variables]
+    accum_total = tf.constant(0.0, dtype=tf.float32)
+    accum_hard  = tf.constant(0.0, dtype=tf.float32)
+    accum_soft  = tf.constant(0.0, dtype=tf.float32)
+    nan_any     = tf.constant(False)
 
-    grads = tape.gradient(total_loss, student_model.trainable_variables)
+    for step_i in tf.range(accumulation_steps):
+        s = step_i * micro_size
+        e = s + micro_size
 
-    # Replace any None gradient (non-differentiable path) with a zero tensor
-    # so tf.clip_by_global_norm receives a homogeneous list with no Nones.
-    grads = [
-        tf.zeros_like(v) if g is None else g
-        for g, v in zip(grads, student_model.trainable_variables)
-    ]
+        enc_micro   = enc_b[s:e]
+        dec_micro   = dec_b[s:e]
+        tpred_micro = tpred_b[s:e]
+        tgt_micro   = tgt_b[s:e]
 
-    # Check NaN BEFORE clipping — clipping a NaN gradient produces 0.0 (hidden NaN)
-    nan_in_grads = tf.reduce_any(tf.stack([
-        tf.reduce_any(tf.math.is_nan(g)) for g in grads
-    ]))
+        with tf.GradientTape() as tape:
+            student_output = student_model([enc_micro, dec_micro], training=True)
+            hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_micro))
+            soft_loss  = tf.reduce_mean(tf.square(tpred_micro - student_output))
+            total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
+            scaled_loss = total_loss / tf.cast(accumulation_steps, tf.float32)
 
-    # Clip gradients. tf.clip_by_global_norm returns (clipped_grads, global_norm).
-    grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
+        grads = tape.gradient(scaled_loss, student_model.trainable_variables)
+        grads = [
+            tf.zeros_like(v) if g is None else g
+            for g, v in zip(grads, student_model.trainable_variables)
+        ]
 
-    # ALWAYS call apply_gradients — no tf.cond, no merge_call inside strategy.run().
-    # NaN gradients become 0.0 after clip_by_global_norm when the norm is NaN,
-    # so the weight update is a no-op. nan_in_grads is returned so the caller
-    # can count and warn without gating the apply call inside the replica context.
-    optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
+        nan_in_step = tf.reduce_any(tf.stack([
+            tf.reduce_any(tf.math.is_nan(g)) for g in grads
+        ]))
+        nan_any = nan_any | nan_in_step
 
-    return total_loss, hard_loss, soft_loss, tf.cast(nan_in_grads, tf.float32)
+        accum_grads = [ag + g for ag, g in zip(accum_grads, grads)]
+        accum_total = accum_total + total_loss
+        accum_hard  = accum_hard  + hard_loss
+        accum_soft  = accum_soft  + soft_loss
+
+    accum_grads, _ = tf.clip_by_global_norm(accum_grads, clip_norm=1.0)
+    optimizer.apply_gradients(zip(accum_grads, student_model.trainable_variables))
+
+    n = tf.cast(accumulation_steps, tf.float32)
+    return (
+        accum_total / n,
+        accum_hard  / n,
+        accum_soft  / n,
+        tf.cast(nan_any, tf.float32),
+    )
 
 
 # ==============================================================================
@@ -797,12 +826,12 @@ def val_step_per_replica(
 # strategy.reduce uses MEAN — no manual local/global loss scaling needed.
 # ==============================================================================
 
-def make_distributed_train_step(strategy, student_model, optimizer, temperature, alpha):
+def make_distributed_train_step(strategy, student_model, optimizer, temperature, alpha, accumulation_steps):
     @tf.function
     def distributed_train_step(batch_x, batch_y):
         per_replica = strategy.run(
             train_step_per_replica,
-            args=(batch_x, batch_y, student_model, optimizer, temperature, alpha),
+            args=(batch_x, batch_y, student_model, optimizer, temperature, alpha, accumulation_steps),
         )
         total_loss = strategy.reduce(
             tf.distribute.ReduceOp.MEAN, per_replica[0], axis=None
@@ -1006,7 +1035,8 @@ def training_loop(
             sys.stdout.flush()
 
     dist_train_step = make_distributed_train_step(
-        strategy, student_model, optimizer, args.temperature, args.alpha
+        strategy, student_model, optimizer, args.temperature, args.alpha,
+        args.accumulation_steps
     )
     dist_val_step = make_distributed_val_step(
         strategy, student_model, args.temperature, args.alpha
@@ -1036,6 +1066,10 @@ def training_loop(
 
     pf("=" * 60)
     pf("VANILLA KD STUDENT TRAINING")
+    pf(f"  Accumulation steps : {args.accumulation_steps}")
+    pf(f"  Effective batch size: {args.batch_size * args.accumulation_steps}")
+    pf(f"  LR NOTE: with accum_steps={args.accumulation_steps} and lr={args.lr:.2e}")
+    pf(f"  effective LR per real update is unchanged — accumulation handles scaling")
     pf(f"  alpha={args.alpha}  temperature={args.temperature}")
     pf(f"  Student QGRU-{args.student_units}  {args.bits_kernel}-bit kernel")
     pf(f"  SEQ_LEN={args.seq_len}  BATCH={args.batch_size}  EPOCHS={args.epochs}")
