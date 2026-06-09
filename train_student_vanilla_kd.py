@@ -253,6 +253,8 @@ def parse_args():
 # ==============================================================================
 
 def make_job_name(args) -> str:
+    effective_batch = args.batch_size
+    micro_batch     = args.batch_size // args.accumulation_steps
     return (
         f"vanilla_kd"
         f"_T{args.temperature}"
@@ -260,10 +262,10 @@ def make_job_name(args) -> str:
         f"_b{args.bits_kernel}k{args.bits_bias}r{args.bits_recurrent}a{args.bits_activation}"
         f"_gru{args.student_units}x1"
         f"_dense{args.n_out}"
-        f"_bs{args.batch_size}"
+        f"_effbs{effective_batch}"
+        f"_microbs{micro_batch}"
         f"_lr{args.effective_lr:.0e}"
     )
-
 
 # ==============================================================================
 # GPU / Strategy setup — explicit device list, memory growth, mixed precision.
@@ -703,6 +705,7 @@ def make_kd_dataset(
     tgt_arr,
     tpred_arr,
     batch_size,
+    accumulation_steps,
     seq_len,
     n_out,
     shuffle,
@@ -710,13 +713,15 @@ def make_kd_dataset(
     prefetch_batches,
     pipeline_workers,
 ):
-    n       = len(enc_arr)
+    n = len(enc_arr)
     dec_arr = np.zeros_like(enc_arr)
 
-    ds_enc    = tf.data.Dataset.from_tensor_slices(enc_arr)
-    ds_dec    = tf.data.Dataset.from_tensor_slices(dec_arr)
-    ds_tpred  = tf.data.Dataset.from_tensor_slices(tpred_arr)
-    ds_tgt    = tf.data.Dataset.from_tensor_slices(tgt_arr)
+    micro_batch_size = batch_size // accumulation_steps
+
+    ds_enc   = tf.data.Dataset.from_tensor_slices(enc_arr)
+    ds_dec   = tf.data.Dataset.from_tensor_slices(dec_arr)
+    ds_tpred = tf.data.Dataset.from_tensor_slices(tpred_arr)
+    ds_tgt   = tf.data.Dataset.from_tensor_slices(tgt_arr)
 
     ds = tf.data.Dataset.zip((ds_enc, ds_dec, ds_tpred, ds_tgt))
 
@@ -727,13 +732,13 @@ def make_kd_dataset(
             reshuffle_each_iteration=True,
         )
 
-    ds = ds.batch(batch_size, drop_remainder=True)
+    ds = ds.batch(micro_batch_size, drop_remainder=True)
 
     def set_shapes(enc_b, dec_b, tpred_b, tgt_b):
-        enc_b.set_shape([batch_size, seq_len, 1])
-        dec_b.set_shape([batch_size, seq_len, 1])
-        tpred_b.set_shape([batch_size, seq_len, n_out])
-        tgt_b.set_shape([batch_size, seq_len, n_out])
+        enc_b.set_shape([micro_batch_size, seq_len, 1])
+        dec_b.set_shape([micro_batch_size, seq_len, 1])
+        tpred_b.set_shape([micro_batch_size, seq_len, n_out])
+        tgt_b.set_shape([micro_batch_size, seq_len, n_out])
         batchx = {
             "enc_input": enc_b,
             "dec_input": dec_b,
@@ -744,6 +749,7 @@ def make_kd_dataset(
     ds = ds.map(set_shapes, num_parallel_calls=pipeline_workers)
     ds = ds.prefetch(prefetch_batches)
     return ds
+
 
 def mse_kd_loss(y_teacher, y_student):
     return tf.reduce_mean(tf.square(y_teacher - y_student))
@@ -762,7 +768,6 @@ def train_step_per_replica(
     optimizer,
     temperature,
     alpha,
-    accumulation_steps,
 ):
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
@@ -771,58 +776,31 @@ def train_step_per_replica(
 
     alpha_f = tf.cast(alpha, tf.float32)
 
-    full_batch_size = tf.shape(enc_b)[0]
-    micro_size      = full_batch_size // accumulation_steps
+    with tf.GradientTape() as tape:
+        student_output = student_model([enc_b, dec_b], training=True)
+        hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_b))
+        soft_loss  = tf.reduce_mean(tf.square(tpred_b - student_output))
+        total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
 
-    accum_grads = [tf.zeros_like(v) for v in student_model.trainable_variables]
-    accum_total = tf.constant(0.0, dtype=tf.float32)
-    accum_hard  = tf.constant(0.0, dtype=tf.float32)
-    accum_soft  = tf.constant(0.0, dtype=tf.float32)
-    nan_any     = tf.constant(False)
+    grads = tape.gradient(total_loss, student_model.trainable_variables)
+    grads = [
+        tf.zeros_like(v) if g is None else g
+        for g, v in zip(grads, student_model.trainable_variables)
+    ]
 
-    for step_i in tf.range(accumulation_steps):
-        s = step_i * micro_size
-        e = s + micro_size
+    nan_in_grads = tf.reduce_any(tf.stack([
+        tf.reduce_any(tf.math.is_nan(g)) for g in grads
+    ]))
 
-        enc_micro   = enc_b[s:e]
-        dec_micro   = dec_b[s:e]
-        tpred_micro = tpred_b[s:e]
-        tgt_micro   = tgt_b[s:e]
+    grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
+    optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
 
-        with tf.GradientTape() as tape:
-            student_output = student_model([enc_micro, dec_micro], training=True)
-            hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_micro))
-            soft_loss  = tf.reduce_mean(tf.square(tpred_micro - student_output))
-            total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
-            scaled_loss = total_loss / tf.cast(accumulation_steps, tf.float32)
-
-        grads = tape.gradient(scaled_loss, student_model.trainable_variables)
-        grads = [
-            tf.zeros_like(v) if g is None else g
-            for g, v in zip(grads, student_model.trainable_variables)
-        ]
-
-        nan_in_step = tf.reduce_any(tf.stack([
-            tf.reduce_any(tf.math.is_nan(g)) for g in grads
-        ]))
-        nan_any = nan_any | nan_in_step
-
-        accum_grads = [ag + g for ag, g in zip(accum_grads, grads)]
-        accum_total = accum_total + total_loss
-        accum_hard  = accum_hard  + hard_loss
-        accum_soft  = accum_soft  + soft_loss
-
-    accum_grads, _ = tf.clip_by_global_norm(accum_grads, clip_norm=1.0)
-    optimizer.apply_gradients(zip(accum_grads, student_model.trainable_variables))
-
-    n = tf.cast(accumulation_steps, tf.float32)
     return (
-        accum_total / n,
-        accum_hard  / n,
-        accum_soft  / n,
-        tf.cast(nan_any, tf.float32),
+        total_loss,
+        hard_loss,
+        soft_loss,
+        tf.cast(nan_in_grads, tf.float32),
     )
-
 
 # ==============================================================================
 # Per-replica val step — NO @tf.function here (same reason as train step).
@@ -857,12 +835,12 @@ def val_step_per_replica(
 # strategy.reduce uses MEAN — no manual local/global loss scaling needed.
 # ==============================================================================
 
-def make_distributed_train_step(strategy, student_model, optimizer, temperature, alpha, accumulation_steps):
+def make_distributed_train_step(strategy, student_model, optimizer, temperature, alpha):
     @tf.function
     def distributed_train_step(batch_x, batch_y):
         per_replica = strategy.run(
             train_step_per_replica,
-            args=(batch_x, batch_y, student_model, optimizer, temperature, alpha, accumulation_steps),
+            args=(batch_x, batch_y, student_model, optimizer, temperature, alpha),
         )
         total_loss = strategy.reduce(
             tf.distribute.ReduceOp.MEAN, per_replica[0], axis=None
@@ -880,7 +858,6 @@ def make_distributed_train_step(strategy, student_model, optimizer, temperature,
         )
         return total_loss, hard_loss, soft_loss, nan_flag > 0.0
     return distributed_train_step
-
 
 def make_distributed_val_step(strategy, student_model, temperature, alpha):
     @tf.function
@@ -1066,8 +1043,7 @@ def training_loop(
             sys.stdout.flush()
 
     dist_train_step = make_distributed_train_step(
-        strategy, student_model, optimizer, args.temperature, args.alpha,
-        args.accumulation_steps
+        strategy, student_model, optimizer, args.temperature, args.alpha
     )
     dist_val_step = make_distributed_val_step(
         strategy, student_model, args.temperature, args.alpha
@@ -1097,8 +1073,11 @@ def training_loop(
 
     pf("=" * 60)
     pf("VANILLA KD STUDENT TRAINING")
-    pf(f"  Accumulation steps : {args.accumulation_steps}")
-    pf(f"  Effective batch size: {args.batch_size * args.accumulation_steps}")
+    micro_batch_size = args.batch_size // args.accumulation_steps
+    pf(f"  Accumulation steps  : {args.accumulation_steps}")
+    pf(f"  Micro batch size    : {micro_batch_size}  (one optimizer update per this many samples)")
+    pf(f"  Logical batch size  : {args.batch_size}  (declared batch_size arg)")
+    pf(f"  Optimizer view      : {micro_batch_size} samples / update  (matches BS=1024 run when accum=16)")
     pf(f"  Base LR (at ref BS {args.ref_batch_size}): {args.lr:.2e}")
     pf(f"  Effective LR (scaled): {args.effective_lr:.2e}")
     pf(f"  LR scaling ratio: {args.batch_size / args.ref_batch_size:.4f}  (batch_size / ref_batch_size)")
@@ -1786,12 +1765,23 @@ def main():
     student_model.summary(print_fn=pf)
     pf(f"Student trainable params: {student_model.count_params():,}")
 
-    # ── 6. tf.data pipelines — pure from_tensor_slices, GIL-free ─────────────
+    # ── 6. tf.data pipelines — micro_batch_size drives dataset, not batch_size ──
     pf("Building tf.data pipelines...")
+
+    micro_batch_size = args.batch_size // args.accumulation_steps
+    pf(
+        f"  Micro batch size : {micro_batch_size}  "
+        f"(batch_size={args.batch_size} / accumulation_steps={args.accumulation_steps})"
+    )
+    pf(
+        f"  Effective batch size (optimizer view): {args.batch_size}  "
+        f"  Updates per epoch (train): {len(train_idx) // micro_batch_size}"
+    )
 
     train_dataset = make_kd_dataset(
         enc_train, tgt_train, tpred_train,
         batch_size       = args.batch_size,
+        accumulation_steps = args.accumulation_steps,
         seq_len          = args.seq_len,
         n_out            = args.n_out,
         shuffle          = True,
@@ -1802,6 +1792,7 @@ def main():
     val_dataset = make_kd_dataset(
         enc_val, tgt_val, tpred_val,
         batch_size       = args.batch_size,
+        accumulation_steps = args.accumulation_steps,
         seq_len          = args.seq_len,
         n_out            = args.n_out,
         shuffle          = False,
@@ -1813,10 +1804,10 @@ def main():
     dist_train_dataset = strategy.experimental_distribute_dataset(train_dataset)
     dist_val_dataset   = strategy.experimental_distribute_dataset(val_dataset)
 
-    train_steps = len(train_idx) // args.batch_size
-    val_steps   = len(val_idx)   // args.batch_size
-    pf(f"  Train steps/epoch : {train_steps:,}")
-    pf(f"  Val   steps/epoch : {val_steps:,}")
+    train_steps = len(train_idx) // micro_batch_size
+    val_steps   = len(val_idx)   // micro_batch_size
+    pf(f"  Train steps/epoch : {train_steps:,}  (was {len(train_idx) // args.batch_size:,} without accumulation)")
+    pf(f"  Val   steps/epoch : {val_steps:,}")    
 
     # ── 7. Pre-flight diagnostics ─────────────────────────────────────────────
     pf("=== PRE-FLIGHT DIAGNOSTICS ===")
