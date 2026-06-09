@@ -4414,16 +4414,37 @@ def find_data_files(data_dir, seq_len):
             matches = glob.glob(os.path.join(data_dir, pat))
             if matches:
                 return sorted(matches)[0]
-        raise FileNotFoundError(f"Cannot find {desc} in {data_dir}. Tried: {patterns}")
+        raise FileNotFoundError(
+            f"Cannot find {desc} in {data_dir}. Tried: {patterns}"
+        )
 
-    file_input  = find_one([f"tpsf_seq_L{seq_len}_*.npy"], "encoder input")
-    file_res    = find_one([f"res_L{seq_len}_*.npy"],       "decoder target")
-    file_labels = find_one([f"labels_3ch_L{seq_len}_*.npy"],"labels_3ch")
+    file_input = find_one(
+        [f"tpsf_seq_L{seq_len}_*.npy"],
+        "encoder input",
+    )
+    file_res = find_one(
+        [f"res_L{seq_len}_*.npy"],
+        "decoder target",
+    )
+    file_labels = find_one(
+        [f"labels_3ch_L{seq_len}_*.npy"],
+        "labels_3ch",
+    )
 
     def find_idx(names, desc):
         for name in names:
-            c = os
+            path = os.path.join(data_dir, name)
+            if os.path.exists(path):
+                return path
+        raise FileNotFoundError(
+            f"{desc} not found in {data_dir}. Tried: {names}"
+        )
 
+    file_train = find_idx(["trainidx.npy", "train_idx.npy"], "train index")
+    file_val   = find_idx(["validx.npy", "val_idx.npy"], "validation index")
+    file_test  = find_idx(["testidx.npy", "test_idx.npy"], "test index")
+
+    return file_input, file_res, file_labels, file_train, file_val, file_test
 
 
 
