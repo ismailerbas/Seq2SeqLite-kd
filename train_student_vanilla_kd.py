@@ -1459,28 +1459,6 @@ def evaluate_and_save(
         json.dump(test_metrics, f, indent=2)
     pfn(f"Test metrics saved: {metrics_path}")
 
-    # ── SDF-domain metrics (Table 1/2/3 of the paper) ─────────────────────────
-    # Computed on the raw output decay sequences (res), not the lifetime params.
-    # res_test shape: (N, T, 3)  — ch0=full, ch1=short, ch2=long
-    # student_preds shape: (N, T, 3)
-    pfn("=" * 60)
-    pfn("SDF-domain metrics (paper Table 1/2/3): RMSE, R², L2-norm, DTW")
-    pfn("=" * 60)
-    sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
-    sdf_metrics = compute_sdf_metrics(
-        gt_seqs       = res_test.astype(np.float32),
-        pred_seqs     = student_preds,
-        channel_names = sdf_channel_names,
-        pfn           = pfn,
-    )
-    sdf_metrics["job_name"] = job_name
-    sdf_metrics["n_test"]   = int(len(test_idx))
-    sdf_metrics_path = os.path.join(job_dir, "test_sdf_metrics.json")
-    with open(sdf_metrics_path, "w") as f:
-        json.dump(sdf_metrics, f, indent=2)
-    pfn(f"SDF metrics saved: {sdf_metrics_path}")
-    # ─────────────────────────────────────────────────────────────────────────
-
     panels = [
         (tau1_gt, tau1_pred, m1, "τ₁ (ns)", "GT τ₁ (ns)", "Pred τ₁ (ns)",
          (0, 3.0), "Blues",   "test_scatter_tau1.png"),
@@ -1547,7 +1525,32 @@ def evaluate_and_save(
     plt.close(fig)
     pfn(f"Residuals saved: {residuals_path}")
 
+    # ── SDF-domain metrics (Table 1/2/3 of the paper) ─────────────────────────
+    # Computed AFTER scatter PNGs so a DTW timeout/OOM never blocks scatter output.
+    # Wrapped in try/except so any failure is logged but does not abort the run.
+    pfn("=" * 60)
+    pfn("SDF-domain metrics (paper Table 1/2/3): RMSE, R², L2-norm, DTW")
+    pfn("=" * 60)
+    try:
+        sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
+        sdf_metrics = compute_sdf_metrics(
+            gt_seqs       = res_test.astype(np.float32),
+            pred_seqs     = student_preds,
+            channel_names = sdf_channel_names,
+            pfn           = pfn,
+        )
+        sdf_metrics["job_name"] = job_name
+        sdf_metrics["n_test"]   = int(len(test_idx))
+        sdf_metrics_path = os.path.join(job_dir, "test_sdf_metrics.json")
+        with open(sdf_metrics_path, "w") as f:
+            json.dump(sdf_metrics, f, indent=2)
+        pfn(f"SDF metrics saved: {sdf_metrics_path}")
+    except Exception as _sdf_exc:
+        pfn(f"WARNING: SDF metrics computation failed and was skipped: {_sdf_exc}")
+        pfn("Scatter PNGs and test_metrics.json were already saved above.")
+
     return test_metrics
+
 # ==============================================================================
 # main
 # ==============================================================================
