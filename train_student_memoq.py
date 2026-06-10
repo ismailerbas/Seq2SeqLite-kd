@@ -889,9 +889,11 @@ def cache_teacher_predictions_and_hidden(
         pf(f"[CACHE] Teacher hidden cache found: {file_hidden}")
 
     if not need_pred and not need_hidden:
+        # Open BOTH as memmap — never load into RAM here.
+        # materialise_memoq_buffers reads only the needed split indices.
         teacher_predictions = np.load(file_pred,   mmap_mode="r")
         teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}")
+        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}  (both memmap)")
         sys.stdout.flush()
         return teacher_predictions, teacher_hidden
 
@@ -944,15 +946,14 @@ def cache_teacher_predictions_and_hidden(
             pf(f"[CACHE] {b+1:>4}/{n_batches}  {pct:5.1f}%  elapsed={elapsed/60:.1f}min  ETA={eta/60:.1f}min")
             sys.stdout.flush()
 
-    pf("[CACHE] Cache complete. Reopening read-only...")
+    pf("[CACHE] Cache complete. Reopening read-only as memmap...")
     sys.stdout.flush()
 
     teacher_predictions = np.load(file_pred,   mmap_mode="r")
     teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-    pf(f"[CACHE] pred={teacher_predictions.shape}  hidden={teacher_hidden.shape}")
+    pf(f"[CACHE] pred={teacher_predictions.shape}  hidden={teacher_hidden.shape}  (both memmap)")
     sys.stdout.flush()
     return teacher_predictions, teacher_hidden
-
 
 # ==============================================================================
 # Materialise split buffers into contiguous RAM
@@ -3292,6 +3293,43 @@ def make_memoq_dataset(
 # materialise_memoq_buffers:
 # Like materialise_enc_tgt_tpred but also materialises teacher_hidden.
 # ==============================================================================
+class _MemmapSubset:
+    """
+    Lightweight wrapper around a np.memmap that provides integer-indexed access
+    to a pre-sorted subset without loading the full array into RAM.
+
+    Reads are sequential in on-disk order (sorted_idx) to minimise random I/O.
+    Accessed via plain integer index into the logical (original) subset order
+    using the stored unsort_order permutation.
+
+    Parameters
+    ----------
+    mmap        : np.memmap  full memory-mapped array, shape (N_total, T, H)
+    sorted_idx  : np.ndarray int64, sorted indices into the full array
+    unsort_order: np.ndarray int64, argsort(argsort(original_idx))
+                  maps logical position → sorted position
+    """
+    def __init__(self, mmap, sorted_idx, unsort_order):
+        self._mmap        = mmap
+        self._sorted_idx  = sorted_idx
+        self._unsort      = unsort_order
+
+    def __len__(self):
+        return len(self._sorted_idx)
+
+    def __getitem__(self, i):
+        """Return sample at logical position i as a float32 ndarray (T, H)."""
+        disk_pos = self._unsort[i]
+        return self._mmap[self._sorted_idx[disk_pos]].astype(np.float32)
+
+    @property
+    def shape(self):
+        return (len(self._sorted_idx),) + self._mmap.shape[1:]
+
+    @property
+    def dtype(self):
+        return np.float32
+
 
 def materialise_memoq_buffers(
     normalized_input,
@@ -3305,25 +3343,55 @@ def materialise_memoq_buffers(
 ):
     """
     Materialise enc/tgt/tpred split into contiguous float32 RAM buffers.
+
+    normalized_input   : np.memmap or ndarray (N_total, T) or (N_total, T, 1)
+    res                : np.memmap or ndarray (N_total, T, n_out) or (N_total, T)
+    teacher_predictions: np.memmap or ndarray (N_total, T, n_out)
+    idx                : np.ndarray int64, split indices into the full arrays
+    seq_len            : int
+    n_out              : int
+    label              : str  'train' or 'val'
+    pf                 : callable print function
+
+    Reads in sorted-index order from memmap arrays to keep disk I/O sequential,
+    then unsorts so the returned buffers are in the original idx order.
+
     Teacher hidden states are NOT materialised here — they are computed
-    on-the-fly inside the train step from the live teacher_hidden_model
-    to avoid the ~443 GB RAM cost of storing (N, 135, 128) float32 for
-    the full training split.
+    on-the-fly inside the train/val step from the live teacher_hidden_model
+    to avoid the ~110 GB RAM cost of storing (N, T, teacher_units) float32.
     """
     n = len(idx)
     pf(f"  Materialising {label} enc/tgt/tpred ({n:,} samples) into RAM...")
     t0 = time.time()
 
-    enc   = np.empty((n, seq_len, 1),    dtype=np.float32)
+    # Sort idx for sequential on-disk access, then compute inverse permutation.
+    sort_order   = np.argsort(idx)
+    sorted_idx   = idx[sort_order]
+    unsort_order = np.argsort(sort_order)
+
+    enc   = np.empty((n, seq_len, 1),     dtype=np.float32)
     tgt   = np.empty((n, seq_len, n_out), dtype=np.float32)
     tpred = np.empty((n, seq_len, n_out), dtype=np.float32)
 
-    chunk = 65536
+    chunk = 32768
     for s in range(0, n, chunk):
-        e          = min(s + chunk, n)
-        enc[s:e]   = normalized_input[idx[s:e]]
-        tgt[s:e]   = res[idx[s:e]]
-        tpred[s:e] = teacher_predictions[idx[s:e]]
+        e        = min(s + chunk, n)
+        sort_pos = sort_order[s:e]
+        src_idx  = sorted_idx[s:e]
+
+        raw_enc = normalized_input[src_idx]
+        if raw_enc.ndim == 2:
+            raw_enc = raw_enc[:, :, np.newaxis]
+        enc[sort_pos] = raw_enc.astype(np.float32)
+
+        raw_tgt = res[src_idx]
+        if raw_tgt.ndim == 2:
+            raw_tgt = raw_tgt[:, :, np.newaxis]
+        if raw_tgt.shape[2] != n_out:
+            raw_tgt = np.broadcast_to(raw_tgt, (e - s, seq_len, n_out)).copy()
+        tgt[sort_pos] = raw_tgt.astype(np.float32)
+
+        tpred[sort_pos] = teacher_predictions[src_idx].astype(np.float32)
 
     pf(
         f"  Done in {time.time() - t0:.1f}s  "
@@ -3331,8 +3399,8 @@ def materialise_memoq_buffers(
         f"tgt={tgt.nbytes / 1e9:.2f} GB  "
         f"tpred={tpred.nbytes / 1e9:.2f} GB"
     )
+    sys.stdout.flush()
     return enc, tgt, tpred
-
 # ==============================================================================
 # transfer_float_to_phase2:
 # Transfer weights from phase1 float student (standard Keras GRU) into the
