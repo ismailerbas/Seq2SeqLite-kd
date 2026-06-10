@@ -2552,119 +2552,78 @@ def make_dist_memoq_train(
     has_z_logit,
     clipnorm,
 ):
-    alpha_f      = tf.cast(alpha,        tf.float32)
-    lambda_m_f   = tf.cast(lambda_m,     tf.float32)
-    lambda_i_f   = tf.cast(lambda_i,     tf.float32)
-    lambda_z_f   = tf.cast(lambda_z,     tf.float32)
-    lambda_r_f   = tf.cast(lambda_r,     tf.float32)
-    eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
-    clipnorm_f   = tf.cast(clipnorm,     tf.float32)
+    teacher_hidden_model_ref = phase2_model._teacher_hidden_model
 
-    def train_step_per_replica(
-        batch_x,
-        batch_y,
-        student_model,
-        teacher_hidden_model,
-        optimizer,
-        temperature,
-        alpha,
-        lambda_mem,
-        lambda_innov,
-        lambda_zsat,
-        lambda_rail,
-        epsilon_innov,
-        lag_set,
-        lag_weights,
-        use_mem,
-        use_innov,
-        use_zsat,
-        use_rail,
-        rho_z,
-        rho_rail,
-        mu_rail,
-    ):
+    alpha_f      = tf.cast(alpha,         tf.float32)
+    lambda_m_f   = tf.cast(lambda_m,      tf.float32)
+    lambda_i_f   = tf.cast(lambda_i,      tf.float32)
+    lambda_z_f   = tf.cast(lambda_z,      tf.float32)
+    lambda_r_f   = tf.cast(lambda_r,      tf.float32)
+    eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
+    clipnorm_f   = tf.cast(clipnorm,      tf.float32)
+    seq_len_int  = int(seq_len)
+
+    def train_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
         dec_b   = batch_x["dec_input"]
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        alpha_f        = tf.cast(alpha,        tf.float32)
-        lambda_mem_f   = tf.cast(lambda_mem,   tf.float32)
-        lambda_innov_f = tf.cast(lambda_innov, tf.float32)
-        lambda_zsat_f  = tf.cast(lambda_zsat,  tf.float32)
-        lambda_rail_f  = tf.cast(lambda_rail,  tf.float32)
-
-        # Compute teacher hidden on-the-fly — avoids materialising the full
-        # (N, 135, 128) float32 teacher hidden array (~443 GB RAM).
-        # teacher_hidden_model is frozen (trainable=False) so this does not
-        # contribute to the gradient tape.
-        h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
+        h_teacher = teacher_hidden_model_ref([enc_b, dec_b], training=False)
 
         with tf.GradientTape() as tape:
-            student_outputs = student_model([enc_b, dec_b], training=True)
+            model_out = phase2_model([enc_b, dec_b], training=True)
 
-            if isinstance(student_outputs, (list, tuple)) and len(student_outputs) >= 3:
-                s_pred       = student_outputs[0]
-                h_student    = student_outputs[1]
-                dec_z_logits = student_outputs[2]
-            elif isinstance(student_outputs, (list, tuple)) and len(student_outputs) == 2:
-                s_pred    = student_outputs[0]
-                h_student = student_outputs[1]
-                dec_z_logits = None
+            if has_z_logit:
+                s_pred, s_hid, z_logits = model_out[0], model_out[1], model_out[2]
             else:
-                s_pred    = student_outputs
-                h_student = None
-                dec_z_logits = None
+                s_pred, s_hid = model_out[0], model_out[1]
+                z_logits = None
 
-            hard_loss = huber_channel_norm_loss(s_pred, tgt_b, delta=0.1)
-            soft_loss = tf.reduce_mean(tf.square(tpred_b - s_pred))
-            total = (1.0 - alpha_f) * hard_loss + alpha_f * soft_loss
+            l_seq = channel_normalised_huber_memoq(tgt_b,   s_pred, channel_scales, huber_delta)
+            l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
+            total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            has_hidden   = h_student is not None
-            has_z_logit  = dec_z_logits is not None
-
-            if use_mem and has_hidden:
-                l_m = loss_mem(h_student, h_teacher, lag_set, lag_weights)
-                total = total + lambda_mem_f * l_m
+            if use_mem:
+                l_m = loss_mem(s_hid, h_teacher, seq_len_int)
+                total = total + lambda_m_f * l_m
             else:
                 l_m = tf.constant(0.0, dtype=tf.float32)
 
-            if use_innov and has_hidden:
-                l_i = loss_innov(h_student, h_teacher, epsilon_innov)
-                total = total + lambda_innov_f * l_i
+            if use_innov:
+                l_i = loss_innov(s_hid, h_teacher, eps_innov_f)
+                total = total + lambda_i_f * l_i
             else:
                 l_i = tf.constant(0.0, dtype=tf.float32)
 
-            if use_zsat and has_z_logit:
-                z_vals = tf.sigmoid(dec_z_logits)
-                l_z = loss_zsat_value(z_vals, rho_z=rho_z)
-                total = total + lambda_zsat_f * l_z
+            if use_zsat and has_z_logit and z_logits is not None:
+                z_vals = tf.sigmoid(z_logits)
+                l_z = loss_zsat_value(z_vals, rho_z=0.98)
+                total = total + lambda_z_f * l_z
             else:
                 l_z = tf.constant(0.0, dtype=tf.float32)
 
-            if use_rail and has_hidden:
-                l_r = loss_railpred(h_student, rho_rail=rho_rail, mu_rail=mu_rail)
-                total = total + lambda_rail_f * l_r
+            if use_rail:
+                l_r = loss_railpred(s_hid, rho_rail, mu_rail)
+                total = total + lambda_r_f * l_r
             else:
                 l_r = tf.constant(0.0, dtype=tf.float32)
 
-        grads = tape.gradient(total, student_model.trainable_variables)
+        grads = tape.gradient(total, phase2_model.trainable_variables)
         grads = [
             tf.zeros_like(v) if g is None else g
-            for g, v in zip(grads, student_model.trainable_variables)
+            for g, v in zip(grads, phase2_model.trainable_variables)
         ]
-
         nan_in_grads = tf.reduce_any(tf.stack([
             tf.reduce_any(tf.math.is_nan(g)) for g in grads
         ]))
-
-        grads, _ = tf.clip_by_global_norm(grads, clip_norm=0.5)
-        optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
+        grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
+        optimizer.apply_gradients(zip(grads, phase2_model.trainable_variables))
 
         return (
             total,
-            hard_loss,
-            soft_loss,
+            l_seq,
+            l_kd,
             l_m,
             l_i,
             l_z,
@@ -2681,7 +2640,6 @@ def make_dist_memoq_train(
         )
 
     return dist_step
-
 
 def make_dist_memoq_val(
     strategy,
@@ -2703,109 +2661,72 @@ def make_dist_memoq_val(
     use_rail,
     has_z_logit,
 ):
+    teacher_hidden_model_ref = phase2_model._teacher_hidden_model
+
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
+    seq_len_int  = int(seq_len)
 
-    def val_step_per_replica(
-        batch_x,
-        batch_y,
-        student_model,
-        teacher_hidden_model,
-        temperature,
-        alpha,
-        lambda_mem,
-        lambda_innov,
-        lambda_zsat,
-        lambda_rail,
-        epsilon_innov,
-        lag_set,
-        lag_weights,
-        use_mem,
-        use_innov,
-        use_zsat,
-        use_rail,
-        rho_z,
-        rho_rail,
-        mu_rail,
-    ):
+    def val_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
         dec_b   = batch_x["dec_input"]
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        alpha_f        = tf.cast(alpha,        tf.float32)
-        lambda_mem_f   = tf.cast(lambda_mem,   tf.float32)
-        lambda_innov_f = tf.cast(lambda_innov, tf.float32)
-        lambda_zsat_f  = tf.cast(lambda_zsat,  tf.float32)
-        lambda_rail_f  = tf.cast(lambda_rail,  tf.float32)
+        h_teacher = teacher_hidden_model_ref([enc_b, dec_b], training=False)
 
-        # Compute teacher hidden on-the-fly — same pattern as train step.
-        h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
+        model_out = phase2_model([enc_b, dec_b], training=False)
 
-        student_outputs = student_model([enc_b, dec_b], training=False)
-
-        if isinstance(student_outputs, (list, tuple)) and len(student_outputs) >= 3:
-            s_pred       = student_outputs[0]
-            h_student    = student_outputs[1]
-            dec_z_logits = student_outputs[2]
-        elif isinstance(student_outputs, (list, tuple)) and len(student_outputs) == 2:
-            s_pred    = student_outputs[0]
-            h_student = student_outputs[1]
-            dec_z_logits = None
+        if has_z_logit:
+            s_pred, s_hid, z_logits = model_out[0], model_out[1], model_out[2]
         else:
-            s_pred    = student_outputs
-            h_student = None
-            dec_z_logits = None
+            s_pred, s_hid = model_out[0], model_out[1]
+            z_logits = None
 
-        hard_loss = huber_channel_norm_loss(s_pred, tgt_b, delta=0.1)
-        soft_loss = tf.reduce_mean(tf.square(tpred_b - s_pred))
-        total = (1.0 - alpha_f) * hard_loss + alpha_f * soft_loss
-        mae   = tf.reduce_mean(tf.abs(s_pred - tgt_b))
+        l_seq = channel_normalised_huber_memoq(tgt_b,   s_pred, channel_scales, huber_delta)
+        l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
+        total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        has_hidden   = h_student is not None
-        has_z_logit  = dec_z_logits is not None
-
-        if use_mem and has_hidden:
-            l_m = loss_mem(h_student, h_teacher, lag_set, lag_weights)
-            total = total + lambda_mem_f * l_m
+        if use_mem:
+            l_m = loss_mem(s_hid, h_teacher, seq_len_int)
+            total = total + lambda_m_f * l_m
         else:
             l_m = tf.constant(0.0, dtype=tf.float32)
 
-        if use_innov and has_hidden:
-            l_i = loss_innov(h_student, h_teacher, epsilon_innov)
-            total = total + lambda_innov_f * l_i
+        if use_innov:
+            l_i = loss_innov(s_hid, h_teacher, eps_innov_f)
+            total = total + lambda_i_f * l_i
         else:
             l_i = tf.constant(0.0, dtype=tf.float32)
 
-        if use_zsat:
-            if has_z_logit and dec_z_logits is not None:
-                z_vals = tf.sigmoid(dec_z_logits)
-                l_z = loss_zsat_value(z_vals, rho_z=rho_z)
-                total = total + lambda_zsat_f * l_z
-            else:
-                l_z = tf.constant(0.0, dtype=tf.float32)
+        if use_zsat and has_z_logit and z_logits is not None:
+            z_vals = tf.sigmoid(z_logits)
+            l_z = loss_zsat_value(z_vals, rho_z=0.98)
+            total = total + lambda_z_f * l_z
         else:
             l_z = tf.constant(0.0, dtype=tf.float32)
 
-        if use_rail and has_hidden:
-            l_r = loss_railpred(h_student, rho_rail=rho_rail, mu_rail=mu_rail)
-            total = total + lambda_rail_f * l_r
+        if use_rail:
+            l_r = loss_railpred(s_hid, rho_rail, mu_rail)
+            total = total + lambda_r_f * l_r
         else:
             l_r = tf.constant(0.0, dtype=tf.float32)
 
+        mae = tf.reduce_mean(tf.abs(s_pred - tgt_b))
+
         return (
             total,
-            hard_loss,
-            soft_loss,
-            mae,
+            l_seq,
+            l_kd,
             l_m,
             l_i,
             l_z,
             l_r,
+            mae,
         )
 
     @tf.function
@@ -2817,7 +2738,6 @@ def make_dist_memoq_val(
         )
 
     return dist_val_step
-
 
 # ==============================================================================
 # make_dist_memoq_train_final / make_dist_memoq_val_final:
@@ -2880,6 +2800,7 @@ def make_dist_memoq_train_final(
     clipnorm,
 ):
     final_hidden_model = build_final_hidden_model(final_qkeras_student)
+    teacher_hidden_model_ref = final_qkeras_student._teacher_hidden_model
 
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -2888,22 +2809,24 @@ def make_dist_memoq_train_final(
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,      tf.float32)
+    seq_len_int  = int(seq_len)
 
     def train_step_per_replica(batch_x, batch_y):
-        enc_b         = batch_x["enc_input"]
-        dec_b         = batch_x["dec_input"]
-        tpred_b       = batch_x["tpred"]
-        teacher_hid_b = batch_x["teacher_hidden"]
-        tgt_b         = batch_y
+        enc_b   = batch_x["enc_input"]
+        dec_b   = batch_x["dec_input"]
+        tpred_b = batch_x["tpred"]
+        tgt_b   = batch_y
+
+        teacher_hid_b = teacher_hidden_model_ref([enc_b, dec_b], training=False)
 
         with tf.GradientTape() as tape:
             seq_out, dec_h_seq = final_hidden_model([enc_b, dec_b], training=True)
 
             l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
             l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
-            total = alpha_f * l_kd + (1.0 - alpha_f) * l_seq
+            total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len)
+            l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
             total = total + lambda_m_f * l_m
 
             l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
@@ -2912,16 +2835,12 @@ def make_dist_memoq_train_final(
             l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
             total = total + lambda_r_f * l_r
 
-            # Phase 3 z_sat: use dec_h_seq as proxy (no z_logit in hard QGRU).
-            # We skip L_zsat in P3 unless lambda_z > 0 AND we want to fire it.
-            # With lambda_z = 0.001 we apply a soft version on the hidden state
-            # magnitude directly (clamp very close to 1.0).
             if lambda_z > 0.0:
                 excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.95)
                 l_z = tf.reduce_mean(tf.square(excess_z))
                 total = total + lambda_z_f * l_z
             else:
-                l_z = tf.constant(0.0)
+                l_z = tf.constant(0.0, dtype=tf.float32)
 
         grads = tape.gradient(total, final_qkeras_student.trainable_variables)
         grads = [
@@ -2962,6 +2881,7 @@ def make_dist_memoq_val_final(
     mu_rail,
 ):
     final_hidden_model_val = build_final_hidden_model(final_qkeras_student)
+    teacher_hidden_model_ref = final_qkeras_student._teacher_hidden_model
 
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -2969,21 +2889,23 @@ def make_dist_memoq_val_final(
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
+    seq_len_int  = int(seq_len)
 
     def val_step_per_replica(batch_x, batch_y):
-        enc_b         = batch_x["enc_input"]
-        dec_b         = batch_x["dec_input"]
-        tpred_b       = batch_x["tpred"]
-        teacher_hid_b = batch_x["teacher_hidden"]
-        tgt_b         = batch_y
+        enc_b   = batch_x["enc_input"]
+        dec_b   = batch_x["dec_input"]
+        tpred_b = batch_x["tpred"]
+        tgt_b   = batch_y
+
+        teacher_hid_b = teacher_hidden_model_ref([enc_b, dec_b], training=False)
 
         seq_out, dec_h_seq = final_hidden_model_val([enc_b, dec_b], training=False)
 
         l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
         l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
-        total = alpha_f * l_kd + (1.0 - alpha_f) * l_seq
+        total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len)
+        l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
         total = total + lambda_m_f * l_m
 
         l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
@@ -3268,24 +3190,43 @@ def cache_teacher_hidden(
 # Runs once before training.
 # ==============================================================================
 
-def compute_epsilon_innov(teacher_hidden_train, pf):
+def compute_epsilon_innov_from_model(
+    teacher_hidden_model,
+    enc_train,
+    seq_len,
+    infer_batch,
+    pf,
+):
     """
-    epsilon_innov = 0.1 * median(v_t(teacher)) over all timesteps.
-    teacher_hidden_train: np.ndarray (N, T, H_t)
-    Precomputed once before training begins.
+    Compute epsilon_innov = 0.1 * median(v_t(teacher)) by running a small
+    inference pass over at most 50000 training samples.
+    Used when teacher hidden is not pre-materialised.
     """
-    pf("[EPS_INNOV] Computing epsilon_innov from teacher hidden cache...")
-    n = min(50000, teacher_hidden_train.shape[0])
+    pf("[EPS_INNOV] Computing epsilon_innov via teacher inference on 50k sample subset...")
+    n = min(50000, enc_train.shape[0])
     rng = np.random.default_rng(seed=0)
-    idx = rng.choice(teacher_hidden_train.shape[0], n, replace=False)
-    h = teacher_hidden_train[idx].astype(np.float32)    # (n, T, H)
-    delta = h[:, 1:, :] - h[:, :-1, :]                  # (n, T-1, H)
-    v = np.mean(delta ** 2, axis=(0, 2))                 # (T-1,)
+    idx = rng.choice(enc_train.shape[0], n, replace=False)
+    enc_sub = enc_train[idx].astype(np.float32)
+    dec_sub = np.zeros((n, seq_len, 1), dtype=np.float32)
+
+    h_list = []
+    for s in range(0, n, infer_batch):
+        e = min(s + infer_batch, n)
+        enc_b = tf.constant(enc_sub[s:e], dtype=tf.float32)
+        dec_b = tf.constant(dec_sub[s:e], dtype=tf.float32)
+        h_chunk = teacher_hidden_model([enc_b, dec_b], training=False).numpy()
+        h_list.append(h_chunk)
+        del enc_b, dec_b, h_chunk
+
+    h = np.concatenate(h_list, axis=0).astype(np.float32)
+    delta = h[:, 1:, :] - h[:, :-1, :]
+    v = np.mean(delta ** 2, axis=(0, 2))
     eps = 0.1 * float(np.median(v))
     eps = max(eps, 1e-6)
     pf(f"[EPS_INNOV] epsilon_innov={eps:.2e}  median_vt={float(np.median(v)):.2e}")
     sys.stdout.flush()
     return eps
+
 # ==============================================================================
 # make_memoq_kd_dataset:
 # Extends make_kd_dataset to include teacher_hidden in batch_x.
@@ -4056,7 +3997,13 @@ def main():
     channel_scales = tf.constant(channel_scales_np, dtype=tf.float32)
 
     # ── Epsilon innov ─────────────────────────────────────────────────────────
-    epsilon_innov = compute_epsilon_innov(thid_tr, pf)
+    epsilon_innov = compute_epsilon_innov_from_model(
+        teacher_hidden_model,
+        enc_train,
+        args.seq_len,
+        args.infer_batch,
+        pf,
+    )
 
     # ── teacher_hidden_dim ────────────────────────────────────────────────────
     teacher_hidden_dim = teacher_hidden_all.shape[2]
@@ -4102,6 +4049,7 @@ def main():
             student_units=args.student_units,
             input_dim=1,
         )
+    phase2_model._teacher_hidden_model = teacher_hidden_model    
     phase2_model.summary(print_fn=pf)
 
     pf("[MAIN] Building final hard QKeras student (Phase 3)...")
@@ -4116,6 +4064,7 @@ def main():
             bits_activation  = args.bits_activation,
             bits_state       = args.bits_state,
         )
+    final_qkeras_student._teacher_hidden_model = teacher_hidden_model    
     final_qkeras_student.summary(print_fn=pf)
 
     # ── Run training ──────────────────────────────────────────────────────────
