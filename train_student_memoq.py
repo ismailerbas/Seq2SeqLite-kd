@@ -172,8 +172,8 @@ def parse_args():
     p.add_argument("--memoq-lambda-rail",        type=float, default=0.001)
     p.add_argument("--memoq-huber-delta",        type=float, default=0.1)
     p.add_argument("--memoq-rho-z",              type=float, default=0.98)
-    p.add_argument("--memoq-rho-rail",           type=float, default=0.88)
-    p.add_argument("--memoq-mu-rail",            type=float, default=0.9)
+    p.add_argument("--memoq-rho-rail",           type=float, default=0.90)
+    p.add_argument("--memoq-mu-rail",            type=float, default=1.0)
     p.add_argument("--memoq-innov-burnin",       type=int,   default=5)
     p.add_argument("--memoq-phase3-lr",          type=float, default=5e-6,
                    help="Fixed LR for Phase 3 hard fine-tune.")
@@ -2413,7 +2413,13 @@ def loss_innov(h_student, h_teacher, epsilon_innov):
     """
     Temporal innovation-profile matching loss L_innov.
 
-    Uses log-ratio form with calibrated epsilon to avoid log-domain spikes.
+    Matches the per-timestep innovation curve between teacher and student
+    using a log-scale squared difference. This prevents a bad 4-bit GRU from
+    gaming a scalar variance match by shifting changes to the wrong timesteps.
+
+    Formula:
+      v_t(h) = (1/H) * sum_d (h_t_d - h_{t-1}_d)^2   [per timestep]
+      L_innov = (1/(T-1)) * sum_t [ log(v_t(h^S) + eps) - log(v_t(h^T) + eps) ]^2
 
     h_student     : (batch, T, Hs)
     h_teacher     : (batch, T, Ht)
@@ -2421,12 +2427,16 @@ def loss_innov(h_student, h_teacher, epsilon_innov):
 
     Returns scalar tf.Tensor.
     """
-    v_s = compute_innovation_profile(h_student)
-    v_t = compute_innovation_profile(h_teacher)
-
     eps = tf.cast(epsilon_innov, tf.float32)
-    log_ratio = tf.math.log((v_s + eps) / (v_t + eps))
-    return tf.reduce_mean(tf.square(log_ratio))
+
+    diff_s = h_student[:, 1:, :] - h_student[:, :-1, :]
+    diff_t = h_teacher[:, 1:, :] - h_teacher[:, :-1, :]
+
+    v_s = tf.reduce_mean(tf.square(diff_s), axis=[0, 2])
+    v_t = tf.reduce_mean(tf.square(diff_t), axis=[0, 2])
+
+    log_diff = tf.math.log(v_s + eps) - tf.math.log(v_t + eps)
+    return tf.reduce_mean(tf.square(log_diff))
 
 
 def loss_zsat_logit(z_logit_seq, logit_threshold=3.0):
@@ -2461,18 +2471,23 @@ def loss_zsat_value(z_values, rho_z=0.98):
     return tf.reduce_mean(tf.square(penalty_hi) + tf.square(penalty_lo))
 
 
-def loss_railpred(h_student, rho_rail=0.88, mu_rail=0.9):
+def loss_railpred(h_student, rho_rail=0.90, mu_rail=1.0):
     """
     Predictive rail-margin regularization L_railpred.
 
-    Penalises hidden states predicted to hit the quantization boundary
-    before saturation (forward-looking).
+    Penalises hidden states that are not yet at the quantizer rail but are
+    moving toward it fast enough to hit it at the next step. This fires
+    BEFORE the boundary hit, solving early rail collision.
+
+    Formula:
+      L_railpred = E_{t,d} [ ReLU( |h_t^q| + mu * |h_t^q - h_{t-1}^q| - rho )^2 ]
+
+    rho  = 0.90  (spec: rho=0.90)
+    mu   = 1.0   (spec: mu=1.0, one-step predictive weight)
 
     h_student : (batch, T, H) — student decoder hidden sequence
-    rho_rail  : float, boundary threshold (default 0.88 for tanh in [-1,1])
-    mu_rail   : float, predictive step weight (default 0.9)
-
-    L_railpred = mean(ReLU(|h_t| + mu * |h_t - h_{t-1}| - rho)^2)
+    rho_rail  : float, boundary threshold, default 0.90 per spec
+    mu_rail   : float, predictive step weight, default 1.0 per spec
 
     Returns scalar tf.Tensor.
     """
@@ -2670,11 +2685,15 @@ def make_dist_memoq_val(
         else:
             l_i = tf.constant(0.0)
 
-        if use_zsat and has_z_logit:
-            l_z = loss_zsat_logit(dec_z_logit_seq)
-            total = total + lambda_z_f * l_z
+        if use_zsat:
+            if has_z_logit and dec_z_logit_seq is not None:
+                z_vals = tf.sigmoid(dec_z_logit_seq)
+                l_z = loss_zsat_value(z_vals, rho_z=0.98)
+                total = total + lambda_z_f * l_z
+            else:
+                l_z = tf.constant(0.0, dtype=tf.float32)
         else:
-            l_z = tf.constant(0.0)
+            l_z = tf.constant(0.0, dtype=tf.float32)
 
         if use_rail:
             l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
