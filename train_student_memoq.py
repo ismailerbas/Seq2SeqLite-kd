@@ -4030,16 +4030,16 @@ def main():
 
     # ── Cache teacher predictions and hidden states ───────────────────────────
     teacher_predictions, teacher_hidden_all = cache_teacher_predictions_and_hidden(
-        teacher_model       = teacher_model,
-        teacher_hidden_model= teacher_hidden_model,
-        normalized_input    = normalized_input,
-        seq_len             = args.seq_len,
-        n_out               = args.n_out,
-        teacher_units       = args.teacher_units,
-        n_samples           = n_total,
-        infer_batch         = args.infer_batch,
-        data_dir            = args.data_dir,
-        pf                  = pf,
+        teacher_model        = teacher_model,
+        teacher_hidden_model = teacher_hidden_model,
+        normalized_input     = normalized_input,
+        seq_len              = args.seq_len,
+        n_out                = args.n_out,
+        teacher_units        = args.teacher_units,
+        n_samples            = n_total,
+        infer_batch          = args.infer_batch,
+        data_dir             = args.data_dir,
+        pf                   = pf,
     )
 
     # ── Materialise train / val buffers ───────────────────────────────────────
@@ -4067,7 +4067,7 @@ def main():
     # ── Epsilon innov ─────────────────────────────────────────────────────────
     epsilon_innov = compute_epsilon_innov_from_model(
         teacher_hidden_model,
-        enc_train,
+        enc_tr,
         args.seq_len,
         args.infer_batch,
         pf,
@@ -4112,27 +4112,27 @@ def main():
     pf("[MAIN] Building Phase 2 split-gate model...")
     with strategy.scope():
         phase2_model, enc_cell_p2, dec_cell_p2 = build_phase2_model(
-            seq_len=args.seq_len,
-            n_out=args.n_out,
-            student_units=args.student_units,
-            input_dim=1,
+            seq_len      = args.seq_len,
+            n_out        = args.n_out,
+            student_units= args.student_units,
+            input_dim    = 1,
         )
-    phase2_model._teacher_hidden_model = teacher_hidden_model    
+    phase2_model._teacher_hidden_model = teacher_hidden_model
     phase2_model.summary(print_fn=pf)
 
     pf("[MAIN] Building final hard QKeras student (Phase 3)...")
     with strategy.scope():
         final_qkeras_student = build_final_qkeras_student(
-            seq_len          = args.seq_len,
-            n_out            = args.n_out,
-            student_units    = args.student_units,
-            bits_kernel      = args.bits_kernel,
-            bits_recurrent   = args.bits_recurrent,
-            bits_bias        = args.bits_bias,
-            bits_activation  = args.bits_activation,
-            bits_state       = args.bits_state,
+            seq_len         = args.seq_len,
+            n_out           = args.n_out,
+            student_units   = args.student_units,
+            bits_kernel     = args.bits_kernel,
+            bits_recurrent  = args.bits_recurrent,
+            bits_bias       = args.bits_bias,
+            bits_activation = args.bits_activation,
+            bits_state      = args.bits_state,
         )
-    final_qkeras_student._teacher_hidden_model = teacher_hidden_model    
+    final_qkeras_student._teacher_hidden_model = teacher_hidden_model
     final_qkeras_student.summary(print_fn=pf)
 
     # ── Run training ──────────────────────────────────────────────────────────
@@ -4187,6 +4187,9 @@ def main():
     pf("[MAIN] Done.")
     sys.stdout.flush()
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
