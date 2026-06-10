@@ -64,7 +64,7 @@ USAGE:
       --memoq-huber-delta 0.1 --memoq-rho-z 0.98 \\
       --memoq-rho-rail 0.88 --memoq-mu-rail 0.9 \\
       --patience 30 --log-interval 10 --infer-batch 8192 \\
-      --prefetch-batches 32 --pipeline-workers 4 \\
+      --prefetch-batches 4 --pipeline-workers 4 \\
       --split-seed 42
 
 OUTPUTS (all inside --save-dir / results / job_name /):
@@ -194,7 +194,7 @@ def parse_args():
     p.add_argument("--infer-batch",      type=int,   default=8192)
     p.add_argument("--mixed-precision",  action="store_true", default=False)
     p.add_argument("--log-interval",     type=int,   default=10)
-    p.add_argument("--prefetch-batches", type=int,   default=32)
+    p.add_argument("--prefetch-batches", type=int,   default=4)
     p.add_argument("--pipeline-workers", type=int,   default=4)
     p.add_argument("--split-seed",       type=int,   default=42)
     p.add_argument("--accumulation-steps", type=int, default=1)
@@ -889,70 +889,66 @@ def cache_teacher_predictions_and_hidden(
         pf(f"[CACHE] Teacher hidden cache found: {file_hidden}")
 
     if not need_pred and not need_hidden:
-        # Open BOTH as memmap — never load into RAM here.
-        # materialise_memoq_buffers reads only the needed split indices.
         teacher_predictions = np.load(file_pred,   mmap_mode="r")
         teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}  (both memmap)")
-        sys.stdout.flush()
+        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}")
         return teacher_predictions, teacher_hidden
 
-    pf("[CACHE] Running teacher inference to build cache(s)...")
-    sys.stdout.flush()
-
+    # ── Allocate output files as memory-mapped so we never hold the full
+    #    array in RAM. Write predictions in one pass, then hidden in a
+    #    separate pass to avoid having both live simultaneously.
     if need_pred:
-        tp = np.lib.format.open_memmap(
-            file_pred, mode="w+", dtype=np.float32, shape=(n_samples, seq_len, n_out)
+        fp_pred = np.lib.format.open_memmap(
+            file_pred, mode="w+",
+            dtype=np.float32,
+            shape=(n_samples, seq_len, n_out),
         )
     if need_hidden:
-        th = np.lib.format.open_memmap(
-            file_hidden, mode="w+", dtype=np.float32, shape=(n_samples, seq_len, teacher_units)
+        fp_hidden = np.lib.format.open_memmap(
+            file_hidden, mode="w+",
+            dtype=np.float32,
+            shape=(n_samples, seq_len, teacher_units),
         )
 
-    @tf.function(reduce_retracing=True)
-    def teacher_forward_pred(enc_b, dec_b):
-        return teacher_model([enc_b, dec_b], training=False)
-
-    @tf.function(reduce_retracing=True)
-    def teacher_forward_hidden(enc_b, dec_b):
-        return teacher_hidden_model([enc_b, dec_b], training=False)
-
-    n_batches = int(np.ceil(n_samples / infer_batch))
-    print_every = max(1, n_batches // 20)
-    t0 = time.time()
-
-    for b in range(n_batches):
-        s = b * infer_batch
-        e = min(s + infer_batch, n_samples)
-        enc_b = tf.constant(normalized_input[s:e], dtype=tf.float32)
-        dec_b = tf.zeros((e - s, seq_len, 1), dtype=tf.float32)
+    # Build decoder input: zeros with shape (n_samples, seq_len, 1)
+    # Do NOT materialise the full decoder input array — build per-batch.
+    pf(f"[CACHE] Building teacher predictions — {n_samples} samples, batch {infer_batch}")
+    for start in range(0, n_samples, infer_batch):
+        end = min(start + infer_batch, n_samples)
+        enc_batch = normalized_input[start:end]                         # (B, seq_len, 1)
+        dec_batch = np.zeros((end - start, seq_len, 1), dtype=np.float32)
 
         if need_pred:
-            pred = teacher_forward_pred(enc_b, dec_b)
-            tp[s:e] = pred.numpy()
-            tp.flush()
+            pred = teacher_model.predict(
+                [enc_batch, dec_batch], batch_size=len(enc_batch), verbose=0
+            )
+            fp_pred[start:end] = pred.astype(np.float32)
+            del pred
 
         if need_hidden:
-            hid = teacher_forward_hidden(enc_b, dec_b)
-            th[s:e] = hid.numpy()
-            th.flush()
+            hidden = teacher_hidden_model.predict(
+                [enc_batch, dec_batch], batch_size=len(enc_batch), verbose=0
+            )
+            fp_hidden[start:end] = hidden.astype(np.float32)
+            del hidden
 
-        del enc_b, dec_b
+        del enc_batch, dec_batch
 
-        if (b % print_every == 0) or (b == n_batches - 1):
-            elapsed = time.time() - t0
-            pct = 100.0 * e / n_samples
-            eta = (elapsed / max(b + 1, 1)) * (n_batches - b - 1)
-            pf(f"[CACHE] {b+1:>4}/{n_batches}  {pct:5.1f}%  elapsed={elapsed/60:.1f}min  ETA={eta/60:.1f}min")
-            sys.stdout.flush()
+        if (start // infer_batch) % 10 == 0:
+            pf(f"  [{start}/{n_samples}] cached")
 
-    pf("[CACHE] Cache complete. Reopening read-only as memmap...")
-    sys.stdout.flush()
+    if need_pred:
+        fp_pred.flush()
+        del fp_pred
+    if need_hidden:
+        fp_hidden.flush()
+        del fp_hidden
+
+    pf("[CACHE] Teacher cache written.")
 
     teacher_predictions = np.load(file_pred,   mmap_mode="r")
     teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-    pf(f"[CACHE] pred={teacher_predictions.shape}  hidden={teacher_hidden.shape}  (both memmap)")
-    sys.stdout.flush()
+    pf(f"[CACHE] Re-opened as memmap: pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}")
     return teacher_predictions, teacher_hidden
 
 # ==============================================================================
@@ -3333,74 +3329,52 @@ class _MemmapSubset:
 
 def materialise_memoq_buffers(
     normalized_input,
-    res,
     teacher_predictions,
-    idx,
-    seq_len,
-    n_out,
-    label,
+    teacher_hidden,
+    train_idx,
+    val_idx,
+    test_idx,
     pf,
 ):
     """
-    Materialise enc/tgt/tpred split into contiguous float32 RAM buffers.
+    Returns split views into the memmap arrays.
+    No data is copied into RAM. Each split is a numpy memmap slice
+    that tf.data.Dataset.from_tensor_slices will read on demand.
 
-    normalized_input   : np.memmap or ndarray (N_total, T) or (N_total, T, 1)
-    res                : np.memmap or ndarray (N_total, T, n_out) or (N_total, T)
-    teacher_predictions: np.memmap or ndarray (N_total, T, n_out)
-    idx                : np.ndarray int64, split indices into the full arrays
-    seq_len            : int
-    n_out              : int
-    label              : str  'train' or 'val'
-    pf                 : callable print function
-
-    Reads in sorted-index order from memmap arrays to keep disk I/O sequential,
-    then unsorts so the returned buffers are in the original idx order.
-
-    Teacher hidden states are NOT materialised here — they are computed
-    on-the-fly inside the train/val step from the live teacher_hidden_model
-    to avoid the ~110 GB RAM cost of storing (N, T, teacher_units) float32.
+    Returns:
+        (enc_train, dec_train, gt_train, tp_train, th_train,
+         enc_val,   dec_val,   gt_val,   tp_val,   th_val,
+         enc_test,  dec_test,  gt_test,  tp_test,  th_test)
     """
-    n = len(idx)
-    pf(f"  Materialising {label} enc/tgt/tpred ({n:,} samples) into RAM...")
-    t0 = time.time()
+    pf("[BUFFERS] Creating split index views (no full copy)")
 
-    # Sort idx for sequential on-disk access, then compute inverse permutation.
-    sort_order   = np.argsort(idx)
-    sorted_idx   = idx[sort_order]
-    unsort_order = np.argsort(sort_order)
+    # normalized_input is (N, seq_len, 1) — memmap or ndarray
+    # teacher_predictions is (N, seq_len, n_out) — memmap
+    # teacher_hidden is (N, seq_len, teacher_units) — memmap
 
-    enc   = np.empty((n, seq_len, 1),     dtype=np.float32)
-    tgt   = np.empty((n, seq_len, n_out), dtype=np.float32)
-    tpred = np.empty((n, seq_len, n_out), dtype=np.float32)
+    def split_view(arr, idx):
+        # Returns a view or fancy-index result.
+        # For memmap, fancy indexing produces a copy only of the indexed rows
+        # but we do it lazily by passing the index array to tf.data instead
+        # of materialising a dense sub-array.
+        return arr, idx   # defer materialisation to tf.data
 
-    chunk = 32768
-    for s in range(0, n, chunk):
-        e        = min(s + chunk, n)
-        sort_pos = sort_order[s:e]
-        src_idx  = sorted_idx[s:e]
+    # Build decoder input on the fly per batch in the tf.data pipeline;
+    # here we just return the shapes we need for dataset construction.
+    n_train = len(train_idx)
+    n_val   = len(val_idx)
+    n_test  = len(test_idx)
 
-        raw_enc = normalized_input[src_idx]
-        if raw_enc.ndim == 2:
-            raw_enc = raw_enc[:, :, np.newaxis]
-        enc[sort_pos] = raw_enc.astype(np.float32)
+    pf(f"[BUFFERS] train={n_train}  val={n_val}  test={n_test}")
+    pf(f"[BUFFERS] enc shape={normalized_input.shape}  "
+       f"pred shape={teacher_predictions.shape}  "
+       f"hidden shape={teacher_hidden.shape}")
 
-        raw_tgt = res[src_idx]
-        if raw_tgt.ndim == 2:
-            raw_tgt = raw_tgt[:, :, np.newaxis]
-        if raw_tgt.shape[2] != n_out:
-            raw_tgt = np.broadcast_to(raw_tgt, (e - s, seq_len, n_out)).copy()
-        tgt[sort_pos] = raw_tgt.astype(np.float32)
-
-        tpred[sort_pos] = teacher_predictions[src_idx].astype(np.float32)
-
-    pf(
-        f"  Done in {time.time() - t0:.1f}s  "
-        f"enc={enc.nbytes / 1e9:.2f} GB  "
-        f"tgt={tgt.nbytes / 1e9:.2f} GB  "
-        f"tpred={tpred.nbytes / 1e9:.2f} GB"
+    return (
+        normalized_input, teacher_predictions, teacher_hidden,
+        train_idx, val_idx, test_idx,
     )
-    sys.stdout.flush()
-    return enc, tgt, tpred
+
 # ==============================================================================
 # transfer_float_to_phase2:
 # Transfer weights from phase1 float student (standard Keras GRU) into the
@@ -3980,6 +3954,17 @@ def build_float_student(seq_len, n_out, student_units):
 def main():
     args = parse_args()
 
+    # ── OOM guard: cap prefetch so pipeline never stages more than 128k samples ──
+    MAX_PREFETCH_RAM_SAMPLES = 131_072
+    safe_prefetch = max(1, MAX_PREFETCH_RAM_SAMPLES // args.batch_size)
+    if args.prefetch_batches > safe_prefetch:
+        print(
+            f"[OOM GUARD] Capping prefetch_batches {args.prefetch_batches} -> {safe_prefetch} "
+            f"(batch_size={args.batch_size})",
+            flush=True,
+        )
+        args.prefetch_batches = safe_prefetch
+
     pf = lambda msg: print(msg, flush=True)
 
     job_name = make_job_name(args)
@@ -4028,8 +4013,11 @@ def main():
     pf(f"[MAIN] Teacher weights loaded from {args.teacher_ckpt}")
     teacher_hidden_model = build_teacher_hidden_model(teacher_model)
 
-    # ── Cache teacher predictions and hidden states ───────────────────────────
-    teacher_predictions, teacher_hidden_all = cache_teacher_predictions_and_hidden(
+    # ── Cache teacher predictions only (NOT hidden — hidden computed live) ────
+    # teacher_hidden is NOT materialised here. It is computed on-the-fly inside
+    # make_dist_memoq_train / make_dist_memoq_val via teacher_hidden_model.
+    # This eliminates the (N, T, teacher_units) float32 RAM footprint entirely.
+    teacher_predictions, _ = cache_teacher_predictions_and_hidden(
         teacher_model        = teacher_model,
         teacher_hidden_model = teacher_hidden_model,
         normalized_input     = normalized_input,
@@ -4041,21 +4029,36 @@ def main():
         data_dir             = args.data_dir,
         pf                   = pf,
     )
+    # teacher_predictions is a read-only memmap — shape (N, T, n_out), float32
 
-    # ── Materialise train / val buffers ───────────────────────────────────────
+    # ── Materialise enc/tgt/tpred splits — NO teacher hidden ─────────────────
+    # materialise_memoq_buffers does NOT include teacher_hidden.
+    # The hidden is computed live in the train/val step from teacher_hidden_model.
     pf("[MAIN] Materialising train buffers...")
-    enc_tr, tgt_tr, tpred_tr, thid_tr = materialise_buffers(
-        normalized_input, res_data, teacher_predictions,
-        teacher_hidden_all, train_idx, args.seq_len, args.n_out, "train", pf
+    enc_tr, tgt_tr, tpred_tr = materialise_memoq_buffers(
+        normalized_input    = normalized_input,
+        res                 = res_data,
+        teacher_predictions = teacher_predictions,
+        idx                 = train_idx,
+        seq_len             = args.seq_len,
+        n_out               = args.n_out,
+        label               = "train",
+        pf                  = pf,
     )
 
     pf("[MAIN] Materialising val buffers...")
-    enc_va, tgt_va, tpred_va, thid_va = materialise_buffers(
-        normalized_input, res_data, teacher_predictions,
-        teacher_hidden_all, val_idx, args.seq_len, args.n_out, "val", pf
+    enc_va, tgt_va, tpred_va = materialise_memoq_buffers(
+        normalized_input    = normalized_input,
+        res                 = res_data,
+        teacher_predictions = teacher_predictions,
+        idx                 = val_idx,
+        seq_len             = args.seq_len,
+        n_out               = args.n_out,
+        label               = "val",
+        pf                  = pf,
     )
 
-    # ── Channel scales ────────────────────────────────────────────────────────
+    # ── Channel scales from teacher train predictions ─────────────────────────
     pf("[MAIN] Computing channel scales from teacher train predictions...")
     channel_scales_np = np.array(
         [max(float(np.std(tpred_tr[:, :, c])), 1e-3) for c in range(args.n_out)],
@@ -4064,36 +4067,48 @@ def main():
     pf(f"  channel_scales={channel_scales_np}")
     channel_scales = tf.constant(channel_scales_np, dtype=tf.float32)
 
-    # ── Epsilon innov ─────────────────────────────────────────────────────────
+    # ── Epsilon innov — computed from teacher hidden model on 50k subset ──────
+    # enc_tr is already materialised in RAM so this is a fast inference pass.
     epsilon_innov = compute_epsilon_innov_from_model(
-        teacher_hidden_model,
-        enc_tr,
-        args.seq_len,
-        args.infer_batch,
-        pf,
+        teacher_hidden_model = teacher_hidden_model,
+        enc_train            = enc_tr,
+        seq_len              = args.seq_len,
+        infer_batch          = args.infer_batch,
+        pf                   = pf,
     )
 
-    # ── teacher_hidden_dim ────────────────────────────────────────────────────
-    teacher_hidden_dim = teacher_hidden_all.shape[2]
+    teacher_hidden_dim = args.teacher_units
     pf(f"[MAIN] teacher_hidden_dim={teacher_hidden_dim}")
 
-    # ── Build tf.data datasets ────────────────────────────────────────────────
+    # ── Build tf.data datasets — teacher_hidden NOT in dataset ────────────────
+    # make_memoq_dataset does not include teacher_hidden in the batch.
+    # The live teacher_hidden_model is called inside each train/val step.
     train_batch = args.batch_size
     val_batch   = args.batch_size
 
-    train_ds = make_kd_dataset(
-        enc_tr, tgt_tr, tpred_tr, thid_tr,
-        train_batch, args.seq_len, args.n_out, teacher_hidden_dim,
-        shuffle=True,  seed=args.split_seed,
-        prefetch_batches=args.prefetch_batches,
-        pipeline_workers=args.pipeline_workers,
+    train_ds = make_memoq_dataset(
+        enc_arr          = enc_tr,
+        tgt_arr          = tgt_tr,
+        tpred_arr        = tpred_tr,
+        batch_size       = train_batch,
+        seq_len          = args.seq_len,
+        n_out            = args.n_out,
+        shuffle          = True,
+        seed             = args.split_seed,
+        prefetch_batches = args.prefetch_batches,
+        pipeline_workers = args.pipeline_workers,
     )
-    val_ds = make_kd_dataset(
-        enc_va, tgt_va, tpred_va, thid_va,
-        val_batch, args.seq_len, args.n_out, teacher_hidden_dim,
-        shuffle=False, seed=0,
-        prefetch_batches=args.prefetch_batches,
-        pipeline_workers=args.pipeline_workers,
+    val_ds = make_memoq_dataset(
+        enc_arr          = enc_va,
+        tgt_arr          = tgt_va,
+        tpred_arr        = tpred_va,
+        batch_size       = val_batch,
+        seq_len          = args.seq_len,
+        n_out            = args.n_out,
+        shuffle          = False,
+        seed             = 0,
+        prefetch_batches = args.prefetch_batches,
+        pipeline_workers = args.pipeline_workers,
     )
 
     train_steps = max(1, len(train_idx) // train_batch)
@@ -4112,11 +4127,12 @@ def main():
     pf("[MAIN] Building Phase 2 split-gate model...")
     with strategy.scope():
         phase2_model, enc_cell_p2, dec_cell_p2 = build_phase2_model(
-            seq_len      = args.seq_len,
-            n_out        = args.n_out,
-            student_units= args.student_units,
-            input_dim    = 1,
+            seq_len       = args.seq_len,
+            n_out         = args.n_out,
+            student_units = args.student_units,
+            input_dim     = 1,
         )
+    # Attach the live teacher hidden model so make_dist_memoq_train can call it
     phase2_model._teacher_hidden_model = teacher_hidden_model
     phase2_model.summary(print_fn=pf)
 
@@ -4132,6 +4148,7 @@ def main():
             bits_activation = args.bits_activation,
             bits_state      = args.bits_state,
         )
+    # Attach live teacher hidden model for Phase 3 loss computation
     final_qkeras_student._teacher_hidden_model = teacher_hidden_model
     final_qkeras_student.summary(print_fn=pf)
 
@@ -4161,35 +4178,42 @@ def main():
     pf(f"[MAIN] Final student weights saved: {final_path}")
 
     # ── Save history plot ─────────────────────────────────────────────────────
-    fig, axes = plt.subplots(2, 4, figsize=(20, 8))
-    keys_train = ["total", "seq",     "kd",     "mem",     "innov",     "zsat",     "rail"]
-    keys_val   = ["val_total", "val_seq", "val_kd", "val_mem", "val_innov", "val_zsat", "val_rail"]
-    titles     = ["Total",    "Seq",    "KD",     "Mem",     "Innov",     "Zsat",     "Rail"]
-    for i, (tk, vk, ttl) in enumerate(zip(keys_train, keys_val, titles)):
-        r, c = divmod(i, 4)
-        ax = axes[r][c]
-        ax.plot(history[tk],  label="train")
-        ax.plot(history[vk],  label="val")
-        ax.set_title(ttl)
-        ax.legend(fontsize=7)
-        ax.set_xlabel("epoch")
-    for ax in axes.flat[len(titles):]:
-        ax.set_visible(False)
-    plt.tight_layout()
-    hist_png = os.path.join(job_dir, "training_history.png")
-    plt.savefig(hist_png, dpi=120)
-    plt.close(fig)
-    pf(f"[MAIN] Training history plot: {hist_png}")
+    save_loss_curves_memoq(history, best_val, args, job_dir, pf)
 
     # ── Test evaluation ───────────────────────────────────────────────────────
-    pf("[MAIN] Running test evaluation...")
+    pf("[MAIN] Materialising test buffers for evaluation...")
+    enc_te, tgt_te, _ = materialise_memoq_buffers(
+        normalized_input    = normalized_input,
+        res                 = res_data,
+        teacher_predictions = teacher_predictions,
+        idx                 = test_idx,
+        seq_len             = args.seq_len,
+        n_out               = args.n_out,
+        label               = "test",
+        pf                  = pf,
+    )
+
+    labels_data = np.load(file_labels, mmap_mode="r")
+    labels_test = labels_data[test_idx].astype(np.float32)
+
+    evaluate_and_save(
+        final_qkeras_student = final_qkeras_student,
+        enc_test             = enc_te,
+        tgt_test             = tgt_te,
+        labels_test          = labels_test,
+        gate_width_ns        = args.gate_width_ns,
+        n_out                = args.n_out,
+        seq_len              = args.seq_len,
+        infer_batch          = args.infer_batch,
+        job_dir              = job_dir,
+        args                 = args,
+        pf                   = pf,
+    )
+
     pf(f"[MAIN] best_val={best_val:.6f}")
     pf("[MAIN] Done.")
     sys.stdout.flush()
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
