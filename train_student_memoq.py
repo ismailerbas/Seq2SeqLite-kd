@@ -3329,51 +3329,64 @@ class _MemmapSubset:
 
 def materialise_memoq_buffers(
     normalized_input,
+    res,
     teacher_predictions,
-    teacher_hidden,
-    train_idx,
-    val_idx,
-    test_idx,
+    idx,
+    seq_len,
+    n_out,
+    label,
     pf,
 ):
     """
-    Returns split views into the memmap arrays.
-    No data is copied into RAM. Each split is a numpy memmap slice
-    that tf.data.Dataset.from_tensor_slices will read on demand.
+    Materialise encoder, decoder-target, and teacher-prediction buffers
+    for a single data split (train / val / test).
 
-    Returns:
-        (enc_train, dec_train, gt_train, tp_train, th_train,
-         enc_val,   dec_val,   gt_val,   tp_val,   th_val,
-         enc_test,  dec_test,  gt_test,  tp_test,  th_test)
+    This function is called once per split. It performs a fancy-index
+    copy of only the rows required for that split, converting memmap
+    arrays into contiguous float32 arrays that tf.data can consume
+    without triggering repeated disk I/O during training.
+
+    Parameters
+    ----------
+    normalized_input : np.ndarray, shape (N, seq_len, 1)
+        Normalised encoder input for the full dataset (memmap or ndarray).
+    res : np.ndarray, shape (N, seq_len, n_out) or (N, n_out)
+        Decoder regression targets for the full dataset (memmap or ndarray).
+    teacher_predictions : np.ndarray, shape (N, seq_len, n_out)
+        Cached teacher output predictions for the full dataset (memmap).
+    idx : np.ndarray, shape (n_split,)
+        Integer indices selecting the rows that belong to this split.
+    seq_len : int
+        Sequence length (used for shape-assertion logging only).
+    n_out : int
+        Number of output channels (used for shape-assertion logging only).
+    label : str
+        Human-readable split name used in log messages ('train', 'val', 'test').
+    pf : callable
+        Print function (e.g. lambda msg: print(msg, flush=True)).
+
+    Returns
+    -------
+    enc_buf : np.ndarray, shape (n_split, seq_len, 1), dtype float32
+        Encoder inputs for this split.
+    tgt_buf : np.ndarray, shape (n_split, ...), dtype float32
+        Decoder targets for this split.
+    tpred_buf : np.ndarray, shape (n_split, seq_len, n_out), dtype float32
+        Teacher predictions for this split.
     """
-    pf("[BUFFERS] Creating split index views (no full copy)")
+    n_split = len(idx)
+    pf(f"[BUFFERS:{label}] Materialising {n_split} samples "
+       f"(enc seq_len={seq_len}, n_out={n_out})...")
 
-    # normalized_input is (N, seq_len, 1) — memmap or ndarray
-    # teacher_predictions is (N, seq_len, n_out) — memmap
-    # teacher_hidden is (N, seq_len, teacher_units) — memmap
+    enc_buf   = np.asarray(normalized_input[idx],    dtype=np.float32)
+    tgt_buf   = np.asarray(res[idx],                 dtype=np.float32)
+    tpred_buf = np.asarray(teacher_predictions[idx], dtype=np.float32)
 
-    def split_view(arr, idx):
-        # Returns a view or fancy-index result.
-        # For memmap, fancy indexing produces a copy only of the indexed rows
-        # but we do it lazily by passing the index array to tf.data instead
-        # of materialising a dense sub-array.
-        return arr, idx   # defer materialisation to tf.data
+    pf(f"[BUFFERS:{label}] enc_buf   shape={enc_buf.shape}   dtype={enc_buf.dtype}")
+    pf(f"[BUFFERS:{label}] tgt_buf   shape={tgt_buf.shape}   dtype={tgt_buf.dtype}")
+    pf(f"[BUFFERS:{label}] tpred_buf shape={tpred_buf.shape} dtype={tpred_buf.dtype}")
 
-    # Build decoder input on the fly per batch in the tf.data pipeline;
-    # here we just return the shapes we need for dataset construction.
-    n_train = len(train_idx)
-    n_val   = len(val_idx)
-    n_test  = len(test_idx)
-
-    pf(f"[BUFFERS] train={n_train}  val={n_val}  test={n_test}")
-    pf(f"[BUFFERS] enc shape={normalized_input.shape}  "
-       f"pred shape={teacher_predictions.shape}  "
-       f"hidden shape={teacher_hidden.shape}")
-
-    return (
-        normalized_input, teacher_predictions, teacher_hidden,
-        train_idx, val_idx, test_idx,
-    )
+    return enc_buf, tgt_buf, tpred_buf
 
 # ==============================================================================
 # transfer_float_to_phase2:
