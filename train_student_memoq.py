@@ -104,7 +104,14 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 from scipy.stats import pearsonr
-from fastdtw import fastdtw
+try:
+    from fastdtw import fastdtw
+    from scipy.spatial.distance import euclidean
+    HAS_FASTDTW = True
+except Exception:
+    fastdtw  = None
+    euclidean = None
+    HAS_FASTDTW = False
 from scipy.spatial.distance import euclidean
 
 import tensorflow as tf
@@ -481,52 +488,57 @@ class SplitGateGRUCell(keras.layers.AbstractRNNCell):
             return w
         return quantizer(w)
 
-    def call(self, inputs, states):
-        h_prev = states[0]
+    def call(self, inputs, states, training=None):
+        h_prev = states[0]   # (B, units)
 
-        # Apply per-gate quantizers to kernels/recurrent kernels
-        W_z_q = self._apply_quantizer(self.W_z, self.quantizer_z)
-        W_r_q = self._apply_quantizer(self.W_r, self.quantizer_r)
-        W_h_q = self._apply_quantizer(self.W_h, self.quantizer_h)
-        U_z_q = self._apply_quantizer(self.U_z, self.quantizer_z)
-        U_r_q = self._apply_quantizer(self.U_r, self.quantizer_r)
-        U_h_q = self._apply_quantizer(self.U_h, self.quantizer_h)
-
-        # reset_after=True GRU equations:
-        # z_logit = x @ W_z + b_z[0] + h_prev @ U_z + b_z[1]
-        # r_logit = x @ W_r + b_r[0] + h_prev @ U_r + b_r[1]
-        # z = sigmoid(z_logit)
-        # r = sigmoid(r_logit)
-        # h_cand = tanh(x @ W_h + b_h[0] + r * (h_prev @ U_h + b_h[1]))
-        # h_new = (1 - z) * h_prev + z * h_cand
-
-        z_logit = (
-            tf.matmul(inputs, W_z_q) + self.b_z[0]
-            + tf.matmul(h_prev, U_z_q) + self.b_z[1]
-        )
-        r_logit = (
-            tf.matmul(inputs, W_r_q) + self.b_r[0]
-            + tf.matmul(h_prev, U_r_q) + self.b_r[1]
-        )
-
-        z = tf.sigmoid(z_logit)
-        r = tf.sigmoid(r_logit)
-
-        recurrent_h = tf.matmul(h_prev, U_h_q) + self.b_h[1]
-        h_cand = tf.tanh(tf.matmul(inputs, W_h_q) + self.b_h[0] + r * recurrent_h)
-
-        # Optionally quantize hidden state
+        # Quantize the incoming recurrent state so accumulated error is trained against
         if self.quantizer_state is not None:
             h_prev_q = self.quantizer_state(h_prev)
         else:
             h_prev_q = h_prev
 
-        h_new = (1.0 - z) * h_prev_q + z * h_cand
+        # Per-gate kernel quantizers (W_* and U_* share one quantizer per gate)
+        def qw(q, w):
+            return q(w) if q is not None else w
 
-        # Store for L_zsat
+        W_z = qw(self.quantizer_z, self.W_z)
+        W_r = qw(self.quantizer_r, self.W_r)
+        W_h = qw(self.quantizer_h, self.W_h)
+        U_z = qw(self.quantizer_z, self.U_z)
+        U_r = qw(self.quantizer_r, self.U_r)
+        U_h = qw(self.quantizer_h, self.U_h)
+
+        # b_z[0] = input bias, b_z[1] = recurrent bias
+        z_logit = (
+            tf.matmul(inputs, W_z) + self.b_z[0]
+            + tf.matmul(h_prev_q, U_z) + self.b_z[1]
+        )
+        r_logit = (
+            tf.matmul(inputs, W_r) + self.b_r[0]
+            + tf.matmul(h_prev_q, U_r) + self.b_r[1]
+        )
+
+        z = tf.sigmoid(z_logit)
+        r = tf.sigmoid(r_logit)
+
+        h_cand = tf.tanh(
+            tf.matmul(inputs, W_h) + self.b_h[0]
+            + r * (tf.matmul(h_prev_q, U_h) + self.b_h[1])
+        )
+
+        # Keras/QKeras GRU convention: z * h_prev + (1 - z) * h_cand
+        h_new = z * h_prev_q + (1.0 - z) * h_cand
+
+        # Quantize the output state so the NEXT timestep receives a quantized state.
+        # This is the core of recurrent error accumulation training.
+        if self.quantizer_state is not None:
+            h_new = self.quantizer_state(h_new)
+
+        # Expose z_logit for L_zsat loss — training only, not used at inference
         self._last_z_logit = z_logit
 
         return h_new, [h_new]
+
 
     def get_packed_weights(self):
         """
@@ -576,31 +588,33 @@ class SplitGateRNNLayer(keras.layers.Layer):
 
     def call(self, inputs, initial_state=None, training=None):
         batch_size = tf.shape(inputs)[0]
-        seq_len    = tf.shape(inputs)[1]
-        units      = self.cell.units
+        seq_len_static = inputs.shape[1]
+        units = self.cell.units
+
+        if seq_len_static is None:
+            raise ValueError(
+                "SplitGateRNNLayer requires a fixed sequence length. "
+                "Use Input(shape=(seq_len, input_dim), ...) with a concrete integer seq_len."
+            )
 
         if initial_state is None:
-            h = tf.zeros((batch_size, units), dtype=tf.float32)
+            h = tf.zeros((batch_size, units), dtype=inputs.dtype)
         else:
             h = initial_state
 
-        outputs_ta   = tf.TensorArray(dtype=tf.float32, size=seq_len, dynamic_size=False)
-        z_logits_ta  = tf.TensorArray(dtype=tf.float32, size=seq_len, dynamic_size=False)
+        outputs  = []
+        z_logits = []
 
-        for t in tf.range(seq_len):
+        for t in range(seq_len_static):
             x_t = inputs[:, t, :]
             h, _ = self.cell(x_t, [h], training=training)
-            z_logit_t = self.cell._last_z_logit
-            outputs_ta  = outputs_ta.write(t, h)
-            z_logits_ta = z_logits_ta.write(t, z_logit_t)
+            outputs.append(h)
+            z_logits.append(self.cell._last_z_logit)
 
-        # Stack: (T, B, units) -> transpose -> (B, T, units)
-        outputs_seq  = tf.transpose(outputs_ta.stack(),  [1, 0, 2])
-        z_logits_seq = tf.transpose(z_logits_ta.stack(), [1, 0, 2])
+        outputs_seq  = tf.stack(outputs,  axis=1)   # (B, T, units)
+        z_logits_seq = tf.stack(z_logits, axis=1)   # (B, T, units)
 
-        final_state = outputs_seq[:, -1, :]
-        return outputs_seq, final_state, z_logits_seq
-
+        return outputs_seq, h, z_logits_seq
 
 def build_phase2_student(seq_len, n_out, student_units,
                          quantizer_z, quantizer_r, quantizer_h, quantizer_state):
@@ -781,15 +795,21 @@ def build_qkeras_student_with_hidden(seq_len, n_out, student_units,
 
 def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
     """
-    Transfer float student weights to the Phase 2 MemoQGRUCell split-gate model.
+    Transfer float student packed GRU weights into the Phase 2
+    SplitGateGRUCell split-gate variables.
 
-    Float student has standard GRU layers named sencgru and sdecgru with
-    packed kernels of shape (input_dim, 3*units), (units, 3*units) and
-    reset_after=True bias of shape (2, 3*units).
+    Float student has standard Keras GRU layers named sencgru / sdecgru
+    with reset_after=True:
+        kernel          (input_dim, 3*units)   — packed [z | r | h]
+        recurrent_kernel (units,    3*units)   — packed [z | r | h]
+        bias             (2,        3*units)   — row 0 = input, row 1 = recurrent
 
-    We split them into the separate MemoQGRUCell gate weight variables.
+    SplitGateGRUCell has:
+        W_z, W_r, W_h   shape (input_dim, units)
+        U_z, U_r, U_h   shape (units,     units)
+        b_z, b_r, b_h   shape (2,         units)  — row 0 = input, row 1 = recurrent
     """
-    pf("[TRANSFER P1->P2] Splitting packed float GRU weights into MemoQGRUCell variables...")
+    pf("[TRANSFER P1->P2] Splitting packed float GRU weights into SplitGateGRUCell...")
     units = enc_cell.units
 
     for layer_name, cell in [("sencgru", enc_cell), ("sdecgru", dec_cell)]:
@@ -800,14 +820,13 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
             continue
 
         fw = fl.get_weights()
-        # Standard Keras GRU reset_after=True: [kernel (d,3H), recurrent_kernel (H,3H), bias (2,3H)]
         if len(fw) < 3:
-            pf(f"  SKIP {layer_name} — unexpected weight count {len(fw)}")
+            pf(f"  SKIP {layer_name} — unexpected weight count {len(fw)}, expected >= 3")
             continue
 
         kernel_packed    = fw[0]   # (input_dim, 3*units)
-        recurrent_packed = fw[1]   # (units, 3*units)
-        bias_packed      = fw[2]   # (2, 3*units)
+        recurrent_packed = fw[1]   # (units,     3*units)
+        bias_packed      = fw[2]   # (2,         3*units)
 
         # Keras/QKeras GRU packed order: [z | r | h]
         W_z = kernel_packed[:, :units]
@@ -818,11 +837,12 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
         U_r = recurrent_packed[:, units:2*units]
         U_h = recurrent_packed[:, 2*units:]
 
-        # bias_packed[0] = input biases [b_z_inp | b_r_inp | b_h_inp]
+        # bias_packed[0] = input biases  [b_z_inp | b_r_inp | b_h_inp]
         # bias_packed[1] = recurrent biases [b_z_rec | b_r_rec | b_h_rec]
         b_z_inp = bias_packed[0, :units]
         b_r_inp = bias_packed[0, units:2*units]
         b_h_inp = bias_packed[0, 2*units:]
+
         b_z_rec = bias_packed[1, :units]
         b_r_rec = bias_packed[1, units:2*units]
         b_h_rec = bias_packed[1, 2*units:]
@@ -830,30 +850,41 @@ def transfer_float_to_phase2(float_model, phase2_model, enc_cell, dec_cell, pf):
         cell.W_z.assign(W_z)
         cell.W_r.assign(W_r)
         cell.W_h.assign(W_h)
+
         cell.U_z.assign(U_z)
         cell.U_r.assign(U_r)
         cell.U_h.assign(U_h)
-        cell.b_z_inp.assign(b_z_inp)
-        cell.b_r_inp.assign(b_r_inp)
-        cell.b_h_inp.assign(b_h_inp)
-        cell.b_z_rec.assign(b_z_rec)
-        cell.b_r_rec.assign(b_r_rec)
-        cell.b_h_rec.assign(b_h_rec)
+
+        # b_z shape is (2, units): row 0 = input bias, row 1 = recurrent bias
+        cell.b_z.assign(np.stack([b_z_inp, b_z_rec], axis=0))
+        cell.b_r.assign(np.stack([b_r_inp, b_r_rec], axis=0))
+        cell.b_h.assign(np.stack([b_h_inp, b_h_rec], axis=0))
 
         pf(
-            f"  OK {layer_name}: kernel={kernel_packed.shape} "
-            f"rec={recurrent_packed.shape} bias={bias_packed.shape}"
+            f"  OK {layer_name}: kernel={kernel_packed.shape}  "
+            f"recurrent={recurrent_packed.shape}  bias={bias_packed.shape}"
         )
 
     try:
-        float_dense = float_model.get_layer("sdec_dense")
-        split_dense = phase2_model.get_layer("sdec_dense")
-        split_dense.set_weights(float_dense.get_weights())
-        pf("  OK sdec_dense")
-    except Exception as e:
-        pf(f"  SKIP sdec_dense: {e}")
+        src_dense = float_model.get_layer("sdec_dense")
+        dst_dense = phase2_model.get_layer("sdec_dense")
+        src_w = src_dense.get_weights()
+        dst_w = dst_dense.get_weights()
+        if len(src_w) == len(dst_w) and all(
+            s.shape == d.shape for s, d in zip(src_w, dst_w)
+        ):
+            dst_dense.set_weights(src_w)
+            pf(f"  OK sdec_dense: transferred {len(src_w)} tensors")
+        else:
+            pf(
+                f"  SKIP sdec_dense: shape mismatch "
+                f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]}"
+            )
+    except Exception as exc:
+        pf(f"  SKIP sdec_dense: {exc}")
 
     sys.stdout.flush()
+
 
 def transfer_phase2_to_qkeras(enc_cell, dec_cell, phase2_model, qkeras_model, pf):
     """
@@ -1028,7 +1059,7 @@ def materialise_buffers(normalized_input, res, teacher_predictions,
     enc   = np.empty((n, seq_len, 1),             dtype=np.float32)
     tgt   = np.empty((n, seq_len, n_out),          dtype=np.float32)
     tpred = np.empty((n, seq_len, n_out),          dtype=np.float32)
-    thid  = np.empty((n, seq_len, teacher_hidden.shape[2]), dtype=np.float32)
+    teacher_hidden  = np.empty((n, seq_len, teacher_hidden.shape[2]), dtype=np.float32)
 
     chunk = 65536
     for s in range(0, n, chunk):
@@ -1036,18 +1067,18 @@ def materialise_buffers(normalized_input, res, teacher_predictions,
         enc[s:e]   = normalized_input[idx[s:e]]
         tgt[s:e]   = res[idx[s:e]]
         tpred[s:e] = teacher_predictions[idx[s:e]]
-        thid[s:e]  = teacher_hidden[idx[s:e]]
+        teacher_hidden[s:e]  = teacher_hidden[idx[s:e]]
 
     pf(f"  Done in {time.time()-t0:.1f}s  enc={enc.nbytes/1e9:.2f}GB")
     sys.stdout.flush()
-    return enc, tgt, tpred, thid
+    return enc, tgt, tpred, teacher_hidden
 
 
 # ==============================================================================
 # tf.data pipeline — includes teacher hidden in batch
 # ==============================================================================
 
-def make_kd_dataset(enc_arr, tgt_arr, tpred_arr, thid_arr,
+def make_kd_dataset(enc_arr, tgt_arr, tpred_arr, teacher_hidden_arr,
                     batch_size, seq_len, n_out, teacher_hidden_dim,
                     shuffle, seed, prefetch_batches, pipeline_workers):
     n = len(enc_arr)
@@ -1059,7 +1090,7 @@ def make_kd_dataset(enc_arr, tgt_arr, tpred_arr, thid_arr,
         tf.data.Dataset.from_tensor_slices(dec_arr),
         tf.data.Dataset.from_tensor_slices(tpred_arr),
         tf.data.Dataset.from_tensor_slices(tgt_arr),
-        tf.data.Dataset.from_tensor_slices(thid_arr),
+        tf.data.Dataset.from_tensor_slices(teacher_hidden_arr),
     ))
 
     if shuffle:
@@ -1067,17 +1098,17 @@ def make_kd_dataset(enc_arr, tgt_arr, tpred_arr, thid_arr,
 
     ds = ds.batch(micro_batch_size, drop_remainder=True)
 
-    def set_shapes(enc_b, dec_b, tpred_b, tgt_b, thid_b):
+    def set_shapes(enc_b, dec_b, tpred_b, tgt_b, teacher_hidden_b):
         enc_b.set_shape([micro_batch_size, seq_len, 1])
         dec_b.set_shape([micro_batch_size, seq_len, 1])
         tpred_b.set_shape([micro_batch_size, seq_len, n_out])
         tgt_b.set_shape([micro_batch_size, seq_len, n_out])
-        thid_b.set_shape([micro_batch_size, seq_len, teacher_hidden_dim])
+        teacher_hidden_b.set_shape([micro_batch_size, seq_len, teacher_hidden_dim])
         batchx = {
             "enc_input":      enc_b,
             "dec_input":      dec_b,
             "tpred":          tpred_b,
-            "teacher_hidden": thid_b,
+            "teacher_hidden": teacher_hidden_b,
         }
         return batchx, tgt_b
 
@@ -1420,7 +1451,7 @@ def train_step_memoq_per_replica(
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
     tpred_b = batch_x["tpred"]
-    thid_b  = batch_x["thid"]
+    teacher_hidden_b = batch_x["teacher_hidden"]
     tgt_b   = batch_y
 
     with tf.GradientTape() as tape:
@@ -1435,8 +1466,8 @@ def train_step_memoq_per_replica(
         l_seq = channel_normalised_huber(tgt_b,   s_pred, channel_scales, huber_delta)
         l_kd  = channel_normalised_huber(tpred_b, s_pred, channel_scales, huber_delta)
 
-        l_mem   = loss_mem(s_hid, thid_b, seq_len_int)   if use_mem   else tf.constant(0.0)
-        l_innov = loss_innov(s_hid, thid_b, epsilon_innov) if use_innov else tf.constant(0.0)
+        l_mem   = loss_mem(s_hid, teacher_hidden_b, seq_len_int)   if use_mem   else tf.constant(0.0)
+        l_innov = loss_innov(s_hid, teacher_hidden_b, epsilon_innov) if use_innov else tf.constant(0.0)
         l_rail  = loss_rail(s_hid, rho_rail, mu_rail)     if use_rail  else tf.constant(0.0)
 
         if use_zsat:
@@ -1444,7 +1475,7 @@ def train_step_memoq_per_replica(
                 l_zsat = loss_zsat_logit(z_logits, logit_threshold=3.0)
             else:
                 # Phase 3: no logits available — use sigmoid(hidden) as proxy
-                l_zsat = loss_zsat_value(tf.sigmoid(s_hid), rho_z=0.98)
+                l_zsat = tf.constant(0.0, dtype=tf.float32)
         else:
             l_zsat = tf.constant(0.0)
 
@@ -1479,7 +1510,7 @@ def val_step_memoq_per_replica(
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
     tpred_b = batch_x["tpred"]
-    thid_b  = batch_x["thid"]
+    teacher_hidden_b  = batch_x["teacher_hidden"]
     tgt_b   = batch_y
 
     model_out = model([enc_b, dec_b], training=False)
@@ -1492,15 +1523,15 @@ def val_step_memoq_per_replica(
 
     l_seq = channel_normalised_huber(tgt_b,   s_pred, channel_scales, huber_delta)
     l_kd  = channel_normalised_huber(tpred_b, s_pred, channel_scales, huber_delta)
-    l_mem   = loss_mem(s_hid, thid_b, seq_len_int)    if use_mem   else tf.constant(0.0)
-    l_innov = loss_innov(s_hid, thid_b, epsilon_innov) if use_innov else tf.constant(0.0)
+    l_mem   = loss_mem(s_hid, teacher_hidden_b, seq_len_int)    if use_mem   else tf.constant(0.0)
+    l_innov = loss_innov(s_hid, teacher_hidden_b, epsilon_innov) if use_innov else tf.constant(0.0)
     l_rail  = loss_rail(s_hid, rho_rail, mu_rail)      if use_rail  else tf.constant(0.0)
 
     if use_zsat:
         if has_z_logit and z_logits is not None:
             l_zsat = loss_zsat_logit(z_logits, logit_threshold=3.0)
         else:
-            l_zsat = loss_zsat_value(tf.sigmoid(s_hid), rho_z=0.98)
+            l_zsat = tf.constant(0.0, dtype=tf.float32)
     else:
         l_zsat = tf.constant(0.0)
 
@@ -1943,17 +1974,50 @@ def make_dist_memoq_val_final(
 
     return dist_val_step
 
-def set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, stage):
-    q_h = quantized_bits(args.bits_kernel,     0, 1, alpha=1.0)
-    q_r = quantized_bits(args.bits_recurrent,  0, 1, alpha=1.0)
-    q_z = quantized_bits(args.bits_kernel,     0, 1, alpha=1.0)
-    q_s = quantized_bits(args.bits_state,      0, 1, alpha=1.0)
+def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
+    """
+    Assign quantizers to SplitGateGRUCell gate variables based on the
+    MemoQ curriculum stage.
 
-    for cell in [enc_cell_p2, dec_cell_p2]:
-        cell.quantizer_h     = q_h if stage in ("P2A", "P2B", "P2C", "P3") else None
-        cell.quantizer_r     = q_r if stage in ("P2B", "P2C", "P3")        else None
-        cell.quantizer_z     = q_z if stage in ("P2C", "P3")               else None
-        cell.quantizer_state = q_s if stage in ("P3",)                     else None
+    Stage P2A : quantize h gate only (W_h, U_h)
+    Stage P2B : quantize h + r gates
+    Stage P2C : quantize h + r + z gates
+    Stage P3  : quantize h + r + z gates + state (all hard 4-bit)
+
+    One shared quantized_bits instance per 4-bit setting is intentional:
+    the STE is stateless so sharing is safe and avoids unnecessary objects.
+    """
+    q4 = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
+
+    if stage == "P2A":
+        q_h = q4
+        q_r = None
+        q_z = None
+        q_s = None
+    elif stage == "P2B":
+        q_h = q4
+        q_r = q4
+        q_z = None
+        q_s = None
+    elif stage == "P2C":
+        q_h = q4
+        q_r = q4
+        q_z = q4
+        q_s = None
+    elif stage == "P3":
+        q_h = q4
+        q_r = q4
+        q_z = q4
+        q_s = quantized_bits(args.bits_state, 0, 1, alpha=1.0)
+    else:
+        raise ValueError(f"Unknown stage: {stage!r}. Expected one of P2A, P2B, P2C, P3.")
+
+    for cell in [enc_cell, dec_cell]:
+        cell.quantizer_h     = q_h
+        cell.quantizer_r     = q_r
+        cell.quantizer_z     = q_z
+        cell.quantizer_state = q_s
+
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
@@ -2514,38 +2578,39 @@ def training_loop_memoq(
 
 def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_student, pf):
     """
-    Packs split-gate cell weights from MemoQGRUCell instances into
-    packed Keras/QKeras GRU weight format [z|r|h] and loads into
-    final_qkeras_student.
+    Pack split-gate cell weights from SplitGateGRUCell into standard
+    Keras/QKeras GRU packed format [z | r | h] and load into final_qkeras_student.
 
-    enc_cell              : MemoQGRUCell for encoder
-    dec_cell              : MemoQGRUCell for decoder
-    phase2_model          : the phase2 Model (used only to transfer sdec_dense)
-    final_qkeras_student  : Model with QGRU layers named sencgru and sdecgru
+    SplitGateGRUCell variables:
+        W_z, W_r, W_h   (input_dim, units)
+        U_z, U_r, U_h   (units,     units)
+        b_z, b_r, b_h   (2,         units)  row 0 = inp, row 1 = rec
+
+    Keras/QKeras reset_after=True GRU expects:
+        kernel           (input_dim, 3*units)   concat [W_z | W_r | W_h]
+        recurrent_kernel (units,     3*units)   concat [U_z | U_r | U_h]
+        bias             (2,         3*units)   concat [b_z | b_r | b_h] along axis=1
     """
-    pf("[EXPORT] transfer_splitgate_to_qkeras: packing [W_z|W_r|W_h] / [U_z|U_r|U_h]...")
+    pf("[EXPORT] transfer_splitgate_to_qkeras: packing [W_z|W_r|W_h] / [U_z|U_r|U_h] / [b_z|b_r|b_h]...")
 
     def pack_and_load(cell, layer_name, target_model):
         W_z = cell.W_z.numpy()
         W_r = cell.W_r.numpy()
         W_h = cell.W_h.numpy()
+
         U_z = cell.U_z.numpy()
         U_r = cell.U_r.numpy()
         U_h = cell.U_h.numpy()
-        b_z_inp = cell.b_z_inp.numpy()
-        b_r_inp = cell.b_r_inp.numpy()
-        b_h_inp = cell.b_h_inp.numpy()
-        b_z_rec = cell.b_z_rec.numpy()
-        b_r_rec = cell.b_r_rec.numpy()
-        b_h_rec = cell.b_h_rec.numpy()
 
-        packed_kernel    = np.concatenate([W_z, W_r, W_h], axis=1)
-        packed_recurrent = np.concatenate([U_z, U_r, U_h], axis=1)
-        # Keras GRU reset_after=True bias shape: (2, 3*units)
-        # row 0 = input bias [z|r|h], row 1 = recurrent bias [z|r|h]
-        packed_bias_inp  = np.concatenate([b_z_inp, b_r_inp, b_h_inp], axis=0)  # (3*units,)
-        packed_bias_rec  = np.concatenate([b_z_rec, b_r_rec, b_h_rec], axis=0)  # (3*units,)
-        packed_bias      = np.stack([packed_bias_inp, packed_bias_rec], axis=0)  # (2, 3*units)
+        # b_z shape (2, units): row 0 = input bias, row 1 = recurrent bias
+        b_z = cell.b_z.numpy()   # (2, units)
+        b_r = cell.b_r.numpy()   # (2, units)
+        b_h = cell.b_h.numpy()   # (2, units)
+
+        packed_kernel    = np.concatenate([W_z, W_r, W_h], axis=1)   # (input_dim, 3*units)
+        packed_recurrent = np.concatenate([U_z, U_r, U_h], axis=1)   # (units,     3*units)
+        # Concatenate along axis=1 (the units dimension) to get (2, 3*units)
+        packed_bias      = np.concatenate([b_z, b_r, b_h], axis=1)   # (2,         3*units)
 
         try:
             target_layer = target_model.get_layer(layer_name)
@@ -2557,24 +2622,30 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         n_w = len(q_weights)
 
         if n_w == 3:
-            # kernel, recurrent_kernel, bias (2, 3*units) packed
             target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
-            pf(f"[EXPORT]   {layer_name}: set 3 weights (packed bias shape {packed_bias.shape})")
+            pf(
+                f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
+                f"recurrent={packed_recurrent.shape}  bias={packed_bias.shape} (3-weight mode)"
+            )
         elif n_w == 4:
-            # Some QKeras builds expose kernel, recurrent_kernel, bias_inp (3*units,), bias_rec (3*units,)
-            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias_inp, packed_bias_rec])
-            pf(f"[EXPORT]   {layer_name}: set 4 weights (split bias_inp/bias_rec)")
+            # Some QKeras builds store inp and rec biases as two separate (3*units,) vectors
+            target_layer.set_weights([
+                packed_kernel,
+                packed_recurrent,
+                packed_bias[0],   # (3*units,) input bias
+                packed_bias[1],   # (3*units,) recurrent bias
+            ])
+            pf(
+                f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
+                f"recurrent={packed_recurrent.shape}  "
+                f"bias_inp={packed_bias[0].shape}  bias_rec={packed_bias[1].shape} (4-weight mode)"
+            )
         else:
             pf(
-                f"[EXPORT]   WARNING: {layer_name} has {n_w} weight tensors, "
+                f"[EXPORT]   WARNING: {layer_name} has unexpected {n_w} weight tensors, "
                 f"attempting 3-weight convention."
             )
             target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
-
-        pf(
-            f"[EXPORT]   {layer_name}  kernel={packed_kernel.shape}  "
-            f"recurrent={packed_recurrent.shape}  bias={packed_bias.shape}"
-        )
 
     pack_and_load(enc_cell, "sencgru", final_qkeras_student)
     pack_and_load(dec_cell, "sdecgru", final_qkeras_student)
@@ -2585,16 +2656,18 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         dst_dense = final_qkeras_student.get_layer("sdec_dense")
         src_w = src_dense.get_weights()
         dst_w = dst_dense.get_weights()
-        if len(src_w) == len(dst_w) and all(s.shape == d.shape for s, d in zip(src_w, dst_w)):
+        if len(src_w) == len(dst_w) and all(
+            s.shape == d.shape for s, d in zip(src_w, dst_w)
+        ):
             dst_dense.set_weights(src_w)
-            pf(f"[EXPORT]   sdec_dense: transferred {len(src_w)} tensors OK")
+            pf(f"[EXPORT]   sdec_dense: OK {len(src_w)} tensors transferred")
         else:
             pf(
                 f"[EXPORT]   sdec_dense: shape mismatch "
                 f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]} — SKIPPED"
             )
     except Exception as exc:
-        pf(f"[EXPORT]   sdec_dense: transfer failed ({exc}) — skipped")
+        pf(f"[EXPORT]   sdec_dense: FAILED ({exc}) — skipped")
 
     sys.stdout.flush()
 
@@ -3793,10 +3866,10 @@ def make_memoq_kd_dataset(
     ds_enc    = tf.data.Dataset.from_tensor_slices(enc_arr)
     ds_dec    = tf.data.Dataset.from_tensor_slices(dec_arr)
     ds_tpred  = tf.data.Dataset.from_tensor_slices(tpred_arr)
-    ds_thid   = tf.data.Dataset.from_tensor_slices(teacher_hidden_arr)
+    ds_teacher_hidden   = tf.data.Dataset.from_tensor_slices(teacher_hidden_arr)
     ds_tgt    = tf.data.Dataset.from_tensor_slices(tgt_arr)
 
-    ds = tf.data.Dataset.zip((ds_enc, ds_dec, ds_tpred, ds_thid, ds_tgt))
+    ds = tf.data.Dataset.zip((ds_enc, ds_dec, ds_tpred, ds_teacher_hidden, ds_tgt))
 
     if shuffle:
         ds = ds.shuffle(
@@ -3807,17 +3880,17 @@ def make_memoq_kd_dataset(
 
     ds = ds.batch(micro_batch_size, drop_remainder=True)
 
-    def set_shapes(enc_b, dec_b, tpred_b, thid_b, tgt_b):
+    def set_shapes(enc_b, dec_b, tpred_b, teacher_hidden_b, tgt_b):
         enc_b.set_shape([micro_batch_size, seq_len, 1])
         dec_b.set_shape([micro_batch_size, seq_len, 1])
         tpred_b.set_shape([micro_batch_size, seq_len, n_out])
-        thid_b.set_shape([micro_batch_size, seq_len, teacher_units])
+        teacher_hidden_b.set_shape([micro_batch_size, seq_len, teacher_units])
         tgt_b.set_shape([micro_batch_size, seq_len, n_out])
         batchx = {
             "enc_input":       enc_b,
             "dec_input":       dec_b,
             "tpred":           tpred_b,
-            "teacher_hidden":  thid_b,
+            "teacher_hidden":  teacher_hidden_b,
         }
         return batchx, tgt_b
 
@@ -3850,7 +3923,7 @@ def materialise_memoq_buffers(
     enc      = np.empty((n, seq_len, 1),            dtype=np.float32)
     tgt      = np.empty((n, seq_len, n_out),        dtype=np.float32)
     tpred    = np.empty((n, seq_len, n_out),        dtype=np.float32)
-    thid     = np.empty((n, seq_len, teacher_units), dtype=np.float32)
+    teacher_hidden     = np.empty((n, seq_len, teacher_units), dtype=np.float32)
 
     chunk = 65536
     for s in range(0, n, chunk):
@@ -3858,17 +3931,17 @@ def materialise_memoq_buffers(
         enc[s:e]   = normalized_input[idx[s:e]]
         tgt[s:e]   = res[idx[s:e]]
         tpred[s:e] = teacher_predictions[idx[s:e]]
-        thid[s:e]  = teacher_hidden[idx[s:e]]
+        teacher_hidden[s:e]  = teacher_hidden[idx[s:e]]
 
     pf(
         f"  Done in {time.time() - t0:.1f}s  "
         f"enc={enc.nbytes/1e9:.2f}GB  "
         f"tgt={tgt.nbytes/1e9:.2f}GB  "
         f"tpred={tpred.nbytes/1e9:.2f}GB  "
-        f"thid={thid.nbytes/1e9:.2f}GB"
+        f"teacher_hidden={teacher_hidden.nbytes/1e9:.2f}GB"
     )
     sys.stdout.flush()
-    return enc, tgt, tpred, thid
+    return enc, tgt, tpred, teacher_hidden
 
 
 # ==============================================================================
@@ -4088,7 +4161,10 @@ def evaluate_and_save(
     n_dtw = min(200, n_test)
     dtw_idx = np.random.choice(n_test, n_dtw, replace=False)
     for i in dtw_idx:
-        d, _ = fastdtw(preds[i], tgt_test[i], dist=euclidean)
+        if HAS_FASTDTW:
+            d, _ = fastdtw(preds[i], tgt_test[i], dist=euclidean)
+        else:
+            d = float("nan")
         dtw_scores.append(d)
     mean_dtw = float(np.mean(dtw_scores))
     pf(f"[EVAL] Mean DTW (n={n_dtw}): {mean_dtw:.4f}")
@@ -4408,43 +4484,6 @@ def build_float_student(seq_len, n_out, student_units):
 # find_data_files — identical to vanilla_kd
 # ==============================================================================
 
-def find_data_files(data_dir, seq_len):
-    def find_one(patterns, desc):
-        for pat in patterns:
-            matches = glob.glob(os.path.join(data_dir, pat))
-            if matches:
-                return sorted(matches)[0]
-        raise FileNotFoundError(
-            f"Cannot find {desc} in {data_dir}. Tried: {patterns}"
-        )
-
-    file_input = find_one(
-        [f"tpsf_seq_L{seq_len}_*.npy"],
-        "encoder input",
-    )
-    file_res = find_one(
-        [f"res_L{seq_len}_*.npy"],
-        "decoder target",
-    )
-    file_labels = find_one(
-        [f"labels_3ch_L{seq_len}_*.npy"],
-        "labels_3ch",
-    )
-
-    def find_idx(names, desc):
-        for name in names:
-            path = os.path.join(data_dir, name)
-            if os.path.exists(path):
-                return path
-        raise FileNotFoundError(
-            f"{desc} not found in {data_dir}. Tried: {names}"
-        )
-
-    file_train = find_idx(["trainidx.npy", "train_idx.npy"], "train index")
-    file_val   = find_idx(["validx.npy", "val_idx.npy"], "validation index")
-    file_test  = find_idx(["testidx.npy", "test_idx.npy"], "test index")
-
-    return file_input, file_res, file_labels, file_train, file_val, file_test
 
 
 
@@ -4548,11 +4587,11 @@ def main():
     pf("[DATA] Materialising split buffers...")
     sys.stdout.flush()
 
-    enc_train, tgt_train, tpred_train, thid_train = materialise_buffers(
+    enc_train, tgt_train, tpred_train, teacher_hidden_train = materialise_buffers(
         normalized_input, res, teacher_predictions, teacher_hidden,
         train_idx, args.seq_len, args.n_out, "train", pf
     )
-    enc_val, tgt_val, tpred_val, thid_val = materialise_buffers(
+    enc_val, tgt_val, tpred_val, teacher_hidden_val = materialise_buffers(
         normalized_input, res, teacher_predictions, teacher_hidden,
         val_idx, args.seq_len, args.n_out, "val", pf
     )
@@ -4564,14 +4603,14 @@ def main():
     sys.stdout.flush()
 
     train_ds = make_kd_dataset(
-        enc_train, tgt_train, tpred_train, thid_train,
+        enc_train, tgt_train, tpred_train, teacher_hidden_train,
         args.batch_size, args.seq_len, args.n_out, teacher_hidden_dim,
         shuffle=True, seed=args.split_seed,
         prefetch_batches=args.prefetch_batches,
         pipeline_workers=args.pipeline_workers,
     )
     val_ds = make_kd_dataset(
-        enc_val, tgt_val, tpred_val, thid_val,
+        enc_val, tgt_val, tpred_val, teacher_hidden_val,
         args.batch_size, args.seq_len, args.n_out, teacher_hidden_dim,
         shuffle=False, seed=args.split_seed,
         prefetch_batches=args.prefetch_batches,
