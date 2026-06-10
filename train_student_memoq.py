@@ -2560,64 +2560,117 @@ def make_dist_memoq_train(
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,     tf.float32)
 
-    def train_step_per_replica(batch_x, batch_y):
-        enc_b         = batch_x["enc_input"]
-        dec_b         = batch_x["dec_input"]
-        tpred_b       = batch_x["tpred"]
-        teacher_hid_b = batch_x["teacher_hidden"]
-        tgt_b         = batch_y
+    def train_step_per_replica(
+        batch_x,
+        batch_y,
+        student_model,
+        teacher_hidden_model,
+        optimizer,
+        temperature,
+        alpha,
+        lambda_mem,
+        lambda_innov,
+        lambda_zsat,
+        lambda_rail,
+        epsilon_innov,
+        lag_set,
+        lag_weights,
+        use_mem,
+        use_innov,
+        use_zsat,
+        use_rail,
+        rho_z,
+        rho_rail,
+        mu_rail,
+    ):
+        enc_b   = batch_x["enc_input"]
+        dec_b   = batch_x["dec_input"]
+        tpred_b = batch_x["tpred"]
+        tgt_b   = batch_y
+
+        alpha_f        = tf.cast(alpha,        tf.float32)
+        lambda_mem_f   = tf.cast(lambda_mem,   tf.float32)
+        lambda_innov_f = tf.cast(lambda_innov, tf.float32)
+        lambda_zsat_f  = tf.cast(lambda_zsat,  tf.float32)
+        lambda_rail_f  = tf.cast(lambda_rail,  tf.float32)
+
+        # Compute teacher hidden on-the-fly — avoids materialising the full
+        # (N, 135, 128) float32 teacher hidden array (~443 GB RAM).
+        # teacher_hidden_model is frozen (trainable=False) so this does not
+        # contribute to the gradient tape.
+        h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
 
         with tf.GradientTape() as tape:
-            model_out = phase2_model([enc_b, dec_b], training=True)
-            seq_out        = model_out[0]
-            dec_h_seq      = model_out[1]
-            dec_z_logit_seq = model_out[2]
+            student_outputs = student_model([enc_b, dec_b], training=True)
 
-            l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
-            l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
-
-            total = alpha_f * l_kd + (1.0 - alpha_f) * l_seq
-
-            if use_mem:
-                l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len)
-                total = total + lambda_m_f * l_m
+            if isinstance(student_outputs, (list, tuple)) and len(student_outputs) >= 3:
+                s_pred       = student_outputs[0]
+                h_student    = student_outputs[1]
+                dec_z_logits = student_outputs[2]
+            elif isinstance(student_outputs, (list, tuple)) and len(student_outputs) == 2:
+                s_pred    = student_outputs[0]
+                h_student = student_outputs[1]
+                dec_z_logits = None
             else:
-                l_m = tf.constant(0.0)
+                s_pred    = student_outputs
+                h_student = None
+                dec_z_logits = None
 
-            if use_innov:
-                l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
-                total = total + lambda_i_f * l_i
+            hard_loss = huber_channel_norm_loss(s_pred, tgt_b, delta=0.1)
+            soft_loss = tf.reduce_mean(tf.square(tpred_b - s_pred))
+            total = (1.0 - alpha_f) * hard_loss + alpha_f * soft_loss
+
+            has_hidden   = h_student is not None
+            has_z_logit  = dec_z_logits is not None
+
+            if use_mem and has_hidden:
+                l_m = loss_mem(h_student, h_teacher, lag_set, lag_weights)
+                total = total + lambda_mem_f * l_m
             else:
-                l_i = tf.constant(0.0)
+                l_m = tf.constant(0.0, dtype=tf.float32)
 
-            if use_zsat:
-                if has_z_logit and dec_z_logit_seq is not None:
-                    z_vals = tf.sigmoid(dec_z_logit_seq)
-                    l_z = loss_zsat_value(z_vals, rho_z=0.98)
-                else:
-                    l_z = tf.constant(0.0, dtype=tf.float32)
-                total = total + lambda_z_f * l_z
+            if use_innov and has_hidden:
+                l_i = loss_innov(h_student, h_teacher, epsilon_innov)
+                total = total + lambda_innov_f * l_i
+            else:
+                l_i = tf.constant(0.0, dtype=tf.float32)
+
+            if use_zsat and has_z_logit:
+                z_vals = tf.sigmoid(dec_z_logits)
+                l_z = loss_zsat_value(z_vals, rho_z=rho_z)
+                total = total + lambda_zsat_f * l_z
             else:
                 l_z = tf.constant(0.0, dtype=tf.float32)
 
-            if use_rail:
-                l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
-                total = total + lambda_r_f * l_r
+            if use_rail and has_hidden:
+                l_r = loss_railpred(h_student, rho_rail=rho_rail, mu_rail=mu_rail)
+                total = total + lambda_rail_f * l_r
             else:
-                l_r = tf.constant(0.0)
+                l_r = tf.constant(0.0, dtype=tf.float32)
 
-        grads = tape.gradient(total, phase2_model.trainable_variables)
+        grads = tape.gradient(total, student_model.trainable_variables)
         grads = [
             tf.zeros_like(v) if g is None else g
-            for g, v in zip(grads, phase2_model.trainable_variables)
+            for g, v in zip(grads, student_model.trainable_variables)
         ]
+
         nan_in_grads = tf.reduce_any(tf.stack([
             tf.reduce_any(tf.math.is_nan(g)) for g in grads
         ]))
-        grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
-        optimizer.apply_gradients(zip(grads, phase2_model.trainable_variables))
 
-        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, tf.cast(nan_in_grads, tf.float32)
+        grads, _ = tf.clip_by_global_norm(grads, clip_norm=0.5)
+        optimizer.apply_gradients(zip(grads, student_model.trainable_variables))
+
+        return (
+            total,
+            hard_loss,
+            soft_loss,
+            l_m,
+            l_i,
+            l_z,
+            l_r,
+            tf.cast(nan_in_grads, tf.float32),
+        )
 
     @tf.function
     def dist_step(batch_x, batch_y):
@@ -2657,52 +2710,103 @@ def make_dist_memoq_val(
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
 
-    def val_step_per_replica(batch_x, batch_y):
-        enc_b         = batch_x["enc_input"]
-        dec_b         = batch_x["dec_input"]
-        tpred_b       = batch_x["tpred"]
-        teacher_hid_b = batch_x["teacher_hidden"]
-        tgt_b         = batch_y
+    def val_step_per_replica(
+        batch_x,
+        batch_y,
+        student_model,
+        teacher_hidden_model,
+        temperature,
+        alpha,
+        lambda_mem,
+        lambda_innov,
+        lambda_zsat,
+        lambda_rail,
+        epsilon_innov,
+        lag_set,
+        lag_weights,
+        use_mem,
+        use_innov,
+        use_zsat,
+        use_rail,
+        rho_z,
+        rho_rail,
+        mu_rail,
+    ):
+        enc_b   = batch_x["enc_input"]
+        dec_b   = batch_x["dec_input"]
+        tpred_b = batch_x["tpred"]
+        tgt_b   = batch_y
 
-        model_out = phase2_model([enc_b, dec_b], training=False)
-        seq_out         = model_out[0]
-        dec_h_seq       = model_out[1]
-        dec_z_logit_seq = model_out[2]
+        alpha_f        = tf.cast(alpha,        tf.float32)
+        lambda_mem_f   = tf.cast(lambda_mem,   tf.float32)
+        lambda_innov_f = tf.cast(lambda_innov, tf.float32)
+        lambda_zsat_f  = tf.cast(lambda_zsat,  tf.float32)
+        lambda_rail_f  = tf.cast(lambda_rail,  tf.float32)
 
-        l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
-        l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
-        total = alpha_f * l_kd + (1.0 - alpha_f) * l_seq
+        # Compute teacher hidden on-the-fly — same pattern as train step.
+        h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
 
-        if use_mem:
-            l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len)
-            total = total + lambda_m_f * l_m
+        student_outputs = student_model([enc_b, dec_b], training=False)
+
+        if isinstance(student_outputs, (list, tuple)) and len(student_outputs) >= 3:
+            s_pred       = student_outputs[0]
+            h_student    = student_outputs[1]
+            dec_z_logits = student_outputs[2]
+        elif isinstance(student_outputs, (list, tuple)) and len(student_outputs) == 2:
+            s_pred    = student_outputs[0]
+            h_student = student_outputs[1]
+            dec_z_logits = None
         else:
-            l_m = tf.constant(0.0)
+            s_pred    = student_outputs
+            h_student = None
+            dec_z_logits = None
 
-        if use_innov:
-            l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
-            total = total + lambda_i_f * l_i
+        hard_loss = huber_channel_norm_loss(s_pred, tgt_b, delta=0.1)
+        soft_loss = tf.reduce_mean(tf.square(tpred_b - s_pred))
+        total = (1.0 - alpha_f) * hard_loss + alpha_f * soft_loss
+        mae   = tf.reduce_mean(tf.abs(s_pred - tgt_b))
+
+        has_hidden   = h_student is not None
+        has_z_logit  = dec_z_logits is not None
+
+        if use_mem and has_hidden:
+            l_m = loss_mem(h_student, h_teacher, lag_set, lag_weights)
+            total = total + lambda_mem_f * l_m
         else:
-            l_i = tf.constant(0.0)
+            l_m = tf.constant(0.0, dtype=tf.float32)
+
+        if use_innov and has_hidden:
+            l_i = loss_innov(h_student, h_teacher, epsilon_innov)
+            total = total + lambda_innov_f * l_i
+        else:
+            l_i = tf.constant(0.0, dtype=tf.float32)
 
         if use_zsat:
-            if has_z_logit and dec_z_logit_seq is not None:
-                z_vals = tf.sigmoid(dec_z_logit_seq)
-                l_z = loss_zsat_value(z_vals, rho_z=0.98)
-                total = total + lambda_z_f * l_z
+            if has_z_logit and dec_z_logits is not None:
+                z_vals = tf.sigmoid(dec_z_logits)
+                l_z = loss_zsat_value(z_vals, rho_z=rho_z)
+                total = total + lambda_zsat_f * l_z
             else:
                 l_z = tf.constant(0.0, dtype=tf.float32)
         else:
             l_z = tf.constant(0.0, dtype=tf.float32)
 
-        if use_rail:
-            l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
-            total = total + lambda_r_f * l_r
+        if use_rail and has_hidden:
+            l_r = loss_railpred(h_student, rho_rail=rho_rail, mu_rail=mu_rail)
+            total = total + lambda_rail_f * l_r
         else:
-            l_r = tf.constant(0.0)
+            l_r = tf.constant(0.0, dtype=tf.float32)
 
-        mae = tf.reduce_mean(tf.abs(seq_out - tgt_b))
-        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, mae
+        return (
+            total,
+            hard_loss,
+            soft_loss,
+            mae,
+            l_m,
+            l_i,
+            l_z,
+            l_r,
+        )
 
     @tf.function
     def dist_val_step(batch_x, batch_y):
@@ -3189,32 +3293,34 @@ def compute_epsilon_innov(teacher_hidden_train, pf):
 # batch_y: ground truth labels
 # ==============================================================================
 
-def make_memoq_kd_dataset(
+def make_memoq_dataset(
     enc_arr,
     tgt_arr,
     tpred_arr,
-    teacher_hidden_arr,
     batch_size,
-    accumulation_steps,
     seq_len,
     n_out,
-    teacher_units,
     shuffle,
     seed,
     prefetch_batches,
     pipeline_workers,
 ):
+    """
+    tf.data pipeline for MemoQ training.
+    Teacher hidden states (thid) are NOT included in the dataset —
+    they are computed on-the-fly inside the train step from the live
+    teacher_hidden_model. This avoids the ~443 GB RAM cost of storing
+    (N, 135, 128) float32 for the full training split.
+    """
     n = len(enc_arr)
     dec_arr = np.zeros_like(enc_arr)
-    micro_batch_size = batch_size // accumulation_steps
 
-    ds_enc    = tf.data.Dataset.from_tensor_slices(enc_arr)
-    ds_dec    = tf.data.Dataset.from_tensor_slices(dec_arr)
-    ds_tpred  = tf.data.Dataset.from_tensor_slices(tpred_arr)
-    ds_teacher_hidden   = tf.data.Dataset.from_tensor_slices(teacher_hidden_arr)
-    ds_tgt    = tf.data.Dataset.from_tensor_slices(tgt_arr)
+    ds_enc   = tf.data.Dataset.from_tensor_slices(enc_arr)
+    ds_dec   = tf.data.Dataset.from_tensor_slices(dec_arr)
+    ds_tpred = tf.data.Dataset.from_tensor_slices(tpred_arr)
+    ds_tgt   = tf.data.Dataset.from_tensor_slices(tgt_arr)
 
-    ds = tf.data.Dataset.zip((ds_enc, ds_dec, ds_tpred, ds_teacher_hidden, ds_tgt))
+    ds = tf.data.Dataset.zip((ds_enc, ds_dec, ds_tpred, ds_tgt))
 
     if shuffle:
         ds = ds.shuffle(
@@ -3223,26 +3329,23 @@ def make_memoq_kd_dataset(
             reshuffle_each_iteration=True,
         )
 
-    ds = ds.batch(micro_batch_size, drop_remainder=True)
+    ds = ds.batch(batch_size, drop_remainder=True)
 
-    def set_shapes(enc_b, dec_b, tpred_b, teacher_hidden_b, tgt_b):
-        enc_b.set_shape([micro_batch_size, seq_len, 1])
-        dec_b.set_shape([micro_batch_size, seq_len, 1])
-        tpred_b.set_shape([micro_batch_size, seq_len, n_out])
-        teacher_hidden_b.set_shape([micro_batch_size, seq_len, teacher_units])
-        tgt_b.set_shape([micro_batch_size, seq_len, n_out])
+    def set_shapes(enc_b, dec_b, tpred_b, tgt_b):
+        enc_b.set_shape([batch_size, seq_len, 1])
+        dec_b.set_shape([batch_size, seq_len, 1])
+        tpred_b.set_shape([batch_size, seq_len, n_out])
+        tgt_b.set_shape([batch_size, seq_len, n_out])
         batchx = {
-            "enc_input":       enc_b,
-            "dec_input":       dec_b,
-            "tpred":           tpred_b,
-            "teacher_hidden":  teacher_hidden_b,
+            "enc_input": enc_b,
+            "dec_input": dec_b,
+            "tpred":     tpred_b,
         }
         return batchx, tgt_b
 
     ds = ds.map(set_shapes, num_parallel_calls=pipeline_workers)
     ds = ds.prefetch(prefetch_batches)
     return ds
-
 
 # ==============================================================================
 # materialise_memoq_buffers:
@@ -3253,40 +3356,41 @@ def materialise_memoq_buffers(
     normalized_input,
     res,
     teacher_predictions,
-    teacher_hidden,
     idx,
     seq_len,
     n_out,
-    teacher_units,
     label,
     pf,
 ):
+    """
+    Materialise enc/tgt/tpred split into contiguous float32 RAM buffers.
+    Teacher hidden states are NOT materialised here — they are computed
+    on-the-fly inside the train step from the live teacher_hidden_model
+    to avoid the ~443 GB RAM cost of storing (N, 135, 128) float32 for
+    the full training split.
+    """
     n = len(idx)
-    pf(f"  Materialising MemoQ {label} buffers ({n:,} samples)...")
+    pf(f"  Materialising {label} enc/tgt/tpred ({n:,} samples) into RAM...")
     t0 = time.time()
 
-    enc_buf         = np.empty((n, seq_len, 1),             dtype=np.float32)
-    tgt_buf         = np.empty((n, seq_len, n_out),         dtype=np.float32)
-    tpred_buf       = np.empty((n, seq_len, n_out),         dtype=np.float32)
-    teacher_hid_buf = np.empty((n, seq_len, teacher_units), dtype=np.float32)
+    enc   = np.empty((n, seq_len, 1),    dtype=np.float32)
+    tgt   = np.empty((n, seq_len, n_out), dtype=np.float32)
+    tpred = np.empty((n, seq_len, n_out), dtype=np.float32)
 
     chunk = 65536
     for s in range(0, n, chunk):
-        e = min(s + chunk, n)
-        enc_buf[s:e]         = normalized_input[idx[s:e]]
-        tgt_buf[s:e]         = res[idx[s:e]]
-        tpred_buf[s:e]       = teacher_predictions[idx[s:e]]
-        teacher_hid_buf[s:e] = teacher_hidden[idx[s:e]]
+        e          = min(s + chunk, n)
+        enc[s:e]   = normalized_input[idx[s:e]]
+        tgt[s:e]   = res[idx[s:e]]
+        tpred[s:e] = teacher_predictions[idx[s:e]]
 
     pf(
         f"  Done in {time.time() - t0:.1f}s  "
-        f"enc={enc_buf.nbytes/1e9:.2f}GB  "
-        f"tgt={tgt_buf.nbytes/1e9:.2f}GB  "
-        f"tpred={tpred_buf.nbytes/1e9:.2f}GB  "
-        f"teacher_hidden={teacher_hid_buf.nbytes/1e9:.2f}GB"
+        f"enc={enc.nbytes / 1e9:.2f} GB  "
+        f"tgt={tgt.nbytes / 1e9:.2f} GB  "
+        f"tpred={tpred.nbytes / 1e9:.2f} GB"
     )
-    sys.stdout.flush()
-    return enc_buf, tgt_buf, tpred_buf, teacher_hid_buf
+    return enc, tgt, tpred
 
 # ==============================================================================
 # transfer_float_to_phase2:
