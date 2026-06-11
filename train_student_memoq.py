@@ -1384,6 +1384,9 @@ def training_loop_memoq(
                 if key in rs["history"]:
                     history[key] = list(rs["history"][key])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage}")
+        if resume_stage in ("P2A", "P2B", "P2C", "P3"):
+            patience_cts[resume_stage] = 0
+            pf(f"[RESUME] Reset patience_cts[{resume_stage!r}] to 0 — quantization context reinit on resume causes transient loss spike")
         stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
         stage_idx = stage_order.index(resume_stage)
         if stage_idx >= 1 and os.path.exists(p1_ckpt):
@@ -3021,7 +3024,7 @@ def run_epoch(
     # ── Log ───────────────────────────────────────────────────────────────────
     elapsed = time.time() - t_epoch
     pf(
-        f"[{phase_tag}] ep {epoch:4d}/{total_epochs}  "
+        f"[{phase_tag}] ep {epoch_in_phase:4d}/{total_epochs}  "
         f"loss={train_acc[0]:.5f}  val={val_total:.5f}  mae={val_mae:.5f}  "
         f"mem={train_acc[3]:.5f}  innov={train_acc[4]:.5f}  "
         f"zsat={train_acc[5]:.5f}  rail={train_acc[6]:.5f}  "
