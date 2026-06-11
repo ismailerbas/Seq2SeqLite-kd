@@ -1926,11 +1926,14 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         b_z_inp, b_r_inp, b_h_inp  (H,) input biases
         b_z_rec, b_r_rec, b_h_rec  (H,) recurrent biases
 
-    Keras/QKeras reset_after=True QGRU expects:
-        kernel           (input_dim, 3*H)   concat [W_z | W_r | W_h]
-        recurrent_kernel (H,         3*H)   concat [U_z | U_r | U_h]
-        bias             (2,         3*H)   row 0 = input bias concat [b_z_inp | b_r_inp | b_h_inp]
-                                            row 1 = recurrent bias concat [b_z_rec | b_r_rec | b_h_rec]
+    Keras/QKeras reset_after=True QGRU weight layouts (version-dependent):
+      3-weight, bias shape (3*H,)    -> input bias only, flat
+      3-weight, bias shape (2, 3*H)  -> stacked [input | recurrent]
+      4-weight                       -> bias_inp (3*H,), bias_rec (3*H,) separate
+      6-weight (quantizer scale vars)-> first 3 or 4 are the actual weight arrays
+
+    This function probes the actual shape of the bias tensor and dispatches
+    to the correct packing strategy so it never fails on a shape mismatch.
     """
     pf("[EXPORT] transfer_splitgate_to_qkeras: packing MemoQGRUCell -> QKeras QGRU [z|r|h]...")
 
@@ -1955,7 +1958,7 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         packed_recurrent = np.concatenate([U_z, U_r, U_h], axis=1)
         packed_bias_inp  = np.concatenate([b_z_inp, b_r_inp, b_h_inp], axis=0)
         packed_bias_rec  = np.concatenate([b_z_rec, b_r_rec, b_h_rec], axis=0)
-        packed_bias      = np.stack([packed_bias_inp, packed_bias_rec], axis=0)
+        packed_bias_2row = np.stack([packed_bias_inp, packed_bias_rec], axis=0)
 
         try:
             target_layer = target_model.get_layer(layer_name)
@@ -1966,30 +1969,80 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         q_weights = target_layer.get_weights()
         n_w = len(q_weights)
 
-        if n_w == 3:
-            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
+        pf(f"[EXPORT]   {layer_name}: layer has {n_w} weight tensors, shapes: {[w.shape for w in q_weights]}")
+
+        if n_w >= 4:
+            bias_inp_shape = q_weights[2].shape
+            bias_rec_shape = q_weights[3].shape
+            if bias_inp_shape == packed_bias_inp.shape and bias_rec_shape == packed_bias_rec.shape:
+                target_layer.set_weights([
+                    packed_kernel,
+                    packed_recurrent,
+                    packed_bias_inp,
+                    packed_bias_rec,
+                ] + list(q_weights[4:]))
+                pf(
+                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
+                    f"recurrent={packed_recurrent.shape}  "
+                    f"bias_inp={packed_bias_inp.shape}  bias_rec={packed_bias_rec.shape} (4-weight mode)"
+                )
+                return
             pf(
-                f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
-                f"recurrent={packed_recurrent.shape}  bias={packed_bias.shape} (3-weight mode)"
+                f"[EXPORT]   {layer_name}: 4-weight mode shape mismatch, "
+                f"expected bias_inp={packed_bias_inp.shape} bias_rec={packed_bias_rec.shape} "
+                f"got {bias_inp_shape} {bias_rec_shape}, falling through to 3-weight probe"
             )
-        elif n_w == 4:
-            target_layer.set_weights([
-                packed_kernel,
-                packed_recurrent,
-                packed_bias_inp,
-                packed_bias_rec,
-            ])
+
+        if n_w >= 3:
+            bias_slot_shape = q_weights[2].shape
+            if bias_slot_shape == packed_bias_2row.shape:
+                target_layer.set_weights([
+                    packed_kernel,
+                    packed_recurrent,
+                    packed_bias_2row,
+                ] + list(q_weights[3:]))
+                pf(
+                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
+                    f"recurrent={packed_recurrent.shape}  bias={packed_bias_2row.shape} (3-weight 2-row bias mode)"
+                )
+                return
+            if bias_slot_shape == packed_bias_inp.shape:
+                target_layer.set_weights([
+                    packed_kernel,
+                    packed_recurrent,
+                    packed_bias_inp,
+                ] + list(q_weights[3:]))
+                pf(
+                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
+                    f"recurrent={packed_recurrent.shape}  bias={packed_bias_inp.shape} (3-weight flat bias mode, recurrent bias dropped)"
+                )
+                pf(
+                    f"[EXPORT]   WARNING: {layer_name} QKeras QGRU only exposes 1 bias tensor of shape "
+                    f"{bias_slot_shape}. Recurrent bias b_{{z,r,h}}_rec is not transferred. "
+                    f"This is a QKeras version limitation (reset_after bias not separately stored)."
+                )
+                return
             pf(
-                f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
-                f"recurrent={packed_recurrent.shape}  "
-                f"bias_inp={packed_bias_inp.shape}  bias_rec={packed_bias_rec.shape} (4-weight mode)"
+                f"[EXPORT]   ERROR: {layer_name} bias slot shape {bias_slot_shape} does not match "
+                f"packed_bias_2row {packed_bias_2row.shape} or packed_bias_inp {packed_bias_inp.shape}. "
+                f"Attempting raw set_weights with 2-row bias to let Keras raise a clear error."
             )
-        else:
-            pf(
-                f"[EXPORT]   WARNING: {layer_name} has unexpected {n_w} weight tensors, "
-                f"attempting 3-weight convention."
+            raise ValueError(
+                f"transfer_splitgate_to_qkeras: layer '{layer_name}' has {n_w} weight tensors, "
+                f"bias slot shape is {bias_slot_shape}, expected either "
+                f"{packed_bias_inp.shape} (flat) or {packed_bias_2row.shape} (2-row). "
+                f"All weight shapes: {[w.shape for w in q_weights]}. "
+                f"packed_kernel={packed_kernel.shape}, packed_recurrent={packed_recurrent.shape}."
             )
-            target_layer.set_weights([packed_kernel, packed_recurrent, packed_bias])
+
+        pf(
+            f"[EXPORT]   ERROR: {layer_name} has only {n_w} weight tensors — too few to transfer. "
+            f"Expected at least 3. Shapes: {[w.shape for w in q_weights]}"
+        )
+        raise ValueError(
+            f"transfer_splitgate_to_qkeras: layer '{layer_name}' has {n_w} weight tensors, "
+            f"cannot transfer (need >= 3). Shapes: {[w.shape for w in q_weights]}"
+        )
 
     pack_and_load(enc_cell, "sencgru", final_qkeras_student)
     pack_and_load(dec_cell, "sdecgru", final_qkeras_student)
