@@ -1337,6 +1337,7 @@ def training_loop_memoq(
     epsilon_innov,
     job_dir,
     pf,
+    teacher_hidden_model=None,
 ):
     p1_ckpt   = os.path.join(job_dir, "phase1_best.weights.h5")
     p2a_ckpt  = os.path.join(job_dir, "stage2a_best.weights.h5")
@@ -1383,7 +1384,27 @@ def training_loop_memoq(
             for key in history:
                 if key in rs["history"]:
                     history[key] = list(rs["history"][key])
-        pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage}")
+        global_epoch = len(history["phase"])
+        pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
+        if resume_stage in ("P2A", "P2B", "P2C", "P3"):
+            patience_cts[resume_stage] = 0
+            pf(f"[RESUME] Reset patience_cts[{resume_stage!r}] to 0 — quantization context reinit on resume causes transient loss spike")
+        stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
+        stage_idx = stage_order.index(resume_stage)
+        if stage_idx >= 1 and os.path.exists(p1_ckpt):
+            float_student.load_weights(p1_ckpt)
+            pf("[RESUME] Loaded P1 weights for float_student")
+        if stage_idx >= 2:
+            ckpt = p2a_ckpt if stage_idx == 2 else (p2b_ckpt if stage_idx == 3 else p2c_ckpt)
+            if os.path.exists(ckpt):
+                phase2_model.load_weights(ckpt)
+                pf(f"[RESUME] Loaded P2 weights for phase2_model from {ckpt}")
+        if stage_idx >= 4 and os.path.exists(p3_ckpt):
+            final_qkeras_student.load_weights(p3_ckpt)
+            pf("[RESUME] Loaded P3 weights for final_qkeras_student")
+        sys.stdout.flush()
+
+
         if resume_stage in ("P2A", "P2B", "P2C", "P3"):
             patience_cts[resume_stage] = 0
             pf(f"[RESUME] Reset patience_cts[{resume_stage!r}] to 0 — quantization context reinit on resume causes transient loss spike")
@@ -1550,7 +1571,9 @@ def training_loop_memoq(
                 use_mem=True, use_innov=innov_active,
                 use_zsat=False, use_rail=True,
                 has_z_logit=True, clipnorm=1.0,
+                teacher_hidden_model=teacher_hidden_model,
             )
+
             dist_val_p2a = make_dist_memoq_val(
                 strategy, phase2_model,
                 args.alpha, channel_scales, args.memoq_huber_delta,
@@ -1560,7 +1583,9 @@ def training_loop_memoq(
                 use_mem=True, use_innov=innov_active,
                 use_zsat=False, use_rail=True,
                 has_z_logit=True,
+                teacher_hidden_model=teacher_hidden_model,
             )
+
 
             history, best_vals["P2A"], patience_cts["P2A"], early_stop = run_epoch(
                 phase_tag="P2A",
@@ -1625,6 +1650,7 @@ def training_loop_memoq(
         ep2b_start = start_ep("P2B")
 
         for ep_in_phase in range(ep2b_start, args.memoq_stage2b_epochs):
+
             dist_train_p2b = make_dist_memoq_train(
                 strategy, phase2_model, opt_p2b,
                 args.alpha, channel_scales, args.memoq_huber_delta,
@@ -1634,7 +1660,9 @@ def training_loop_memoq(
                 use_mem=True, use_innov=True,
                 use_zsat=False, use_rail=True,
                 has_z_logit=True, clipnorm=1.0,
+                teacher_hidden_model=teacher_hidden_model,
             )
+
             dist_val_p2b = make_dist_memoq_val(
                 strategy, phase2_model,
                 args.alpha, channel_scales, args.memoq_huber_delta,
@@ -1644,7 +1672,9 @@ def training_loop_memoq(
                 use_mem=True, use_innov=True,
                 use_zsat=False, use_rail=True,
                 has_z_logit=True,
+                teacher_hidden_model=teacher_hidden_model,
             )
+
 
             history, best_vals["P2B"], patience_cts["P2B"], early_stop = run_epoch(
                 phase_tag="P2B",
@@ -1718,6 +1748,7 @@ def training_loop_memoq(
                 use_mem=True, use_innov=True,
                 use_zsat=True, use_rail=True,
                 has_z_logit=True, clipnorm=1.0,
+                teacher_hidden_model=teacher_hidden_model,
             )
             dist_val_p2c = make_dist_memoq_val(
                 strategy, phase2_model,
@@ -1728,7 +1759,9 @@ def training_loop_memoq(
                 use_mem=True, use_innov=True,
                 use_zsat=True, use_rail=True,
                 has_z_logit=True,
-            )
+                teacher_hidden_model=teacher_hidden_model,
+            )            
+
 
             history, best_vals["P2C"], patience_cts["P2C"], early_stop = run_epoch(
                 phase_tag="P2C",
@@ -1797,6 +1830,7 @@ def training_loop_memoq(
         ep3_start = start_ep("P3")
 
         for ep_in_phase in range(ep3_start, args.memoq_stage3_epochs):
+
             dist_train_p3 = make_dist_memoq_train_final(
                 strategy, final_qkeras_student, opt_p3,
                 0.5, channel_scales, args.memoq_huber_delta,
@@ -1804,15 +1838,18 @@ def training_loop_memoq(
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
                 clipnorm=0.5,
+                teacher_hidden_model=teacher_hidden_model,
             )
-
             dist_val_p3 = make_dist_memoq_val_final(
                 strategy, final_qkeras_student,
                 0.5, channel_scales, args.memoq_huber_delta,
                 0.03, 0.002, 0.0, 0.0005,
                 epsilon_innov, args.seq_len,
                 args.memoq_rho_rail, args.memoq_mu_rail,
-            )
+                teacher_hidden_model=teacher_hidden_model,
+            )            
+
+
 
             history, best_vals["P3"], patience_cts["P3"], early_stop = run_epoch(
                 phase_tag="P3",
@@ -2499,9 +2536,8 @@ def make_dist_memoq_train(
     use_rail,
     has_z_logit,
     clipnorm,
+    teacher_hidden_model=None,
 ):
-    teacher_hidden_model_ref = phase2_model._teacher_hidden_model
-
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
@@ -2517,7 +2553,10 @@ def make_dist_memoq_train(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        h_teacher = teacher_hidden_model_ref([enc_b, dec_b], training=False)
+        if teacher_hidden_model is not None:
+            h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
+        else:
+            h_teacher = batch_x.get("teacher_hidden", None)
 
         with tf.GradientTape() as tape:
             model_out = phase2_model([enc_b, dec_b], training=True)
@@ -2532,13 +2571,13 @@ def make_dist_memoq_train(
             l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
             total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            if use_mem:
+            if use_mem and h_teacher is not None:
                 l_m = loss_mem(s_hid, h_teacher, seq_len_int)
                 total = total + lambda_m_f * l_m
             else:
                 l_m = tf.constant(0.0, dtype=tf.float32)
 
-            if use_innov:
+            if use_innov and h_teacher is not None:
                 l_i = loss_innov(s_hid, h_teacher, eps_innov_f)
                 total = total + lambda_i_f * l_i
             else:
@@ -2608,9 +2647,8 @@ def make_dist_memoq_val(
     use_zsat,
     use_rail,
     has_z_logit,
+    teacher_hidden_model=None,
 ):
-    teacher_hidden_model_ref = phase2_model._teacher_hidden_model
-
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
@@ -2625,7 +2663,10 @@ def make_dist_memoq_val(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        h_teacher = teacher_hidden_model_ref([enc_b, dec_b], training=False)
+        if teacher_hidden_model is not None:
+            h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
+        else:
+            h_teacher = batch_x.get("teacher_hidden", None)
 
         model_out = phase2_model([enc_b, dec_b], training=False)
 
@@ -2639,13 +2680,13 @@ def make_dist_memoq_val(
         l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
         total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        if use_mem:
+        if use_mem and h_teacher is not None:
             l_m = loss_mem(s_hid, h_teacher, seq_len_int)
             total = total + lambda_m_f * l_m
         else:
             l_m = tf.constant(0.0, dtype=tf.float32)
 
-        if use_innov:
+        if use_innov and h_teacher is not None:
             l_i = loss_innov(s_hid, h_teacher, eps_innov_f)
             total = total + lambda_i_f * l_i
         else:
@@ -2686,6 +2727,7 @@ def make_dist_memoq_val(
         )
 
     return dist_val_step
+
 
 # ==============================================================================
 # make_dist_memoq_train_final / make_dist_memoq_val_final:
@@ -2746,9 +2788,9 @@ def make_dist_memoq_train_final(
     rho_rail,
     mu_rail,
     clipnorm,
+    teacher_hidden_model=None,
 ):
     final_hidden_model = build_final_hidden_model(final_qkeras_student)
-    teacher_hidden_model_ref = final_qkeras_student._teacher_hidden_model
 
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -2765,7 +2807,10 @@ def make_dist_memoq_train_final(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        teacher_hid_b = teacher_hidden_model_ref([enc_b, dec_b], training=False)
+        if teacher_hidden_model is not None:
+            teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
+        else:
+            teacher_hid_b = batch_x.get("teacher_hidden", None)
 
         with tf.GradientTape() as tape:
             seq_out, dec_h_seq = final_hidden_model([enc_b, dec_b], training=True)
@@ -2774,11 +2819,15 @@ def make_dist_memoq_train_final(
             l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
             total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
-            total = total + lambda_m_f * l_m
+            if teacher_hid_b is not None:
+                l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
+                total = total + lambda_m_f * l_m
 
-            l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
-            total = total + lambda_i_f * l_i
+                l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
+                total = total + lambda_i_f * l_i
+            else:
+                l_m = tf.constant(0.0, dtype=tf.float32)
+                l_i = tf.constant(0.0, dtype=tf.float32)
 
             l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
             total = total + lambda_r_f * l_r
@@ -2813,6 +2862,7 @@ def make_dist_memoq_train_final(
 
     return dist_step
 
+
 def make_dist_memoq_val_final(
     strategy,
     final_qkeras_student,
@@ -2827,9 +2877,9 @@ def make_dist_memoq_val_final(
     seq_len,
     rho_rail,
     mu_rail,
+    teacher_hidden_model=None,
 ):
     final_hidden_model_val = build_final_hidden_model(final_qkeras_student)
-    teacher_hidden_model_ref = final_qkeras_student._teacher_hidden_model
 
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -2845,7 +2895,10 @@ def make_dist_memoq_val_final(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        teacher_hid_b = teacher_hidden_model_ref([enc_b, dec_b], training=False)
+        if teacher_hidden_model is not None:
+            teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
+        else:
+            teacher_hid_b = batch_x.get("teacher_hidden", None)
 
         seq_out, dec_h_seq = final_hidden_model_val([enc_b, dec_b], training=False)
 
@@ -2853,11 +2906,15 @@ def make_dist_memoq_val_final(
         l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
         total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
-        total = total + lambda_m_f * l_m
+        if teacher_hid_b is not None:
+            l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
+            total = total + lambda_m_f * l_m
 
-        l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
-        total = total + lambda_i_f * l_i
+            l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
+            total = total + lambda_i_f * l_i
+        else:
+            l_m = tf.constant(0.0, dtype=tf.float32)
+            l_i = tf.constant(0.0, dtype=tf.float32)
 
         l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
         total = total + lambda_r_f * l_r
@@ -4130,6 +4187,8 @@ def main():
         epsilon_innov        = epsilon_innov,
         job_dir              = job_dir,
         pf                   = pf,
+        teacher_hidden_model=teacher_hidden_model,
+
     )
 
     # ── Save final weights ────────────────────────────────────────────────────
