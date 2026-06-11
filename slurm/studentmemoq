@@ -245,17 +245,29 @@ echo "============================================================"
 
 # --- If resuming: verify that phase checkpoints exist before launching ---
 if [ "${RESUME_FLAG}" = "--resume" ]; then
-    BEST_CKPT="${SAVE_DIR}/results/${JOB_TAG}/student_best.weights.h5"
-    RESUME_STATE="${SAVE_DIR}/results/${JOB_TAG}/resume_state.json"
+    JOB_RESULTS_DIR="${SAVE_DIR}/results/${JOB_TAG}"
+    RESUME_STATE="${JOB_RESULTS_DIR}/resume_state.json"
     echo "RESUME MODE: checking for required files..."
-    echo "  Best weights : ${BEST_CKPT}"
+    echo "  Job dir      : ${JOB_RESULTS_DIR}"
     echo "  Resume state : ${RESUME_STATE}"
-    if [ ! -f "${BEST_CKPT}" ]; then
-        echo "FATAL: --resume passed but student_best.weights.h5 not found at:"
-        echo "  ${BEST_CKPT}"
+
+    FOUND_CKPT=""
+    for CKPT_NAME in "student_best.weights.h5" "stage2c_best.weights.h5" "stage2b_best.weights.h5" "stage2a_best.weights.h5" "phase1_best.weights.h5"; do
+        if [ -f "${JOB_RESULTS_DIR}/${CKPT_NAME}" ]; then
+            FOUND_CKPT="${JOB_RESULTS_DIR}/${CKPT_NAME}"
+            echo "  Found checkpoint : ${FOUND_CKPT}"
+            break
+        fi
+    done
+
+    if [ -z "${FOUND_CKPT}" ]; then
+        echo "FATAL: --resume passed but no checkpoint found in:"
+        echo "  ${JOB_RESULTS_DIR}"
+        echo "  Checked: student_best.weights.h5, stage2c_best.weights.h5, stage2b_best.weights.h5, stage2a_best.weights.h5, phase1_best.weights.h5"
         echo "Cannot resume without a checkpoint. Run without --resume for a fresh start."
         exit 1
     fi
+
     if [ ! -f "${RESUME_STATE}" ]; then
         echo "WARNING: resume_state.json not found at:"
         echo "  ${RESUME_STATE}"
