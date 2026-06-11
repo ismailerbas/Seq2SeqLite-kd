@@ -220,61 +220,8 @@ def parse_args():
 
     return args
 
-# ==============================================================================
-# Job naming
-# ==============================================================================
-
-def make_job_name(args) -> str:
-    return (
-        f"memoq"
-        f"_b{args.bits_kernel}k{args.bits_recurrent}r{args.bits_activation}a{args.bits_state}s"
-        f"_gru{args.student_units}"
-        f"_dense{args.n_out}"
-        f"_effbs{args.batch_size}"
-        f"_microbs{args.batch_size}"
-        f"_lr{args.effective_lr:.0e}"
-        f"_p1-{args.memoq_warmup_epochs}"
-        f"_2a{args.memoq_stage2a_epochs}"
-        f"_2b{args.memoq_stage2b_epochs}"
-        f"_2c{args.memoq_stage2c_epochs}"
-        f"_p3-{args.memoq_finetune_epochs}"
-    )
 
 
-# ==============================================================================
-# GPU / strategy setup
-# ==============================================================================
-
-def setup_gpus_and_strategy(mixed_precision: bool):
-    physical_gpus = tf.config.list_physical_devices("GPU")
-    if not physical_gpus:
-        print("[GPU] No GPUs found — CPU mode.", flush=True)
-        return tf.distribute.get_strategy()
-
-    for gpu in physical_gpus:
-        try:
-            tf.config.experimental.set_memory_growth(gpu, True)
-        except RuntimeError as e:
-            print(f"[GPU] set_memory_growth warning: {e}", flush=True)
-
-    print(f"[GPU] Physical GPUs: {len(physical_gpus)}", flush=True)
-
-    logical_gpus = tf.config.list_logical_devices("GPU")
-    print(f"[GPU] Logical GPUs:  {len(logical_gpus)}", flush=True)
-
-    if not logical_gpus:
-        print("[GPU] No logical GPUs — CPU fallback.", flush=True)
-        return tf.distribute.get_strategy()
-
-    if mixed_precision:
-        print("[GPU] WARNING: --mixed-precision disabled (QKeras incompatible). Using float32.", flush=True)
-
-    keras.mixed_precision.set_global_policy("float32")
-
-    gpu_devices = [f"GPU:{i}" for i in range(len(logical_gpus))]
-    strategy = tf.distribute.MirroredStrategy(devices=gpu_devices)
-    print(f"[GPU] MirroredStrategy: {strategy.num_replicas_in_sync} replicas  devices={gpu_devices}", flush=True)
-    return strategy
 
 
 # ==============================================================================
@@ -3808,25 +3755,21 @@ def parse_args():
 # make_job_name
 # ==============================================================================
 
-def make_job_name(args):
-    effective_batch = args.batch_size
-    micro_batch = args.batch_size // args.accumulation_steps
+def make_job_name(args) -> str:
     return (
         f"memoq"
-        f"_b{args.bits_kernel}k{args.bits_bias}r{args.bits_recurrent}"
-        f"a{args.bits_activation}s{args.bits_state}"
+        f"_b{args.bits_kernel}k{args.bits_recurrent}r{args.bits_activation}a{args.bits_state}s"
         f"_gru{args.student_units}"
         f"_dense{args.n_out}"
-        f"_effbs{effective_batch}"
-        f"_microbs{micro_batch}"
+        f"_effbs{args.batch_size}"
+        f"_microbs{args.batch_size}"
         f"_lr{args.effective_lr:.0e}"
-        f"_p1-{args.memoq_stage1_epochs}"
+        f"_p1-{args.memoq_warmup_epochs}"
         f"_2a{args.memoq_stage2a_epochs}"
         f"_2b{args.memoq_stage2b_epochs}"
         f"_2c{args.memoq_stage2c_epochs}"
-        f"_p3-{args.memoq_stage3_epochs}"
+        f"_p3-{args.memoq_finetune_epochs}"
     )
-
 
 # ==============================================================================
 # setup_gpus_and_strategy — identical to vanilla_kd
