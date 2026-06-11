@@ -153,14 +153,14 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 
 # --- Results subfolder: matches make_job_name() in train_student_memoq.py exactly ---
-# memoq_a{alpha}_b{K}k{R}r{A}a_gru{U}_bs{B}_lr{LR}_w{W}_2a{2A}_2b{2B}_2c{2C}_f{F}
+# memoq_b{K}k{R}r{A}a{S}s_gru{U}_dense{NOUT}_effbs{B}_microbs{B}_lr{LR}_p1-{W}_2a{2A}_2b{2B}_2c{2C}_p3-{F}
 # Since LR and all epoch counts are fixed defaults in this script, the tag is
 # computed below by calling python with the same logic so it never drifts.
 # We derive effective_lr here in bash to build JOB_TAG without invoking python twice.
 REF_BATCH_SIZE=1024
 EFFECTIVE_LR=$(python -c "print(f'{1e-4 * ${BATCH_SIZE} / ${REF_BATCH_SIZE}:.0e}')" 2>/dev/null || echo "1e-3")
 
-JOB_TAG="memoq_a0.7_b${BITS_KERNEL}k${BITS_RECURRENT}r${BITS_ACTIVATION}a_gru${STUDENT_UNITS}_bs${BATCH_SIZE}_lr${EFFECTIVE_LR}_w40_2a30_2b30_2c30_f170"
+JOB_TAG="memoq_b${BITS_KERNEL}k${BITS_RECURRENT}r${BITS_ACTIVATION}a${BITS_STATE}s_gru${STUDENT_UNITS}_dense${N_OUT}_effbs${BATCH_SIZE}_microbs${BATCH_SIZE}_lr${EFFECTIVE_LR}_p1-40_2a30_2b30_2c30_p3-170"
 
 
 

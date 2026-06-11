@@ -227,16 +227,17 @@ def parse_args():
 def make_job_name(args) -> str:
     return (
         f"memoq"
-        f"_a{args.alpha}"
-        f"_b{args.bits_kernel}k{args.bits_recurrent}r{args.bits_activation}a"
+        f"_b{args.bits_kernel}k{args.bits_recurrent}r{args.bits_activation}a{args.bits_state}s"
         f"_gru{args.student_units}"
-        f"_bs{args.batch_size}"
+        f"_dense{args.n_out}"
+        f"_effbs{args.batch_size}"
+        f"_microbs{args.batch_size}"
         f"_lr{args.effective_lr:.0e}"
-        f"_w{args.memoq_warmup_epochs}"
+        f"_p1-{args.memoq_warmup_epochs}"
         f"_2a{args.memoq_stage2a_epochs}"
         f"_2b{args.memoq_stage2b_epochs}"
         f"_2c{args.memoq_stage2c_epochs}"
-        f"_f{args.memoq_finetune_epochs}"
+        f"_p3-{args.memoq_finetune_epochs}"
     )
 
 
