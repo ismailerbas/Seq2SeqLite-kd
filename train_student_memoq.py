@@ -3412,14 +3412,13 @@ def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_
     Keras GRU reset_after=True weight layout:
       kernel           (input_dim, 3*H)  columns: [z | r | h]
       recurrent_kernel (H,         3*H)  columns: [z | r | h]
-      bias             (2,         3*H)  row 0 = input bias, row 1 = recurrent bias
-                       OR (3*H,)         single flat bias vector (reset_after=False fallback)
+      bias             (2,         3*H)  row 0 = input bias [z|r|h], row 1 = recurrent bias [z|r|h]
 
     MemoQGRUCell variables:
-      W_z, W_r, W_h   (input_dim, H)
-      U_z, U_r, U_h   (H,         H)
-      b_z_inp, b_r_inp, b_h_inp  (H,)  input biases
-      b_z_rec, b_r_rec, b_h_rec  (H,)  recurrent biases
+      W_z, W_r, W_h       (input_dim, H)
+      U_z, U_r, U_h       (H,         H)
+      b_z_inp, b_r_inp, b_h_inp  (H,)
+      b_z_rec, b_r_rec, b_h_rec  (H,)
     """
     pf("[P1->P2 TRANSFER] Unpacking float GRU weights into MemoQGRUCell split-gate variables...")
 
@@ -3431,43 +3430,69 @@ def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_
             return
 
         weights = layer.get_weights()
-        H = cell.units
-
         if len(weights) < 3:
-            pf(f"  SKIP {gru_layer_name} — expected >= 3 weight tensors, got {len(weights)}")
+            pf(f"  SKIP {gru_layer_name} — only {len(weights)} weight tensors (expected 3)")
             return
 
-        packed_kernel    = weights[0]   # (input_dim, 3*H)
-        packed_recurrent = weights[1]   # (H, 3*H)
-        packed_bias      = weights[2]   # (2, 3*H) or (3*H,)
+        kernel           = weights[0]   # (input_dim, 3*H)
+        recurrent_kernel = weights[1]   # (H, 3*H)
+        bias             = weights[2]   # (2, 3*H) for reset_after=True
 
-        if packed_bias.ndim == 2:
-            packed_bias_inp = packed_bias[0]   # (3*H,)
-            packed_bias_rec = packed_bias[1]   # (3*H,)
+        H = cell.units
+
+        if kernel.shape[1] != 3 * H:
+            pf(f"  SKIP {gru_layer_name} — kernel column count {kernel.shape[1]} != 3*{H}")
+            return
+
+        # Keras GRU packed column order: [z | r | h]
+        W_z = kernel[:, 0:H]
+        W_r = kernel[:, H:2*H]
+        W_h = kernel[:, 2*H:3*H]
+
+        U_z = recurrent_kernel[:, 0:H]
+        U_r = recurrent_kernel[:, H:2*H]
+        U_h = recurrent_kernel[:, 2*H:3*H]
+
+        if bias.ndim == 2 and bias.shape[0] == 2:
+            # reset_after=True: row 0 = input bias, row 1 = recurrent bias
+            b_z_inp = bias[0, 0:H]
+            b_r_inp = bias[0, H:2*H]
+            b_h_inp = bias[0, 2*H:3*H]
+            b_z_rec = bias[1, 0:H]
+            b_r_rec = bias[1, H:2*H]
+            b_h_rec = bias[1, 2*H:3*H]
+        elif bias.ndim == 1 and bias.shape[0] == 3 * H:
+            # reset_after=False fallback: single flat bias, all recurrent biases = 0
+            b_z_inp = bias[0:H]
+            b_r_inp = bias[H:2*H]
+            b_h_inp = bias[2*H:3*H]
+            b_z_rec = np.zeros(H, dtype=np.float32)
+            b_r_rec = np.zeros(H, dtype=np.float32)
+            b_h_rec = np.zeros(H, dtype=np.float32)
         else:
-            packed_bias_inp = packed_bias      # (3*H,) reset_after=False fallback
-            packed_bias_rec = np.zeros(3 * H, dtype=np.float32)
+            pf(f"  SKIP {gru_layer_name} — unexpected bias shape {bias.shape}")
+            return
 
-        cell.W_z.assign(packed_kernel[:, 0:H])
-        cell.W_r.assign(packed_kernel[:, H:2 * H])
-        cell.W_h.assign(packed_kernel[:, 2 * H:3 * H])
-
-        cell.U_z.assign(packed_recurrent[:, 0:H])
-        cell.U_r.assign(packed_recurrent[:, H:2 * H])
-        cell.U_h.assign(packed_recurrent[:, 2 * H:3 * H])
-
-        cell.b_z_inp.assign(packed_bias_inp[0:H])
-        cell.b_r_inp.assign(packed_bias_inp[H:2 * H])
-        cell.b_h_inp.assign(packed_bias_inp[2 * H:3 * H])
-
-        cell.b_z_rec.assign(packed_bias_rec[0:H])
-        cell.b_r_rec.assign(packed_bias_rec[H:2 * H])
-        cell.b_h_rec.assign(packed_bias_rec[2 * H:3 * H])
+        cell.W_z.assign(W_z)
+        cell.W_r.assign(W_r)
+        cell.W_h.assign(W_h)
+        cell.U_z.assign(U_z)
+        cell.U_r.assign(U_r)
+        cell.U_h.assign(U_h)
+        cell.b_z_inp.assign(b_z_inp)
+        cell.b_r_inp.assign(b_r_inp)
+        cell.b_h_inp.assign(b_h_inp)
+        cell.b_z_rec.assign(b_z_rec)
+        cell.b_r_rec.assign(b_r_rec)
+        cell.b_h_rec.assign(b_h_rec)
 
         pf(
-            f"  OK {gru_layer_name}: kernel={packed_kernel.shape}  "
-            f"recurrent={packed_recurrent.shape}  bias={packed_bias.shape}"
+            f"  OK {gru_layer_name}: "
+            f"W_z={W_z.shape} W_r={W_r.shape} W_h={W_h.shape}  "
+            f"U_z={U_z.shape} U_r={U_r.shape} U_h={U_h.shape}  "
+            f"b_*_inp={b_z_inp.shape} b_*_rec={b_z_rec.shape}"
         )
+        sys.stdout.flush()
 
     unpack_and_set("sencgru", enc_cell_p2)
     unpack_and_set("sdecgru", dec_cell_p2)
@@ -3479,10 +3504,10 @@ def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_
         dst_w = dst_dense.get_weights()
         if len(src_w) == len(dst_w) and all(s.shape == d.shape for s, d in zip(src_w, dst_w)):
             dst_dense.set_weights(src_w)
-            pf(f"  OK sdec_dense: transferred {len(src_w)} tensors")
+            pf("  OK sdec_dense")
         else:
             pf(
-                f"  SKIP sdec_dense: shape mismatch "
+                f"  SKIP sdec_dense — shape mismatch "
                 f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]}"
             )
     except Exception as exc:
