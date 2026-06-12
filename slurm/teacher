@@ -8,10 +8,24 @@
 #SBATCH --time=01:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
 
 # ============================================================================
 # Teacher Seq2Seq GRU Training
 # All 8 GPUs used via MirroredStrategy inside train_teacher.py.
+#
+# Auto-resubmission logic (mirrors slurm/student):
+#   - SIGUSR1 fires 120s before wall time -> sets RESUBMIT=1 IMMEDIATELY
+#     (Python runs in background so the trap is not deferred).
+#     Python finishes its current epoch, writes resume_state.json, exits 0.
+#     Job resubmits itself with --resume.
+#   - Python exits 0 cleanly within wall time -> check resume_state.json:
+#     if start_epoch < EPOCHS and patience not exhausted, resubmit with --resume.
+#   - Python exits 0 and resume_state.json says start_epoch >= EPOCHS OR
+#     patience was exhausted -> training is genuinely done, no resubmit.
+#   - Python exits non-zero and RESUBMIT=0 -> hard failure, no resubmit.
+#   - Python killed by SIGTERM (exit 143) and RESUBMIT=0 -> treat as
+#     wall-time preemption (SIGUSR1 race condition), resubmit with --resume.
 #
 # Positional args:
 #   $1  SEQ_LEN            (optional, default 135)
@@ -77,7 +91,7 @@ export OPENBLAS_NUM_THREADS=1
 # --- Paths ---
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 DATA_PATH="${SCRATCH_BASE}/nmi"
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." && pwd )"
 
 # --- Scratch / cache dirs ---
 export TMPDIR="${SCRATCH_BASE}/tmp_pip"
@@ -86,6 +100,31 @@ export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
 export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
 export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
 mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+
+# ============================================================================
+# STEP 5 — Auto-resubmission trap
+#
+# Python is launched in BACKGROUND below so that bash can interrupt
+# `wait $PYTHON_PID` and fire this trap IMMEDIATELY when SIGUSR1 arrives.
+# With a foreground process, bash DEFERS all traps until the foreground
+# command exits -- by then SLURM has already killed everything and
+# RESUBMIT is never set to 1.
+# ============================================================================
+RESUBMIT=0
+PYTHON_PID=""
+
+resubmit_handler() {
+    echo "============================================================"
+    echo "SIGUSR1 received: wall time limit approaching in ~120 seconds."
+    echo "Flagging for resubmission. Python will finish its current epoch."
+    echo "resume_state.json will be written by train_teacher.py before it exits."
+    echo "============================================================"
+    RESUBMIT=1
+    # Do NOT send any signal to Python -- let it complete its current epoch.
+    # SLURM will send SIGTERM to the job ~120s later if Python has not exited.
+}
+
+trap resubmit_handler SIGUSR1
 
 # --- Log ---
 echo "============================================================"
@@ -130,6 +169,12 @@ echo "train_teacher.py found."
 echo "Starting teacher training..."
 echo "============================================================"
 
+# ============================================================================
+# Launch Python in BACKGROUND — critical for SIGUSR1 trap to fire immediately.
+# & runs Python as a background job so the trap above fires immediately
+# when the signal arrives, rather than being deferred until Python exits.
+# `wait $PYTHON_PID` blocks the shell here and is interruptible by signals.
+# ============================================================================
 python "${SCRIPT_DIR}/train_teacher.py" \
     --data-dir            "${DATA_PATH}"    \
     --seq-len             "${SEQ_LEN}"      \
@@ -141,7 +186,7 @@ python "${SCRIPT_DIR}/train_teacher.py" \
     --lr                  "${LR}"           \
     --patience            8                 \
     --min-delta           1e-5              \
-    --lr-factor           0.5              \
+    --lr-factor           0.5               \
     --lr-patience         4                 \
     --lr-min              1e-6              \
     --val-frac            0.1               \
@@ -150,25 +195,142 @@ python "${SCRIPT_DIR}/train_teacher.py" \
     --infer-batch         8192              \
     --prefetch-batches    32                \
     --pipeline-workers    16                \
-    --teacher-layers-list ${LAYERS_LIST}
+    --teacher-layers-list ${LAYERS_LIST}    \
+    &
 
+PYTHON_PID=$!
+echo "Python launched in background. PID=${PYTHON_PID}"
+echo "Waiting for Python to finish (wait is interruptible by SIGUSR1)..."
+
+# wait is interruptible -- SIGUSR1 will fire resubmit_handler immediately,
+# set RESUBMIT=1, and then wait resumes automatically.
+wait ${PYTHON_PID}
 EXIT_CODE=$?
 
+echo "Python process ${PYTHON_PID} exited with code: ${EXIT_CODE}"
+
+# ============================================================================
+# SIGTERM hardening: if SLURM killed Python with SIGTERM (exit 143) and
+# RESUBMIT is still 0, this means SIGUSR1 either arrived too close to
+# SIGTERM for the trap to complete, or the epoch was still running when
+# the hard kill hit. resume_state.json from the last completed epoch is
+# intact on disk -- safe to resubmit.
+# ============================================================================
+if [ "${EXIT_CODE}" = "143" ] && [ "${RESUBMIT}" = "0" ]; then
+    echo "============================================================"
+    echo "Python was killed by SIGTERM (exit 143) without a prior SIGUSR1."
+    echo "Treating as wall-time preemption. Flagging for resubmission."
+    echo "resume_state.json from the last completed epoch will be used."
+    echo "============================================================"
+    RESUBMIT=1
+fi
+
+# ============================================================================
+# STEP 6 — Auto-resubmission block
+#
+# Resubmit decision logic:
+#
+#   RESUBMIT=1 (SIGUSR1 fired, or SIGTERM hardening):
+#     Always resubmit with --resume regardless of EXIT_CODE.
+#     resume_state.json from the last completed epoch is intact on disk.
+#
+#   RESUBMIT=0 + EXIT_CODE=0 (Python finished cleanly within wall time):
+#     Read resume_state.json to check start_epoch and patience_ct.
+#     - start_epoch < EPOCHS AND patience_ct < patience: resubmit.
+#     - start_epoch >= EPOCHS OR patience_ct >= patience: done, no resubmit.
+#
+#   RESUBMIT=0 + EXIT_CODE!=0 and EXIT_CODE!=143 (hard crash):
+#     Do NOT resubmit -- a crash loop would waste queue allocations.
+# ============================================================================
+
+CKPT_TAG="gru$(echo ${LAYERS_LIST} | tr ' ' 'x')"
+JOB_OUT_DIR="${DATA_PATH}/teacher_training_${CKPT_TAG}"
+RESUME_STATE_FILE="${JOB_OUT_DIR}/resume_state.json"
+PATIENCE_LIMIT=8
+DO_RESUBMIT=0
+
+if [ "${RESUBMIT}" = "1" ]; then
+    echo "============================================================"
+    echo "RESUBMIT reason: SIGUSR1 fired or SIGTERM preemption detected."
+    DO_RESUBMIT=1
+
+elif [ "${EXIT_CODE}" = "0" ]; then
+    if [ -f "${RESUME_STATE_FILE}" ]; then
+        NEXT_EPOCH=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('start_epoch', 0))" 2>/dev/null)
+        PATIENCE_CT=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('patience_ct', 0))" 2>/dev/null)
+        echo "============================================================"
+        echo "Python exited 0. Checking resume_state.json..."
+        echo "  start_epoch  = ${NEXT_EPOCH}"
+        echo "  patience_ct  = ${PATIENCE_CT}"
+        echo "  total epochs = ${EPOCHS}"
+        echo "  patience lim = ${PATIENCE_LIMIT}"
+        if [ -n "${NEXT_EPOCH}" ] && [ "${NEXT_EPOCH}" -lt "${EPOCHS}" ] && \
+           [ -n "${PATIENCE_CT}" ] && [ "${PATIENCE_CT}" -lt "${PATIENCE_LIMIT}" ]; then
+            echo "  Training not complete (${NEXT_EPOCH}/${EPOCHS} epochs, patience ${PATIENCE_CT}/${PATIENCE_LIMIT})."
+            echo "RESUBMIT reason: clean exit but epochs remaining."
+            DO_RESUBMIT=1
+        else
+            echo "  Training complete or early-stopped. No resubmission needed."
+            DO_RESUBMIT=0
+        fi
+    else
+        echo "============================================================"
+        echo "Python exited 0 but resume_state.json not found at:"
+        echo "  ${RESUME_STATE_FILE}"
+        echo "Cannot determine training state. Not resubmitting to avoid loop."
+        echo "If training is incomplete, resubmit manually with --resume."
+        DO_RESUBMIT=0
+    fi
+
+else
+    echo "============================================================"
+    echo "Python exited with error code ${EXIT_CODE}. Not resubmitting."
+    echo "Fix the error first, then resubmit manually with --resume."
+    DO_RESUBMIT=0
+fi
+
+# --- Execute resubmission ---
+if [ "${DO_RESUBMIT}" = "1" ]; then
+    echo "AUTO-RESUBMIT: submitting next job with --resume..."
+    echo "  Script   : ${SCRIPT_DIR}/slurm/teacher"
+    echo "  Job name : ${SLURM_JOB_NAME}"
+    NEW_JOB_ID=$(sbatch \
+        --parsable \
+        --job-name="${SLURM_JOB_NAME}" \
+        "${SCRIPT_DIR}/slurm/teacher"  \
+        "${SEQ_LEN}"                   \
+        "${N_TOTAL_M}"                 \
+        "${BATCH_SIZE}"                \
+        "${LR}"                        \
+        "${EPOCHS}"                    \
+        ${LAYERS_LIST}                 \
+        "--resume"
+    )
+    SBATCH_RC=$?
+    if [ "${SBATCH_RC}" = "0" ]; then
+        echo "  Resubmitted successfully. New SLURM job ID: ${NEW_JOB_ID}"
+        echo "  Monitor with: squeue --job ${NEW_JOB_ID}"
+    else
+        echo "  ERROR: sbatch resubmission FAILED (rc=${SBATCH_RC})"
+        echo "  Resubmit manually:"
+        echo "    sbatch --job-name=${SLURM_JOB_NAME} ${SCRIPT_DIR}/slurm/teacher \\"
+        echo "      ${SEQ_LEN} ${N_TOTAL_M} ${BATCH_SIZE} ${LR} ${EPOCHS} ${LAYERS_LIST} --resume"
+    fi
+    echo "============================================================"
+fi
+
+# --- Final summary ---
 echo "============================================================"
 echo "Training Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
-    # Derive the ckpt_tag in bash the same way parse_args() does in Python:
-    # join all elements of LAYERS_LIST with "x" and prepend "gru"
-    CKPT_TAG="gru$(echo ${LAYERS_LIST} | tr ' ' 'x')"
-    JOB_OUT_DIR="${DATA_PATH}/teacher_training_${CKPT_TAG}"
     echo "Completed successfully."
     echo "Outputs in: ${JOB_OUT_DIR}"
-    echo "  Best weights : $(find "${DATA_PATH}" -maxdepth 1 -name "teacher_best_${CKPT_TAG}.weights.h5" 2>/dev/null)"
+    echo "  Best weights : $(find "${JOB_OUT_DIR}" -maxdepth 1 -name "teacher_best_${CKPT_TAG}.weights.h5" 2>/dev/null)"
     echo "  PNGs  : $(find "${JOB_OUT_DIR}" -name "*.png"  2>/dev/null | wc -l)"
     echo "  JSONs : $(find "${JOB_OUT_DIR}" -name "*.json" 2>/dev/null | wc -l)"
     echo "  CSVs  : $(find "${JOB_OUT_DIR}" -name "*.csv"  2>/dev/null | wc -l)"
 else
-    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "FAILED or preempted (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
     echo "  grep -i 'error\|traceback\|valueerror\|assertionerror' \\"
     echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"

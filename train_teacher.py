@@ -141,6 +141,9 @@ def parse_args():
                    help="num_parallel_calls for tf.data map()")
     p.add_argument("--prefetch-batches", type=int, default=32,
                    help="Number of batches to prefetch ahead of GPU")
+    p.add_argument("--resume", action="store_true",
+                   help="Resume training from best checkpoint and resume_state.json "
+                        "written by a previous interrupted run.")
 
     args = p.parse_args()
     if args.save_dir is None:
@@ -536,8 +539,7 @@ def train_step(teacher_model, optimizer, batch_x, batch_y):
     )
 
     optimizer.apply_gradients(zip(grads, teacher_model.trainable_variables))
-    return loss, nan_in_grads
-
+    return {"loss": loss, "nan": nan_in_grads}
 
 # NO @tf.function on val_step either — same reason.
 def val_step(teacher_model, batch_x, batch_y):
@@ -545,19 +547,22 @@ def val_step(teacher_model, batch_x, batch_y):
     loss   = tf.reduce_mean(tf.square(batch_y - y_pred))
     return loss
 
-
 def make_distributed_train_step(strategy, teacher_model, optimizer, global_batch_size):
     @tf.function
     def distributed_train_step(batch_x, batch_y):
-        per_replica_loss, per_replica_nan = strategy.run(
+        per_replica_outputs = strategy.run(
             train_step,
             args=(teacher_model, optimizer, batch_x, batch_y),
         )
         total_loss = strategy.reduce(
-            tf.distribute.ReduceOp.MEAN, per_replica_loss, axis=None
+            tf.distribute.ReduceOp.MEAN,
+            per_replica_outputs["loss"],
+            axis=None,
         )
         nan_flag = strategy.reduce(
-            tf.distribute.ReduceOp.SUM, per_replica_nan, axis=None
+            tf.distribute.ReduceOp.SUM,
+            per_replica_outputs["nan"],
+            axis=None,
         )
         return total_loss, nan_flag > 0.0
     return distributed_train_step
@@ -749,6 +754,7 @@ def save_loss_curves(history, best_val_loss, args, job_dir, pf):
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
+
 def training_loop(
     strategy,
     teacher_model, optimizer, lr_scheduler,
@@ -757,14 +763,43 @@ def training_loop(
     args, job_dir, pf,
 ):
     best_ckpt   = os.path.join(job_dir, f"teacher_best_{args.ckpt_tag}.weights.h5")
+    resume_state_path = os.path.join(job_dir, "resume_state.json")
     history     = {"train": [], "val": []}
     best_val    = float("inf")
     patience_ct = 0
+    start_epoch = 0
 
     dist_train_step = make_distributed_train_step(
         strategy, teacher_model, optimizer, args.batch_size
     )
     dist_val_step = make_distributed_val_step(strategy, teacher_model)
+
+    # ------------------------------------------------------------------
+    # Resume: load checkpoint + state from previous interrupted run
+    # ------------------------------------------------------------------
+    if args.resume and os.path.exists(best_ckpt):
+        pf(f"RESUME: loading weights from {best_ckpt}")
+        teacher_model.load_weights(best_ckpt)
+        if os.path.exists(resume_state_path):
+            with open(resume_state_path) as f:
+                state = json.load(f)
+            start_epoch = int(state.get("start_epoch", 0))
+            best_val    = float(state.get("best_val", float("inf")))
+            patience_ct = int(state.get("patience_ct", 0))
+            history["train"] = state.get("history_train", [])
+            history["val"]   = state.get("history_val",   [])
+            saved_lr = state.get("lr", None)
+            if saved_lr is not None:
+                tf.keras.backend.set_value(lr_scheduler.lr_var, float(saved_lr))
+                pf(f"RESUME: restored lr={float(saved_lr):.2e}")
+            pf(f"RESUME: start_epoch={start_epoch}  best_val={best_val:.6f}  "
+               f"patience_ct={patience_ct}")
+        else:
+            pf("RESUME: resume_state.json not found — loading weights only, "
+               "starting from epoch 0.")
+    elif args.resume and not os.path.exists(best_ckpt):
+        pf(f"RESUME requested but checkpoint not found at {best_ckpt}. "
+           f"Starting from scratch.")
 
     # ------------------------------------------------------------------
     # Pre-flight timing check
@@ -786,11 +821,11 @@ def training_loop(
 
     pf("=" * 60)
     pf(f"Starting teacher training — {args.epochs} epochs  "
-       f"patience={args.patience}")
+       f"patience={args.patience}  start_epoch={start_epoch}")
     pf(f"  Checkpoint: {best_ckpt}")
     pf("=" * 60)
 
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         t_epoch      = time.time()
         t_batch_zero = None
 
@@ -848,15 +883,32 @@ def training_loop(
         else:
             patience_ct += 1
             pf(f"  patience {patience_ct}/{args.patience}")
-            if patience_ct >= args.patience:
-                pf(f"Early stopping at epoch {epoch+1}")
-                break
+
+        # ------------------------------------------------------------------
+        # Write resume_state.json after EVERY epoch so that a wall-time
+        # preemption mid-epoch loses at most one epoch of progress.
+        # ------------------------------------------------------------------
+        resume_state = {
+            "start_epoch":   epoch + 1,
+            "best_val":      float(best_val),
+            "patience_ct":   patience_ct,
+            "lr":            float(lr_scheduler.current_lr),
+            "history_train": history["train"],
+            "history_val":   history["val"],
+        }
+        with open(resume_state_path, "w") as f:
+            json.dump(resume_state, f, indent=2)
+
+        if patience_ct >= args.patience:
+            pf(f"Early stopping at epoch {epoch+1}")
+            break
 
     if os.path.exists(best_ckpt):
         teacher_model.load_weights(best_ckpt)
         pf(f"Restored best weights from {best_ckpt}")
 
     return history, best_val, best_ckpt
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
