@@ -35,7 +35,9 @@
 #   $5  EPOCHS             (optional, default 200)
 #   $6+ TEACHER_LAYERS_LIST (optional, space-separated units per layer, default "128 128")
 #                           All remaining positional args after $5 are treated
-#                           as the layers list. e.g.: 64 16  or  128  or  45 45
+#                           as the layers list. --resume anywhere in $6+ is
+#                           automatically stripped out and forwarded to Python.
+#                           e.g.: 64 16  or  128  or  45 45
 #
 # Examples:
 #   sbatch --job-name=teacher_gru128x2_bs16384 slurm/teacher
@@ -53,10 +55,21 @@ BATCH_SIZE=${3:-16384}
 LR=${4:-8e-3}
 EPOCHS=${5:-200}
 
-# Collect all remaining positional args as the layers list
+# Collect all remaining positional args as the layers list.
+# Strip --resume out if present (it is passed back by the auto-resubmit sbatch call).
 shift 5
-if [ "$#" -gt 0 ]; then
-    LAYERS_LIST="$@"
+RESUME_FLAG=""
+RAW_ARGS=("$@")
+FILTERED_ARGS=()
+for arg in "${RAW_ARGS[@]}"; do
+    if [ "${arg}" = "--resume" ]; then
+        RESUME_FLAG="--resume"
+    else
+        FILTERED_ARGS+=("${arg}")
+    fi
+done
+if [ "${#FILTERED_ARGS[@]}" -gt 0 ]; then
+    LAYERS_LIST="${FILTERED_ARGS[*]}"
 else
     LAYERS_LIST="128 128"
 fi
@@ -146,6 +159,7 @@ echo "BATCH SIZE          : ${BATCH_SIZE}"
 echo "LR                  : ${LR}"
 echo "EPOCHS              : ${EPOCHS}"
 echo "LAYERS LIST         : ${LAYERS_LIST}"
+echo "RESUME FLAG         : ${RESUME_FLAG}"
 echo "PYTHON              : $(which python)"
 echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
 echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
@@ -196,6 +210,7 @@ python "${SCRIPT_DIR}/train_teacher.py" \
     --prefetch-batches    32                \
     --pipeline-workers    16                \
     --teacher-layers-list ${LAYERS_LIST}    \
+    ${RESUME_FLAG}                          \
     &
 
 PYTHON_PID=$!
