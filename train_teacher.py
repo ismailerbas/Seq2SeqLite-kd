@@ -758,7 +758,7 @@ def training_loop(
     train_steps, val_steps,
     args, job_dir, pf,
 ):
-    best_ckpt   = os.path.join(args.data_dir, f"teacher_best_{args.ckpt_tag}.weights.h5")
+    best_ckpt   = os.path.join(job_dir, f"teacher_best_{args.ckpt_tag}.weights.h5")
     history     = {"train": [], "val": []}
     best_val    = float("inf")
     patience_ct = 0
