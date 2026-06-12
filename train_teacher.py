@@ -527,10 +527,13 @@ def train_step(teacher_model, optimizer, batch_x, batch_y):
     grads = tape.gradient(loss, teacher_model.trainable_variables)
     grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
 
-    nan_in_grads = tf.reduce_any(tf.stack([
-        tf.reduce_any(tf.math.is_nan(g))
-        for g in grads if g is not None
-    ]))
+    nan_in_grads = tf.cast(
+        tf.reduce_any(tf.stack([
+            tf.reduce_any(tf.math.is_nan(g))
+            for g in grads if g is not None
+        ])),
+        tf.float32,
+    )
 
     optimizer.apply_gradients(zip(grads, teacher_model.trainable_variables))
     return loss, nan_in_grads
@@ -544,8 +547,6 @@ def val_step(teacher_model, batch_x, batch_y):
 
 
 def make_distributed_train_step(strategy, teacher_model, optimizer, global_batch_size):
-    # @tf.function goes HERE ONLY — on the function that calls strategy.run().
-    # This is the correct TF 2.10 MirroredStrategy pattern.
     @tf.function
     def distributed_train_step(batch_x, batch_y):
         per_replica_loss, per_replica_nan = strategy.run(
@@ -556,13 +557,10 @@ def make_distributed_train_step(strategy, teacher_model, optimizer, global_batch
             tf.distribute.ReduceOp.MEAN, per_replica_loss, axis=None
         )
         nan_flag = strategy.reduce(
-            tf.distribute.ReduceOp.SUM,
-            tf.cast(per_replica_nan, tf.float32),
-            axis=None,
+            tf.distribute.ReduceOp.SUM, per_replica_nan, axis=None
         )
         return total_loss, nan_flag > 0.0
     return distributed_train_step
-
 
 def make_distributed_val_step(strategy, teacher_model):
     @tf.function
