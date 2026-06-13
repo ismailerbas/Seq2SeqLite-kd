@@ -3583,7 +3583,7 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
         "P2A": ("tab:orange", "tab:red"),
         "P2B": ("tab:purple", "tab:pink"),
         "P2C": ("tab:brown",  "tab:olive"),
-        "P3":  ("tab:green",  "tab:lime"),
+        "P3":  ("tab:green",  "limegreen"),
     }
 
     fig, axes = plt.subplots(2, 5, figsize=(36, 8))
