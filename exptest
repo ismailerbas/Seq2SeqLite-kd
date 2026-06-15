@@ -1,0 +1,286 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=01:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+# ============================================================================
+# Experimental data evaluation — eval_experimental.py
+#
+# Loads the .mat file, preprocesses it (baseline correction + max normalization),
+# optionally applies a binary mask, runs inference with every .weights.h5 found
+# under --ablation-root and/or a single explicit teacher checkpoint, and saves
+# pixel maps, histograms, scatter plots, statistics JSON, and overview PNG
+# next to each weight file.
+# No training. No resubmission. Runs once and exits.
+#
+# Positional args:
+#   $1  TEACHER_LAYERS_0   First teacher GRU layer units         (e.g. 128)
+#   $2  TEACHER_LAYERS_1   Second teacher GRU layer units        (e.g. 128)
+#                          Pass 0 to use a single-layer teacher.
+#   $3  SEQ_LEN            Number of time bins                   (e.g. 135)
+#   $4  N_ROWS             Pixel rows in spatial image           (e.g. 484)
+#   $5  N_COLS             Pixel columns in spatial image        (e.g. 250)
+#   $6  INFER_BATCH        Inference batch size                  (e.g. 4096)
+#   $7  BASELINE_BINS      Leading bins for background subtract  (e.g. 10)
+#   $8  TEACHER_CKPT       Full path to teacher .weights.h5, or "none"
+#   $9  ABLATION_ROOT      Full path to ablation results dir,   or "none"
+#   $10 MAT_FILE           Full path to .mat file (quote if spaces in path)
+#   $11 MASK_FILE          Full path to binary mask file (.npy/.mat/image),
+#                          or "none" to skip masking. Optional, defaults to none.
+#
+# Example — teacher only, no mask:
+#   sbatch --job-name=exptest_teacher128 \
+#          slurm/exptest \
+#          128 128 135 484 250 4096 10 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_training_gru128x128/teacher_best_gru128x128.weights.h5 \
+#          none \
+#          "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/af700 [Accumulated].mat" \
+#          none
+#
+# Example — teacher only, with mask:
+#   sbatch --job-name=exptest_teacher128 \
+#          slurm/exptest \
+#          128 128 135 484 250 4096 10 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_training_gru128x128/teacher_best_gru128x128.weights.h5 \
+#          none \
+#          "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/af700 [Accumulated].mat" \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/mask.npy
+#
+# Example — all ablations, no mask:
+#   sbatch --job-name=exptest_ablations \
+#          slurm/exptest \
+#          128 128 135 484 250 4096 10 \
+#          none \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/results \
+#          "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/af700 [Accumulated].mat" \
+#          none
+#
+# Example — teacher + all ablations, with mask:
+#   sbatch --job-name=exptest_all \
+#          slurm/exptest \
+#          128 128 135 484 250 4096 10 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_training_gru128x128/teacher_best_gru128x128.weights.h5 \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/results \
+#          "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/af700 [Accumulated].mat" \
+#          /gpfs/u/scratch/HBNN/HBNNrbss/nmi/mask.npy
+# ============================================================================
+
+# --- Positional arguments ---
+TEACHER_LAYERS_0=$1
+TEACHER_LAYERS_1=$2
+SEQ_LEN=$3
+N_ROWS=$4
+N_COLS=$5
+INFER_BATCH=$6
+BASELINE_BINS=$7
+TEACHER_CKPT=$8
+ABLATION_ROOT=$9
+MAT_FILE=${10}
+MASK_FILE=${11:-none}
+
+# --- Required argument check (first 10 are mandatory) ---
+if [ -z "${TEACHER_LAYERS_0}" ] || [ -z "${TEACHER_LAYERS_1}" ] || \
+   [ -z "${SEQ_LEN}"          ] || [ -z "${N_ROWS}"           ] || \
+   [ -z "${N_COLS}"           ] || [ -z "${INFER_BATCH}"      ] || \
+   [ -z "${BASELINE_BINS}"    ] || [ -z "${TEACHER_CKPT}"     ] || \
+   [ -z "${ABLATION_ROOT}"    ] || [ -z "${MAT_FILE}"         ]; then
+    echo "FATAL: Missing positional arguments."
+    echo "Usage: sbatch slurm/exptest TEACHER_LAYERS_0 TEACHER_LAYERS_1 SEQ_LEN N_ROWS N_COLS INFER_BATCH BASELINE_BINS TEACHER_CKPT ABLATION_ROOT MAT_FILE [MASK_FILE]"
+    exit 1
+fi
+
+# --- At least one of TEACHER_CKPT or ABLATION_ROOT must not be "none" ---
+if [ "${TEACHER_CKPT}" = "none" ] && [ "${ABLATION_ROOT}" = "none" ]; then
+    echo "FATAL: Both TEACHER_CKPT and ABLATION_ROOT are 'none'. Provide at least one."
+    exit 1
+fi
+
+# --- MAT file existence check ---
+if [ ! -f "${MAT_FILE}" ]; then
+    echo "FATAL: .mat file not found: ${MAT_FILE}"
+    exit 1
+fi
+
+# --- Teacher checkpoint check (only if not none) ---
+if [ "${TEACHER_CKPT}" != "none" ] && [ ! -f "${TEACHER_CKPT}" ]; then
+    echo "FATAL: teacher checkpoint not found: ${TEACHER_CKPT}"
+    exit 1
+fi
+
+# --- Ablation root check (only if not none) ---
+if [ "${ABLATION_ROOT}" != "none" ] && [ ! -d "${ABLATION_ROOT}" ]; then
+    echo "FATAL: ablation root directory not found: ${ABLATION_ROOT}"
+    exit 1
+fi
+
+# --- Mask file check (only if not none) ---
+if [ "${MASK_FILE}" != "none" ] && [ ! -f "${MASK_FILE}" ]; then
+    echo "FATAL: mask file not found: ${MASK_FILE}"
+    exit 1
+fi
+
+# --- Build teacher layers list string (drop second layer if 0) ---
+if [ "${TEACHER_LAYERS_1}" = "0" ]; then
+    TEACHER_LAYERS_ARG="${TEACHER_LAYERS_0}"
+else
+    TEACHER_LAYERS_ARG="${TEACHER_LAYERS_0} ${TEACHER_LAYERS_1}"
+fi
+
+# ============================================================================
+# STEP 1 - modules
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+# ============================================================================
+# STEP 2 - activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+# ============================================================================
+# STEP 3 - cuDNN path fix (identical to all other slurm scripts)
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+# ============================================================================
+# STEP 4 - GPU / TF settings
+# ============================================================================
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+
+# --- Log header ---
+echo "============================================================"
+echo "EXPERIMENTAL DATA EVALUATION"
+echo "eval_experimental.py"
+echo "============================================================"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
+echo "NODE                : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH     : ${LD_LIBRARY_PATH}"
+echo "GPUs available      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "SCRIPT DIR          : ${SCRIPT_DIR}"
+echo "MAT FILE            : ${MAT_FILE}"
+echo "MASK FILE           : ${MASK_FILE}"
+echo "TEACHER CKPT        : ${TEACHER_CKPT}"
+echo "ABLATION ROOT       : ${ABLATION_ROOT}"
+echo "TEACHER LAYERS ARG  : ${TEACHER_LAYERS_ARG}"
+echo "SEQ LEN             : ${SEQ_LEN}"
+echo "N ROWS              : ${N_ROWS}"
+echo "N COLS              : ${N_COLS}"
+echo "INFER BATCH         : ${INFER_BATCH}"
+echo "BASELINE BINS       : ${BASELINE_BINS}"
+echo "PYTHON              : $(which python)"
+echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "SCIPY VERSION       : $(python -c 'import scipy; print(scipy.__version__)' 2>/dev/null)"
+echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
+
+# --- GPU sanity check ---
+GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
+echo "TF physical GPUs found : ${GPU_CHECK}"
+if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
+    echo "FATAL: TensorFlow found 0 GPUs."
+    echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
+    echo "libcudnn.so.8 location:"
+    find "${CONDA_PREFIX}/lib" -name "libcudnn.so.8" 2>/dev/null
+    exit 1
+fi
+
+# --- Script existence check ---
+if [ ! -f "${SCRIPT_DIR}/eval_experimental.py" ]; then
+    echo "FATAL: eval_experimental.py not found in ${SCRIPT_DIR}"
+    echo "Expected path: ${SCRIPT_DIR}/eval_experimental.py"
+    exit 1
+fi
+echo "eval_experimental.py found."
+echo "Starting experimental data evaluation..."
+echo "============================================================"
+
+# ============================================================================
+# Build the python command dynamically
+# ============================================================================
+PYTHON_CMD="python ${SCRIPT_DIR}/eval_experimental.py"
+PYTHON_CMD="${PYTHON_CMD} --mat-file      \"${MAT_FILE}\""
+PYTHON_CMD="${PYTHON_CMD} --seq-len       ${SEQ_LEN}"
+PYTHON_CMD="${PYTHON_CMD} --n-rows        ${N_ROWS}"
+PYTHON_CMD="${PYTHON_CMD} --n-cols        ${N_COLS}"
+PYTHON_CMD="${PYTHON_CMD} --gate-width-ns 0.09"
+PYTHON_CMD="${PYTHON_CMD} --infer-batch   ${INFER_BATCH}"
+PYTHON_CMD="${PYTHON_CMD} --baseline-bins ${BASELINE_BINS}"
+PYTHON_CMD="${PYTHON_CMD} --teacher-layers-list ${TEACHER_LAYERS_ARG}"
+
+if [ "${MASK_FILE}" != "none" ]; then
+    PYTHON_CMD="${PYTHON_CMD} --mask-file \"${MASK_FILE}\""
+fi
+
+if [ "${TEACHER_CKPT}" != "none" ]; then
+    PYTHON_CMD="${PYTHON_CMD} --teacher-ckpt \"${TEACHER_CKPT}\""
+fi
+
+if [ "${ABLATION_ROOT}" != "none" ]; then
+    PYTHON_CMD="${PYTHON_CMD} --ablation-root \"${ABLATION_ROOT}\""
+fi
+
+echo "Running: ${PYTHON_CMD}"
+echo "============================================================"
+
+# Run directly (foreground — no resubmission needed, inference only)
+eval ${PYTHON_CMD}
+EXIT_CODE=$?
+
+echo "============================================================"
+echo "Python exited with code: ${EXIT_CODE}"
+echo "============================================================"
+
+# --- Final summary ---
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "Evaluation completed successfully."
+    if [ "${TEACHER_CKPT}" != "none" ]; then
+        TEACHER_CKPT_DIR=$(dirname "${TEACHER_CKPT}")
+        echo "Teacher output PNGs  : $(find "${TEACHER_CKPT_DIR}" -name "*.png"  2>/dev/null | wc -l)"
+        echo "Teacher output JSONs : $(find "${TEACHER_CKPT_DIR}" -name "*.json" 2>/dev/null | wc -l)"
+    fi
+    if [ "${ABLATION_ROOT}" != "none" ]; then
+        echo "Ablation output PNGs  : $(find "${ABLATION_ROOT}" -name "*.png"                    2>/dev/null | wc -l)"
+        echo "Ablation output JSONs : $(find "${ABLATION_ROOT}" -name "experimental_stats.json"  2>/dev/null | wc -l)"
+        echo "Summary JSON          : ${ABLATION_ROOT}/experimental_eval_summary.json"
+    fi
+else
+    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "Hint:"
+    echo "  grep -i 'error\|traceback\|valueerror\|filenotfound\|keyerror' \\"
+    echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+exit ${EXIT_CODE}
