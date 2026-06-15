@@ -161,9 +161,9 @@ def parse_args():
 
     # ── MemoQ curriculum hyper-parameters ─────────────────────────────────────
     p.add_argument("--memoq-warmup-epochs",      type=int,   default=40)
-    p.add_argument("--memoq-stage2a-epochs",     type=int,   default=30)
-    p.add_argument("--memoq-stage2b-epochs",     type=int,   default=30)
-    p.add_argument("--memoq-stage2c-epochs",     type=int,   default=30)
+    p.add_argument("--memoq-stage2a-epochs",     type=int,   default=60)
+    p.add_argument("--memoq-stage2b-epochs",     type=int,   default=60)
+    p.add_argument("--memoq-stage2c-epochs",     type=int,   default=80)
     p.add_argument("--memoq-finetune-epochs",    type=int,   default=170,
                    help="Phase 3 hard 4-bit polish epochs.")
     p.add_argument("--memoq-lambda-mem",         type=float, default=0.03)
@@ -188,7 +188,7 @@ def parse_args():
     p.add_argument("--lr-factor",        type=float, default=0.5)
     p.add_argument("--lr-patience",      type=int,   default=8)
     p.add_argument("--lr-min",           type=float, default=1e-6)
-    p.add_argument("--patience",         type=int,   default=30)
+    p.add_argument("--patience",         type=int,   default=60)
     p.add_argument("--min-delta",        type=float, default=1e-5)
     p.add_argument("--warmup-epochs",    type=int,   default=5)
     p.add_argument("--infer-batch",      type=int,   default=8192)
@@ -329,7 +329,10 @@ def build_float_student(seq_len, n_out, student_units):
         student_units, return_sequences=True, return_state=True, name="sdecgru"
     )(dec_inputs, initial_state=enc_state)
 
-    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hid_seq)
+    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hid_seq)
+    s_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x), name="sdec_dense"
+    )(s_output_raw)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
@@ -355,7 +358,10 @@ def build_float_student_with_hidden(seq_len, n_out, student_units):
         student_units, return_sequences=True, return_state=True, name="sdecgru"
     )(dec_inputs, initial_state=enc_state)
 
-    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hid_seq)
+    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hid_seq)
+    s_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x), name="sdec_dense"
+    )(s_output_raw)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
@@ -1386,28 +1392,6 @@ def training_loop_memoq(
                     history[key] = list(rs["history"][key])
         global_epoch = len(history["phase"])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
-        if resume_stage in ("P2A", "P2B", "P2C", "P3"):
-            patience_cts[resume_stage] = 0
-            pf(f"[RESUME] Reset patience_cts[{resume_stage!r}] to 0 — quantization context reinit on resume causes transient loss spike")
-        stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
-        stage_idx = stage_order.index(resume_stage)
-        if stage_idx >= 1 and os.path.exists(p1_ckpt):
-            float_student.load_weights(p1_ckpt)
-            pf("[RESUME] Loaded P1 weights for float_student")
-        if stage_idx >= 2:
-            ckpt = p2a_ckpt if stage_idx == 2 else (p2b_ckpt if stage_idx == 3 else p2c_ckpt)
-            if os.path.exists(ckpt):
-                phase2_model.load_weights(ckpt)
-                pf(f"[RESUME] Loaded P2 weights for phase2_model from {ckpt}")
-        if stage_idx >= 4 and os.path.exists(p3_ckpt):
-            final_qkeras_student.load_weights(p3_ckpt)
-            pf("[RESUME] Loaded P3 weights for final_qkeras_student")
-        sys.stdout.flush()
-
-
-        if resume_stage in ("P2A", "P2B", "P2C", "P3"):
-            patience_cts[resume_stage] = 0
-            pf(f"[RESUME] Reset patience_cts[{resume_stage!r}] to 0 — quantization context reinit on resume causes transient loss spike")
         stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
         stage_idx = stage_order.index(resume_stage)
         if stage_idx >= 1 and os.path.exists(p1_ckpt):
@@ -1556,36 +1540,58 @@ def training_loop_memoq(
         innov_active = False
         ep2a_start = start_ep("P2A")
 
+        innov_active = ep2a_start >= args.memoq_innov_burnin
+
+        lambda_i_2a = args.memoq_lambda_innov if innov_active else 0.0
+        dist_train_p2a = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2a,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.01, lambda_i_2a, 0.0, 0.0005,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=innov_active,
+            use_zsat=False, use_rail=True,
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+        dist_val_p2a = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.01, lambda_i_2a, 0.0, 0.0005,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=innov_active,
+            use_zsat=False, use_rail=True,
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+
         for ep_in_phase in range(ep2a_start, args.memoq_stage2a_epochs):
-            if ep_in_phase >= args.memoq_innov_burnin:
+            if ep_in_phase == args.memoq_innov_burnin and not innov_active:
                 innov_active = True
-
-            lambda_i_2a = args.memoq_lambda_innov if innov_active else 0.0
-
-            dist_train_p2a = make_dist_memoq_train(
-                strategy, phase2_model, opt_p2a,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.01, lambda_i_2a, 0.0, 0.0005,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=innov_active,
-                use_zsat=False, use_rail=True,
-                has_z_logit=True, clipnorm=1.0,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-
-            dist_val_p2a = make_dist_memoq_val(
-                strategy, phase2_model,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.01, lambda_i_2a, 0.0, 0.0005,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=innov_active,
-                use_zsat=False, use_rail=True,
-                has_z_logit=True,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-
+                lambda_i_2a = args.memoq_lambda_innov
+                dist_train_p2a = make_dist_memoq_train(
+                    strategy, phase2_model, opt_p2a,
+                    args.alpha, channel_scales, args.memoq_huber_delta,
+                    0.01, lambda_i_2a, 0.0, 0.0005,
+                    epsilon_innov, args.seq_len,
+                    args.memoq_rho_rail, args.memoq_mu_rail,
+                    use_mem=True, use_innov=True,
+                    use_zsat=False, use_rail=True,
+                    has_z_logit=True, clipnorm=1.0,
+                    teacher_hidden_model=teacher_hidden_model,
+                )
+                dist_val_p2a = make_dist_memoq_val(
+                    strategy, phase2_model,
+                    args.alpha, channel_scales, args.memoq_huber_delta,
+                    0.01, lambda_i_2a, 0.0, 0.0005,
+                    epsilon_innov, args.seq_len,
+                    args.memoq_rho_rail, args.memoq_mu_rail,
+                    use_mem=True, use_innov=True,
+                    use_zsat=False, use_rail=True,
+                    has_z_logit=True,
+                    teacher_hidden_model=teacher_hidden_model,
+                )
 
             history, best_vals["P2A"], patience_cts["P2A"], early_stop = run_epoch(
                 phase_tag="P2A",
@@ -1649,32 +1655,30 @@ def training_loop_memoq(
 
         ep2b_start = start_ep("P2B")
 
+        dist_train_p2b = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2b,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.03, 0.005, 0.0, 0.001,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=True,
+            use_zsat=False, use_rail=True,
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+        dist_val_p2b = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.03, 0.005, 0.0, 0.001,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=True,
+            use_zsat=False, use_rail=True,
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+
         for ep_in_phase in range(ep2b_start, args.memoq_stage2b_epochs):
-
-            dist_train_p2b = make_dist_memoq_train(
-                strategy, phase2_model, opt_p2b,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.03, 0.005, 0.0, 0.001,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=True,
-                use_zsat=False, use_rail=True,
-                has_z_logit=True, clipnorm=1.0,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-
-            dist_val_p2b = make_dist_memoq_val(
-                strategy, phase2_model,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.03, 0.005, 0.0, 0.001,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=True,
-                use_zsat=False, use_rail=True,
-                has_z_logit=True,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-
 
             history, best_vals["P2B"], patience_cts["P2B"], early_stop = run_epoch(
                 phase_tag="P2B",
@@ -1738,30 +1742,30 @@ def training_loop_memoq(
 
         ep2c_start = start_ep("P2C")
 
-        for ep_in_phase in range(ep2c_start, args.memoq_stage2c_epochs):
-            dist_train_p2c = make_dist_memoq_train(
-                strategy, phase2_model, opt_p2c,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.05, 0.005, 0.002, 0.001,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=True,
-                use_zsat=True, use_rail=True,
-                has_z_logit=True, clipnorm=1.0,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-            dist_val_p2c = make_dist_memoq_val(
-                strategy, phase2_model,
-                args.alpha, channel_scales, args.memoq_huber_delta,
-                0.05, 0.005, 0.002, 0.001,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                use_mem=True, use_innov=True,
-                use_zsat=True, use_rail=True,
-                has_z_logit=True,
-                teacher_hidden_model=teacher_hidden_model,
-            )            
+        dist_train_p2c = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2c,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.05, 0.005, 0.002, 0.001,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=True,
+            use_zsat=True, use_rail=True,
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+        dist_val_p2c = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            0.05, 0.005, 0.002, 0.001,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=True, use_innov=True,
+            use_zsat=True, use_rail=True,
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+        )
 
+        for ep_in_phase in range(ep2c_start, args.memoq_stage2c_epochs):
 
             history, best_vals["P2C"], patience_cts["P2C"], early_stop = run_epoch(
                 phase_tag="P2C",
@@ -1829,27 +1833,25 @@ def training_loop_memoq(
 
         ep3_start = start_ep("P3")
 
+        dist_train_p3 = make_dist_memoq_train_final(
+            strategy, final_qkeras_student, opt_p3,
+            0.5, channel_scales, args.memoq_huber_delta,
+            0.03, 0.00002, 0.0, 0.0005,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            clipnorm=0.5,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+        dist_val_p3 = make_dist_memoq_val_final(
+            strategy, final_qkeras_student,
+            0.5, channel_scales, args.memoq_huber_delta,
+            0.03, 0.00002, 0.0, 0.0005,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            teacher_hidden_model=teacher_hidden_model,
+        )
+
         for ep_in_phase in range(ep3_start, args.memoq_stage3_epochs):
-
-            dist_train_p3 = make_dist_memoq_train_final(
-                strategy, final_qkeras_student, opt_p3,
-                0.5, channel_scales, args.memoq_huber_delta,
-                0.03, 0.002, 0.0, 0.0005,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                clipnorm=0.5,
-                teacher_hidden_model=teacher_hidden_model,
-            )
-            dist_val_p3 = make_dist_memoq_val_final(
-                strategy, final_qkeras_student,
-                0.5, channel_scales, args.memoq_huber_delta,
-                0.03, 0.002, 0.0, 0.0005,
-                epsilon_innov, args.seq_len,
-                args.memoq_rho_rail, args.memoq_mu_rail,
-                teacher_hidden_model=teacher_hidden_model,
-            )            
-
-
 
             history, best_vals["P3"], patience_cts["P3"], early_stop = run_epoch(
                 phase_tag="P3",
@@ -2314,7 +2316,10 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
         initial_state=[enc_final_h, enc_initial_z],
     )
 
-    seq_output = keras.layers.Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
+    seq_output_raw = keras.layers.Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hidden_seq)
+    seq_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x), name="sdec_dense"
+    )(seq_output_raw)
 
     model = keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
@@ -2379,13 +2384,16 @@ def build_final_qkeras_student(
         name="sdecgru",
     )(dec_inputs, initial_state=s_enc_state)
 
-    s_output = QDense(
+    s_output_raw = QDense(
         n_out,
         kernel_quantizer=qd(),
         bias_quantizer=qd(),
         activation="linear",
-        name="sdec_dense",
+        name="sdec_dense_raw",
     )(s_dec_hid_seq)
+    s_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x), name="sdec_dense"
+    )(s_output_raw)
 
     return keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
