@@ -96,6 +96,18 @@ def parse_args():
     p.add_argument("--baseline-bins", type=int, default=10,
                    help="Number of leading time bins to average for "
                         "per-pixel baseline (background) subtraction.")
+    p.add_argument("--mask-file", type=str, default=None,
+                   help="Optional path to a binary mask file. Accepted formats: "
+                        ".npy (bool or uint8 array of shape (n_rows, n_cols)), "
+                        ".mat (must contain a variable named 'mask' of shape "
+                        "(n_rows, n_cols)), or any image file readable by "
+                        "matplotlib (PNG/TIFF/BMP — non-zero pixels = valid). "
+                        "True / non-zero = valid pixel included in statistics "
+                        "and visualisations. Pixels where mask is False / 0 are "
+                        "set to NaN in pixel maps and excluded from histograms "
+                        "and scatter plots. This mask is applied ON TOP of the "
+                        "intensity-based pixel_mask (max-after-baseline > 0), "
+                        "so a pixel must satisfy BOTH conditions to be included.")
     p.add_argument("--infer-batch", type=int, default=4096,
                    help="Batch size for model inference.")
     p.add_argument("--student-units-default", type=int, default=32,
@@ -117,7 +129,6 @@ def parse_args():
         p.error("Provide at least one of --ablation-root or --teacher-ckpt.")
 
     return args
-
 
 # ---------------------------------------------------------------------------
 # GPU setup (CPU-friendly — no MirroredStrategy needed for inference)
@@ -217,6 +228,95 @@ def load_and_preprocess_mat(mat_path, n_rows, n_cols, seq_len,
 
     return encoder_input, pixel_mask, n_rows, n_cols
 
+
+# ---------------------------------------------------------------------------
+# Load external binary mask and combine with intensity-based pixel_mask
+# ---------------------------------------------------------------------------
+def load_binary_mask(mask_path, n_rows, n_cols, pf):
+    """
+    Load a binary mask from disk and return it as a bool array (n_rows, n_cols).
+
+    Supported formats
+    -----------------
+    .npy  — numpy array of shape (n_rows, n_cols), dtype bool or uint8/int/float.
+            Non-zero = valid.
+    .mat  — MATLAB file containing a variable named 'mask' of shape
+            (n_rows, n_cols). Non-zero = valid.
+    image — any format readable by matplotlib (PNG, TIFF, BMP, JPG).
+            Loaded as greyscale (mean across channels if RGB/RGBA).
+            Non-zero = valid.
+
+    The loaded mask is resized to (n_rows, n_cols) using nearest-neighbour
+    interpolation only if its spatial dimensions differ from (n_rows, n_cols).
+    A warning is printed in that case.
+
+    Returns
+    -------
+    ext_mask : np.ndarray  shape (n_rows, n_cols)  dtype bool
+               True = valid pixel (included in all statistics and plots).
+    """
+    pf(f"[MASK] Loading external binary mask: {mask_path}")
+
+    if not os.path.isfile(mask_path):
+        raise FileNotFoundError(
+            f"[MASK] --mask-file not found on disk: {mask_path}"
+        )
+
+    ext = os.path.splitext(mask_path)[1].lower()
+
+    if ext == ".npy":
+        raw = np.load(mask_path)
+        pf(f"[MASK] .npy loaded: shape={raw.shape}  dtype={raw.dtype}")
+
+    elif ext == ".mat":
+        mat_data = loadmat(mask_path)
+        available = [k for k in mat_data.keys() if not k.startswith("_")]
+        if "mask" not in mat_data:
+            raise KeyError(
+                f"[MASK] Variable 'mask' not found in {mask_path}. "
+                f"Available variables: {available}"
+            )
+        raw = mat_data["mask"]
+        pf(f"[MASK] .mat 'mask' loaded: shape={raw.shape}  dtype={raw.dtype}")
+
+    else:
+        # Treat as image (PNG, TIFF, BMP, JPG, etc.)
+        import matplotlib.image as mpimg
+        img = mpimg.imread(mask_path)
+        pf(f"[MASK] Image loaded: shape={img.shape}  dtype={img.dtype}")
+        if img.ndim == 3:
+            raw = img.mean(axis=2)
+        else:
+            raw = img
+        pf(f"[MASK] After channel collapse: shape={raw.shape}")
+
+    raw = np.squeeze(raw)
+    if raw.ndim != 2:
+        raise ValueError(
+            f"[MASK] Mask must be 2-D after loading but got shape {raw.shape}."
+        )
+
+    if raw.shape[0] != n_rows or raw.shape[1] != n_cols:
+        pf(
+            f"[MASK] WARNING: mask shape {raw.shape} != expected ({n_rows}, {n_cols}). "
+            f"Resizing with nearest-neighbour interpolation."
+        )
+        from PIL import Image as PILImage
+        pil_img = PILImage.fromarray(raw.astype(np.float32))
+        pil_img = pil_img.resize((n_cols, n_rows), PILImage.NEAREST)
+        raw = np.array(pil_img)
+        pf(f"[MASK] After resize: shape={raw.shape}")
+
+    ext_mask = raw.astype(bool)
+
+    n_valid = int(ext_mask.sum())
+    n_total = n_rows * n_cols
+    pf(
+        f"[MASK] External mask: {n_valid:,} / {n_total:,} valid pixels "
+        f"({100.0 * n_valid / n_total:.1f}%)"
+    )
+
+    return ext_mask
 
 # ---------------------------------------------------------------------------
 # Post-processing: extract tau1, tau2, fret from model output sequences
@@ -1063,6 +1163,9 @@ def main():
     # ------------------------------------------------------------------
     # 1. Load and preprocess experimental .mat file
     # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # 1. Load and preprocess experimental .mat file
+    # ------------------------------------------------------------------
     pf("=" * 70)
     pf("PHASE 1: Load and preprocess experimental .mat file")
     pf("=" * 70)
@@ -1078,6 +1181,26 @@ def main():
     pf(f"[MAIN] encoder_input shape : {encoder_input.shape}")
     pf(f"[MAIN] pixel_mask shape    : {pixel_mask.shape}  "
        f"valid={pixel_mask.sum():,}")
+
+    # ------------------------------------------------------------------
+    # 1b. Apply external binary mask (if provided)
+    # ------------------------------------------------------------------
+    if args.mask_file is not None:
+        pf("=" * 70)
+        pf("PHASE 1b: Applying external binary mask")
+        pf("=" * 70)
+        ext_mask = load_binary_mask(args.mask_file, n_rows, n_cols, pf)
+        n_before = int(pixel_mask.sum())
+        pixel_mask = pixel_mask & ext_mask
+        n_after  = int(pixel_mask.sum())
+        pf(
+            f"[MAIN] pixel_mask after combining with external mask: "
+            f"{n_after:,} valid pixels "
+            f"(was {n_before:,} from intensity mask alone, "
+            f"removed {n_before - n_after:,})"
+        )
+    else:
+        pf("[MAIN] No --mask-file provided — using intensity-based pixel_mask only.")
 
     # ------------------------------------------------------------------
     # 2. Collect all weight files to evaluate
