@@ -280,7 +280,6 @@ def load_binary_mask(mask_path, n_rows, n_cols, pf):
         pf(f"[MASK] .mat 'mask' loaded: shape={raw.shape}  dtype={raw.dtype}")
 
     else:
-        # Treat as image (PNG, TIFF, BMP, JPG, etc.)
         import matplotlib.image as mpimg
         img = mpimg.imread(mask_path)
         pf(f"[MASK] Image loaded: shape={img.shape}  dtype={img.dtype}")
@@ -465,8 +464,9 @@ def build_teacher_student_names(seq_len, n_out, teacher_units, teacher_layers):
 
 # ---------------------------------------------------------------------------
 # Build vanilla-KD student model — exact replica of train_student_vanilla_kd.py
-# We build a plain float32 GRU student (no QKeras) for the vanilla-KD ablations.
-# Layer names: senc_input, sdec_input, sencgru, sdecgru, sdec_dense
+# Plain float32 GRU student (no QKeras).
+# Layer names MUST match train_student_vanilla_kd.py exactly:
+#   senc_input, sdec_input, sencgru, sdecgru, sdec_dense
 # ---------------------------------------------------------------------------
 def build_vanilla_student(student_units, seq_len, n_out):
     enc_input = tf.keras.Input(shape=(seq_len, 1), name="s_enc_input")
@@ -476,7 +476,7 @@ def build_vanilla_student(student_units, seq_len, n_out):
         student_units,
         return_state=True,
         return_sequences=False,
-        reset_after=True,
+        reset_after=False,
         name="s_enc_gru",
     )
     _, enc_state = enc_gru(enc_input)
@@ -485,7 +485,7 @@ def build_vanilla_student(student_units, seq_len, n_out):
         student_units,
         return_sequences=True,
         return_state=False,
-        reset_after=True,
+        reset_after=False,
         name="s_dec_gru",
     )
     dec_out = dec_gru(dec_input, initial_state=enc_state)
@@ -824,7 +824,6 @@ def save_scatter_plots(tau1_vals, tau2_vals, fret_vals,
     tau2_valid = tau2_vals[pixel_mask_flat]
     fret_valid = fret_vals[pixel_mask_flat]
 
-    # Finite-only
     valid_idx = (
         np.isfinite(tau1_valid) &
         np.isfinite(tau2_valid) &
@@ -1018,17 +1017,13 @@ def save_mat_outputs(tau1_map, tau2_map, fret_map, pixel_mask,
         do_compression=True,
     )
     pf(f"  .mat preds saved  : {preds_path}")
+
 # ---------------------------------------------------------------------------
 # Evaluate a single weight file and save all outputs next to it
 # ---------------------------------------------------------------------------
 def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
                           n_rows, n_cols, seq_len, n_out, gate_width_ns,
                           infer_batch, args, pf):
-    """
-    Load the model described by weight_path, run inference on encoder_input,
-    extract tau1/tau2/fret, and save all outputs into the same directory as
-    weight_path.
-    """
     out_dir    = os.path.dirname(weight_path)
     model_tag  = os.path.basename(out_dir) + "/" + os.path.basename(weight_path)
     pf("=" * 70)
@@ -1039,7 +1034,6 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
     config = parse_config_from_path(weight_path, args)
     pf(f"[EVAL] Parsed config: {config}")
 
-    # Build model
     model_type = config["model_type"]
 
     if model_type == "teacher":
@@ -1063,22 +1057,25 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
             pf("[EVAL] WARNING: QKeras not available — "
                "falling back to vanilla float student for weight loading.")
             model = build_vanilla_student(
-                seq_len, n_out, config["student_units"]
+                config["student_units"], seq_len, n_out
             )
     elif model_type == "student_vanilla":
         pf(f"[EVAL] Building vanilla student: units={config['student_units']}")
-        model = build_vanilla_student(seq_len, n_out, config["student_units"])
+        model = build_vanilla_student(config["student_units"], seq_len, n_out)
     else:
         pf(f"[EVAL] WARNING: model_type='{model_type}' — "
            f"attempting teacher build with layers={config['layers_teacher']}")
         model = build_teacher(seq_len, n_out, config["layers_teacher"])
 
-    # Load weights
     pf(f"[EVAL] Loading weights from: {weight_path}")
     try:
         model.load_weights(weight_path)
     except Exception as e:
         pf(f"[EVAL] ERROR loading weights: {e}")
+        if model_type == "student_vanilla":
+            pf(f"[EVAL] ERROR: could not load weights for model_type='{model_type}'. Skipping.")
+            pf(f"  {e}")
+            return None
         pf(f"[EVAL] Trying alternate teacher naming (enc_input/dec_input)...")
         try:
             model = build_teacher_student_names(
@@ -1096,26 +1093,22 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
     model.trainable = False
     pf(f"[EVAL] Model params: {model.count_params():,}")
 
-    # Run inference
     pf(f"[EVAL] Running inference on {len(encoder_input):,} pixels...")
     t_axis   = np.arange(seq_len, dtype=np.float32) * gate_width_ns
     preds    = run_inference(model, encoder_input, seq_len, n_out, infer_batch, pf)
     pf(f"[EVAL] preds shape: {preds.shape}")
 
-    # Extract lifetimes
     tau1_vals, tau2_vals, fret_vals = extract_lifetimes(preds, t_axis)
     pf(f"[EVAL] tau1 range: [{tau1_vals.min():.4f}, {tau1_vals.max():.4f}]")
     pf(f"[EVAL] tau2 range: [{tau2_vals.min():.4f}, {tau2_vals.max():.4f}]")
     pf(f"[EVAL] fret range: [{fret_vals.min():.4f}, {fret_vals.max():.4f}]")
 
-    # Reshape to pixel maps
     tau1_map = tau1_vals.reshape(n_rows, n_cols)
     tau2_map = tau2_vals.reshape(n_rows, n_cols)
     fret_map = fret_vals.reshape(n_rows, n_cols)
 
     pixel_mask_flat = pixel_mask.flatten()
 
-    # Statistics — valid pixels only
     pf(f"[EVAL] Computing statistics (valid pixels only)...")
     tau1_valid_flat = tau1_vals[pixel_mask_flat]
     tau2_valid_flat = tau2_vals[pixel_mask_flat]
@@ -1144,29 +1137,23 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
         json.dump(results, f, indent=2)
     pf(f"[EVAL] Stats saved: {stats_path}")
 
-    # Save raw per-pixel arrays as .npy for downstream use
     np.save(os.path.join(out_dir, "experimental_tau1.npy"), tau1_map)
     np.save(os.path.join(out_dir, "experimental_tau2.npy"), tau2_map)
     np.save(os.path.join(out_dir, "experimental_fret.npy"), fret_map)
     pf(f"[EVAL] Per-pixel .npy arrays saved to {out_dir}")
 
-    # Save .mat files for MATLAB import
     save_mat_outputs(tau1_map, tau2_map, fret_map, pixel_mask,
                      preds, out_dir, model_tag, pf)
 
-    # Pixel maps
     save_pixel_maps(tau1_map, tau2_map, fret_map, pixel_mask,
                     n_rows, n_cols, out_dir, model_tag, pf)
 
-    # Histograms
     save_histograms(tau1_vals, tau2_vals, fret_vals, pixel_mask_flat,
                     out_dir, model_tag, pf)
 
-    # Scatter plots (pairwise correlations)
     save_scatter_plots(tau1_vals, tau2_vals, fret_vals, pixel_mask_flat,
                        out_dir, model_tag, pf)
 
-    # Combined overview
     save_overview_figure(
         tau1_map, tau2_map, fret_map,
         tau1_vals, tau2_vals, fret_vals,
@@ -1179,7 +1166,6 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
 
     return results
 
-
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -1189,9 +1175,6 @@ def main():
 
     setup_gpu()
 
-    # ------------------------------------------------------------------
-    # 1. Load and preprocess experimental .mat file
-    # ------------------------------------------------------------------
     # ------------------------------------------------------------------
     # 1. Load and preprocess experimental .mat file
     # ------------------------------------------------------------------
@@ -1321,7 +1304,6 @@ def main():
         "results":         all_results,
     }
 
-    # Save summary next to the mat file if possible, else next to ablation root
     if args.ablation_root is not None:
         summary_dir = args.ablation_root
     else:
