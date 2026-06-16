@@ -468,38 +468,36 @@ def build_teacher_student_names(seq_len, n_out, teacher_units, teacher_layers):
 # We build a plain float32 GRU student (no QKeras) for the vanilla-KD ablations.
 # Layer names: senc_input, sdec_input, sencgru, sdecgru, sdec_dense
 # ---------------------------------------------------------------------------
-def build_vanilla_student(seq_len, n_out, student_units):
-    from tensorflow.keras.layers import GRU
+def build_vanilla_student(student_units, seq_len, n_out):
+    enc_input = tf.keras.Input(shape=(seq_len, 1), name="s_enc_input")
+    dec_input = tf.keras.Input(shape=(seq_len, 1), name="s_dec_input")
 
-    enc_inputs = Input(shape=(None, 1), name="senc_input")
-    dec_inputs = Input(shape=(None, 1), name="sdec_input")
-
-    _, s_enc_state = GRU(
+    enc_gru = tf.keras.layers.GRU(
         student_units,
         return_state=True,
-        name="sencgru",
-    )(enc_inputs)
+        return_sequences=False,
+        reset_after=True,
+        name="s_enc_gru",
+    )
+    _, enc_state = enc_gru(enc_input)
 
-    s_dec_hid_seq, _ = GRU(
+    dec_gru = tf.keras.layers.GRU(
         student_units,
         return_sequences=True,
-        return_state=True,
-        name="sdecgru",
-    )(dec_inputs, initial_state=s_enc_state)
+        return_state=False,
+        reset_after=True,
+        name="s_dec_gru",
+    )
+    dec_out = dec_gru(dec_input, initial_state=enc_state)
 
-    s_output = Dense(
-        n_out,
-        activation="linear",
-        name="sdec_dense",
-    )(s_dec_hid_seq)
+    out = tf.keras.layers.Dense(n_out, name="s_out_dense")(dec_out)
 
-    student_model = Model(
-        inputs=[enc_inputs, dec_inputs],
-        outputs=s_output,
+    model = tf.keras.Model(
+        inputs=[enc_input, dec_input],
+        outputs=out,
         name="vanilla_student",
     )
-    return student_model
-
+    return model
 
 # ---------------------------------------------------------------------------
 # Build QKeras student model — exact replica of train_student.py
@@ -689,54 +687,32 @@ def discover_weight_files(root_dir, pf):
 # Handles both teacher (encinput/decinput) and student (senc_input/sdec_input)
 # input name conventions automatically.
 # ---------------------------------------------------------------------------
-def run_inference(model, encoder_input, seq_len, n_out, infer_batch, pf):
-    """
-    encoder_input : (N, seq_len, 1) float32
-    Returns preds : (N, seq_len, n_out) float32
-    """
-    n     = len(encoder_input)
-    preds = np.zeros((n, seq_len, n_out), dtype=np.float32)
+def run_inference(model, encoder_input, seq_len, n_out, infer_batch, pf="INFER"):
+    N = encoder_input.shape[0]
+    dec_input_zeros = np.zeros((N, seq_len, 1), dtype=np.float32)
 
-    input_names = [layer.name for layer in model.inputs]
-    is_teacher  = any("encinput" in nm or "enc_input" in nm for nm in input_names)
-    is_student  = any("senc_input" in nm for nm in input_names)
+    input_names = [inp.name for inp in model.inputs]
+    enc_key = None
+    dec_key = None
+    for name in input_names:
+        stripped = name.split(":")[0]
+        if "enc" in stripped:
+            enc_key = stripped
+        elif "dec" in stripped:
+            dec_key = stripped
+    if enc_key is None or dec_key is None:
+        raise ValueError(
+            f"[{pf}] Could not auto-detect enc/dec input names from model inputs: {input_names}"
+        )
 
-    if is_teacher:
-        enc_key = "encinput" if "encinput" in input_names else "enc_input"
-        dec_key = "decinput" if "decinput" in input_names else "dec_input"
-    elif is_student:
-        enc_key = "senc_input"
-        dec_key = "sdec_input"
-    else:
-        # Fallback: positional
-        enc_key = None
-        dec_key = None
-
-    pf(f"  [INFER] N={n:,}  batch={infer_batch}  "
-       f"enc_key={enc_key}  dec_key={dec_key}")
-
-    n_batches = int(np.ceil(n / infer_batch))
-    for b in range(n_batches):
-        s = b * infer_batch
-        e = min(s + infer_batch, n)
-        bs = e - s
-
-        enc_b = tf.constant(encoder_input[s:e], dtype=tf.float32)
-        dec_b = tf.zeros((bs, seq_len, 1), dtype=tf.float32)
-
-        if enc_key is not None:
-            out = model({enc_key: enc_b, dec_key: dec_b}, training=False)
-        else:
-            out = model([enc_b, dec_b], training=False)
-
-        preds[s:e] = out.numpy()
-
-        if (b % max(1, n_batches // 10) == 0) or (b == n_batches - 1):
-            pf(f"  [INFER] batch {b + 1}/{n_batches}  "
-               f"samples {e:,}/{n:,}  ({100.0 * e / n:.1f}%)")
-
-    return preds
-
+    print(f"[{pf}] N={N:,} batch={infer_batch} enc_key={enc_key} dec_key={dec_key}")
+    all_preds = []
+    for start in range(0, N, infer_batch):
+        enc_b = encoder_input[start:start + infer_batch]
+        dec_b = dec_input_zeros[start:start + infer_batch]
+        out = model({enc_key: enc_b, dec_key: dec_b}, training=False)
+        all_preds.append(out.numpy() if hasattr(out, "numpy") else out)
+    return np.concatenate(all_preds, axis=0)
 
 # ---------------------------------------------------------------------------
 # Save pixel maps (spatial images)
