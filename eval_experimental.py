@@ -992,7 +992,56 @@ def save_overview_figure(tau1_map, tau2_map, fret_map,
     plt.close(fig)
     pf(f"  Overview figure saved: {out_path}")
 
+# ---------------------------------------------------------------------------
+# Save per-pixel results and raw predictions as .mat files for MATLAB import
+# ---------------------------------------------------------------------------
+def save_mat_outputs(tau1_map, tau2_map, fret_map, pixel_mask,
+                     preds, out_dir, model_tag, pf):
+    """
+    Save all per-pixel output arrays and raw model predictions as MATLAB .mat
+    files into out_dir so they can be loaded directly in MATLAB via load().
 
+    Files written
+    -------------
+    experimental_results.mat
+        tau1_map    : (n_rows, n_cols)  float32  — τ₁ lifetime map in ns
+        tau2_map    : (n_rows, n_cols)  float32  — τ₂ lifetime map in ns
+        fret_map    : (n_rows, n_cols)  float32  — FRET fraction map
+        pixel_mask  : (n_rows, n_cols)  uint8    — 1=valid, 0=masked pixel
+        model_tag   : char array        str      — identifier string
+
+    experimental_preds.mat
+        preds       : (N_pixels, seq_len, 3)  float32
+                      channel 0 = reconstructed full decay
+                      channel 1 = short-lifetime component
+                      channel 2 = long-lifetime component
+        Note: N_pixels = n_rows * n_cols (row-major flattening)
+    """
+    from scipy.io import savemat
+
+    results_path = os.path.join(out_dir, "experimental_results.mat")
+    savemat(
+        results_path,
+        {
+            "tau1_map":   tau1_map.astype(np.float64),
+            "tau2_map":   tau2_map.astype(np.float64),
+            "fret_map":   fret_map.astype(np.float64),
+            "pixel_mask": pixel_mask.astype(np.uint8),
+            "model_tag":  model_tag,
+        },
+        do_compression=True,
+    )
+    pf(f"  .mat results saved: {results_path}")
+
+    preds_path = os.path.join(out_dir, "experimental_preds.mat")
+    savemat(
+        preds_path,
+        {
+            "preds": preds.astype(np.float64),
+        },
+        do_compression=True,
+    )
+    pf(f"  .mat preds saved  : {preds_path}")
 # ---------------------------------------------------------------------------
 # Evaluate a single weight file and save all outputs next to it
 # ---------------------------------------------------------------------------
@@ -1124,6 +1173,10 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
     np.save(os.path.join(out_dir, "experimental_tau2.npy"), tau2_map)
     np.save(os.path.join(out_dir, "experimental_fret.npy"), fret_map)
     pf(f"[EVAL] Per-pixel .npy arrays saved to {out_dir}")
+
+    # Save .mat files for MATLAB import
+    save_mat_outputs(tau1_map, tau2_map, fret_map, pixel_mask,
+                     preds, out_dir, model_tag, pf)
 
     # Pixel maps
     save_pixel_maps(tau1_map, tau2_map, fret_map, pixel_mask,
