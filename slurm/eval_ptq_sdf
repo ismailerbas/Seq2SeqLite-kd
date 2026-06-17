@@ -10,56 +10,52 @@
 #SBATCH --mail-user=erbasi@rpi.edu
 
 # ============================================================================
-# eval_ptq_sdf — Post-training quantization evaluation for Table 2.
-# Loads teacher_best.weights.h5 from --teacher-run-dir, converts to TFLite
-# at --bits (8 or 16), runs inference on the test split, computes RMSE, R²,
-# L2-norm, DTW per SDF channel, and saves results under
-#   /scratch/nmi/results/ptq/ptq_{BITS}bit_{TEACHER_RUN_NAME}/
+# eval_ptq_sdf — Weight-only PTQ evaluation for Table 2.
+# Auto-discovers all teacher runs under /scratch/nmi that contain
+# teacher_best.weights.h5, applies symmetric per-tensor weight-only
+# quantization at 8-bit and/or 16-bit, runs batched GPU inference on the
+# frozen test split, and saves results under:
+#   /scratch/nmi/results/ptq/ptq_{bits}bit_{run_name}/
 #
-# TFLite inference is sequential (sample by sample).  Wall time 8h is set
-# for worst-case full test set at 8-bit.  Use --max-test-samples to cap.
-# No resubmission logic: eval is deterministic and idempotent.
+# No TFLite.  Quantized weights are set back via layer.set_weights() and
+# inference runs at full float32 speed on GPU using the normal Keras path.
+# Wall time 8h covers worst-case DTW on the full test set for all runs
+# at both bit-widths.  No resubmission logic: eval is deterministic.
 #
 # Positional args:
-#   $1  BITS               (required: 8 or 16)
-#   $2  TEACHER_RUN_NAME   (required: basename of the teacher run directory
-#                           under /scratch/nmi, e.g. teacher_training_gru128x2)
-#   $3  SEQ_LEN            (optional, default 135)
-#   $4  INFER_BATCH        (optional, default 8192  — used only for float32
-#                           reference run inside ptq script; TFLite is always
-#                           sequential)
-#   $5  MAX_TEST_SAMPLES   (optional, default 0 = all; set e.g. 50000 for speed)
-#   $6  REP_SAMPLES        (optional, default 2048; calibration samples for INT8)
-#   $7  OVERWRITE          (optional, pass "overwrite" to add --overwrite flag)
+#   $1  BITS        (optional, default "both"  — choices: 8 / 16 / both)
+#   $2  SEQ_LEN     (optional, default 135)
+#   $3  INFER_BATCH (optional, default 8192)
+#   $4  OVERWRITE   (optional, pass "overwrite" to add --overwrite flag)
 #
 # Examples:
-#   # 8-bit PTQ on teacher_training_gru128x2, cap test to 50k samples:
-#   sbatch --job-name=eval_ptq_8bit_gru128x2 slurm/eval_ptq_sdf \
-#       8 teacher_training_gru128x2 135 8192 50000 2048
+#   # Run both 8-bit and 16-bit on all discovered teacher runs:
+#   sbatch --job-name=eval_ptq_both slurm/eval_ptq_sdf
 #
-#   # 16-bit PTQ on teacher_training_gru128x2, full test set:
-#   sbatch --job-name=eval_ptq_16bit_gru128x2 slurm/eval_ptq_sdf \
-#       16 teacher_training_gru128x2 135 8192 0 2048
+#   # Run only 8-bit:
+#   sbatch --job-name=eval_ptq_8bit slurm/eval_ptq_sdf 8
 #
-#   # 8-bit PTQ, overwrite existing results:
-#   sbatch --job-name=eval_ptq_8bit_gru128x2 slurm/eval_ptq_sdf \
-#       8 teacher_training_gru128x2 135 8192 50000 2048 overwrite
+#   # Run only 16-bit:
+#   sbatch --job-name=eval_ptq_16bit slurm/eval_ptq_sdf 16
+#
+#   # Run both bit-widths with overwrite:
+#   sbatch --job-name=eval_ptq_both slurm/eval_ptq_sdf both 135 8192 overwrite
+#
+#   # Run only 8-bit with overwrite:
+#   sbatch --job-name=eval_ptq_8bit slurm/eval_ptq_sdf 8 135 8192 overwrite
 # ============================================================================
 
-BITS=${1:?"ERROR: \$1 BITS is required (8 or 16)."}
-TEACHER_RUN_NAME=${2:?"ERROR: \$2 TEACHER_RUN_NAME is required (e.g. teacher_training_gru128x2)."}
-SEQ_LEN=${3:-135}
-INFER_BATCH=${4:-8192}
-MAX_TEST_SAMPLES=${5:-0}
-REP_SAMPLES=${6:-2048}
+BITS=${1:-both}
+SEQ_LEN=${2:-135}
+INFER_BATCH=${3:-8192}
 OVERWRITE_ARG=""
-if [ "${7}" = "overwrite" ]; then
+if [ "${4}" = "overwrite" ]; then
     OVERWRITE_ARG="--overwrite"
 fi
 
 # Validate BITS
-if [ "${BITS}" != "8" ] && [ "${BITS}" != "16" ]; then
-    echo "FATAL: BITS must be 8 or 16. Got: ${BITS}"
+if [ "${BITS}" != "8" ] && [ "${BITS}" != "16" ] && [ "${BITS}" != "both" ]; then
+    echo "FATAL: BITS must be 8, 16, or both. Got: ${BITS}"
     exit 1
 fi
 
@@ -93,8 +89,7 @@ export OPENBLAS_NUM_THREADS=1
 # --- Paths ---
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 DATA_PATH="${SCRATCH_BASE}/nmi"
-TEACHER_RUN_DIR="${SCRATCH_BASE}/nmi/${TEACHER_RUN_NAME}"
-SAVE_DIR="${SCRATCH_BASE}/nmi/results/ptq"
+RESULTS_PATH="${SCRATCH_BASE}/nmi"
 SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 
 # --- Scratch / cache dirs ---
@@ -103,12 +98,14 @@ export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
 export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
 export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
 export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
-mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}" "${SAVE_DIR}"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+mkdir -p "${RESULTS_PATH}/results/ptq"
 
 # --- Log ---
 echo "============================================================"
 echo "EVAL PTQ SDF — Table 2"
-echo "PTQ ${BITS}-bit on teacher run: ${TEACHER_RUN_NAME}"
+echo "Weight-only PTQ at ${BITS}-bit on all discovered teacher runs"
+echo "Auto-discovers all teacher_best.weights.h5 under ${RESULTS_PATH}"
 echo "============================================================"
 echo "SLURM JOB ID        : ${SLURM_JOBID}"
 echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
@@ -118,21 +115,18 @@ echo "LD_LIBRARY_PATH     : ${LD_LIBRARY_PATH}"
 echo "GPUs available      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
 echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
 echo "DATA PATH           : ${DATA_PATH}"
-echo "TEACHER RUN DIR     : ${TEACHER_RUN_DIR}"
-echo "SAVE DIR            : ${SAVE_DIR}"
+echo "RESULTS PATH        : ${RESULTS_PATH}"
 echo "SCRIPT DIR          : ${SCRIPT_DIR}"
 echo "BITS                : ${BITS}"
 echo "SEQ LEN             : ${SEQ_LEN}"
 echo "INFER BATCH         : ${INFER_BATCH}"
-echo "MAX TEST SAMPLES    : ${MAX_TEST_SAMPLES}"
-echo "REP SAMPLES         : ${REP_SAMPLES}"
 echo "OVERWRITE ARG       : ${OVERWRITE_ARG}"
 echo "PYTHON              : $(which python)"
 echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
 echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
 echo "============================================================"
 
-# --- Sanity checks ---
+# --- GPU sanity check ---
 GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
 echo "TF physical GPUs found : ${GPU_CHECK}"
 if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
@@ -147,51 +141,35 @@ if [ ! -f "${SCRIPT_DIR}/eval/eval_ptq_sdf.py" ]; then
     exit 1
 fi
 
-if [ ! -d "${TEACHER_RUN_DIR}" ]; then
-    echo "FATAL: TEACHER_RUN_DIR does not exist: ${TEACHER_RUN_DIR}"
-    exit 1
-fi
-
-if [ ! -f "${TEACHER_RUN_DIR}/teacher_best.weights.h5" ]; then
-    echo "FATAL: teacher_best.weights.h5 not found in ${TEACHER_RUN_DIR}"
-    echo "  Files present: $(ls ${TEACHER_RUN_DIR} 2>/dev/null)"
-    exit 1
-fi
-
 echo "eval_ptq_sdf.py found."
-echo "teacher_best.weights.h5 found."
-echo "Starting PTQ ${BITS}-bit evaluation..."
+echo "Starting weight-only PTQ ${BITS}-bit evaluation on all teacher runs..."
 echo "============================================================"
 
 # ============================================================================
 # Launch eval (foreground)
 # ============================================================================
 python "${SCRIPT_DIR}/eval/eval_ptq_sdf.py" \
-    --data-dir           "${DATA_PATH}"          \
-    --teacher-run-dir    "${TEACHER_RUN_DIR}"     \
-    --save-dir           "${SAVE_DIR}"            \
-    --bits               "${BITS}"               \
-    --seq-len            "${SEQ_LEN}"            \
-    --n-out              3                       \
-    --gate-width-ns      0.09                    \
-    --teacher-units      128                     \
-    --teacher-layers     2                       \
-    --rep-samples        "${REP_SAMPLES}"        \
-    --max-test-samples   "${MAX_TEST_SAMPLES}"   \
+    --data-dir          "${DATA_PATH}"     \
+    --results-dir       "${RESULTS_PATH}"  \
+    --bits              "${BITS}"          \
+    --seq-len           "${SEQ_LEN}"       \
+    --n-out             3                  \
+    --gate-width-ns     0.09               \
+    --teacher-units     128                \
+    --teacher-layers    2                  \
+    --infer-batch       "${INFER_BATCH}"   \
     ${OVERWRITE_ARG}
 
 EXIT_CODE=$?
-
-JOB_OUT_DIR="${SAVE_DIR}/ptq_${BITS}bit_${TEACHER_RUN_NAME}"
 
 echo "============================================================"
 echo "Eval Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
     echo "PTQ ${BITS}-bit evaluation completed successfully."
-    echo "Results in: ${JOB_OUT_DIR}"
-    echo "  TFLite model : $(find "${JOB_OUT_DIR}" -name "*.tflite" 2>/dev/null)"
-    echo "  JSON count   : $(find "${JOB_OUT_DIR}" -name "*.json"   2>/dev/null | wc -l)"
-    echo "  PNG count    : $(find "${JOB_OUT_DIR}" -name "*.png"    2>/dev/null | wc -l)"
+    echo "Results saved under: ${RESULTS_PATH}/results/ptq/"
+    echo "  Subdirs  : $(find "${RESULTS_PATH}/results/ptq" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    echo "  JSONs    : $(find "${RESULTS_PATH}/results/ptq" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  PNGs     : $(find "${RESULTS_PATH}/results/ptq" -name "*.png"  2>/dev/null | wc -l)"
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"

@@ -1,62 +1,82 @@
 #!/usr/bin/env python3
 """
-eval/eval_ptq_sdf.py — Post-training quantization (PTQ) evaluation for Table 2.
+eval/eval_ptq_sdf.py — Post-training weight-only quantization (PTQ) evaluation
+for Table 2.
 
-Loads teacher_best.weights.h5 from --teacher-run-dir, applies TensorFlow Lite
-representative-dataset-based PTQ at --bits (16 or 8), runs inference on the
-frozen test split (testidx.npy), computes RMSE, R², L2-norm, DTW per SDF channel,
-and saves:
-    test_sdf_metrics.json
-    test_metrics.json
-    test_scatter_tau1.png
-    test_scatter_tau2.png
-    test_scatter_fret.png
-    test_residuals.png
-    ptq_args.json
-into --save-dir/<job_name>/.
+Auto-discovers all teacher runs under --results-dir (same walk logic as
+eval_teacher_sdf.py), applies symmetric per-tensor weight-only quantization
+at --bits (8, 16, or "both"), runs batched GPU inference on the frozen test
+split (testidx.npy), computes RMSE, R², L2-norm, DTW per SDF channel, and
+saves results into:
 
-PTQ approach:
-    We use TFLite full-integer quantization with float32 I/O for 8-bit and
-    float16 quantization for 16-bit, both via a representative dataset drawn
-    from a random 2048-sample subset of the TRAIN split.
-    INT8 PTQ: converter.optimizations = [OPTIMIZE_FOR_SIZE] +
-              representative_dataset + target_spec = [INT8]
-    FP16 PTQ: converter.optimizations = [OPTIMIZE_FOR_SIZE] +
-              target_spec = [FP16]
-    The TFLite model is saved as teacher_ptq_{bits}bit.tflite next to the
-    weights file, then reloaded for inference.
-    Inference is done sample-by-sample (TFLite interpreter is sequential).
-    For large test sets this is slow — use --max-test-samples to cap.
+    <results-dir>/ptq/ptq_{bits}bit_{run_name}/
+        test_sdf_metrics.json
+        test_metrics.json
+        test_scatter_tau1.png
+        test_scatter_tau2.png
+        test_scatter_fret.png
+        test_residuals.png
+        ptq_args.json
+
+Weight-only quantization:
+    Symmetric per-tensor min-max quantization is applied to every weight
+    tensor (kernel, recurrent_kernel, bias) in every layer of the teacher
+    model.  The quantized float32 values are written back via layer.set_weights()
+    and inference runs at full float32 speed on GPU using the normal Keras path.
+    This measures the accuracy degradation from storing weights at reduced
+    precision, which is the standard definition of PTQ weight-only quantization
+    used in the paper.
+
+    8-bit:  scale = max(|w|) / 127   (INT8 symmetric, 127 levels)
+    16-bit: scale = max(|w|) / 32767 (INT16 symmetric, 32767 levels)
+
+    Weights with max(|w|) < 1e-8 are left unchanged (zero/near-zero tensors).
+    After quantization the weights are dequantized back to float32 before being
+    set on the layer, so inference runs in float32 throughout — exactly as
+    weight-only PTQ works on hardware that dequantizes at runtime.
 
 Usage:
-    # 8-bit PTQ
+    # Both 8-bit and 16-bit in one job (default):
     python eval/eval_ptq_sdf.py \
         --data-dir /scratch/nmi \
-        --teacher-run-dir /scratch/nmi/your_teacher_run \
-        --save-dir /scratch/nmi/results/ptq \
+        --results-dir /scratch/nmi \
+        --seq-len 135 \
+        --n-out 3 \
+        --gate-width-ns 0.09 \
+        --teacher-units 128 \
+        --teacher-layers 2 \
+        --infer-batch 8192 \
+        --bits both \
+        --overwrite
+
+    # Only 8-bit:
+    python eval/eval_ptq_sdf.py \
+        --data-dir /scratch/nmi \
+        --results-dir /scratch/nmi \
         --bits 8 \
         --seq-len 135 --n-out 3 --gate-width-ns 0.09 \
         --teacher-units 128 --teacher-layers 2 \
-        --rep-samples 2048 \
-        --max-test-samples 50000
+        --infer-batch 8192
 
-    # 16-bit PTQ
+    # Only 16-bit:
     python eval/eval_ptq_sdf.py \
         --data-dir /scratch/nmi \
-        --teacher-run-dir /scratch/nmi/your_teacher_run \
-        --save-dir /scratch/nmi/results/ptq \
+        --results-dir /scratch/nmi \
         --bits 16 \
         --seq-len 135 --n-out 3 --gate-width-ns 0.09 \
         --teacher-units 128 --teacher-layers 2 \
-        --rep-samples 2048 \
-        --max-test-samples 50000
+        --infer-batch 8192
 
-    --max-test-samples : cap the test set size for speed.  0 = use all.
-    --rep-samples      : number of representative samples for PTQ calibration.
-    --overwrite        : re-run even if test_sdf_metrics.json already exists.
+    --overwrite : re-compute even if test_sdf_metrics.json already exists.
+
+The script discovers teacher run directories by recursively walking --results-dir
+and finding every directory that contains teacher_best.weights.h5.
+teacher_args.json is loaded when present so per-run --teacher-units /
+--teacher-layers override the CLI defaults automatically.
 """
 
 import argparse
+import copy
 import glob
 import json
 import os
@@ -100,30 +120,26 @@ import tensorflow.keras as keras
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="PTQ evaluation — Table 2 (16-bit and 8-bit quantization).",
+        description="PTQ weight-only evaluation — Table 2 (8-bit and 16-bit).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--data-dir",         type=str, required=True,
-                   help="Directory containing tpsf_seq, res, labels, split .npy files.")
-    p.add_argument("--teacher-run-dir",  type=str, required=True,
-                   help="Directory containing teacher_best.weights.h5.")
-    p.add_argument("--save-dir",         type=str, required=True,
-                   help="Root directory for PTQ results subfolders.")
-    p.add_argument("--bits",             type=int, required=True, choices=[8, 16],
-                   help="PTQ bit-width: 8 (INT8 full-integer) or 16 (FP16).")
-    p.add_argument("--seq-len",          type=int, default=135)
-    p.add_argument("--n-out",            type=int, default=3)
-    p.add_argument("--gate-width-ns",    type=float, default=0.09)
-    p.add_argument("--teacher-units",    type=int, default=128,
-                   help="Teacher GRU hidden units (overridden by teacher_args.json if found).")
-    p.add_argument("--teacher-layers",   type=int, default=2,
-                   help="Teacher GRU layers (overridden by teacher_args.json if found).")
-    p.add_argument("--rep-samples",      type=int, default=2048,
-                   help="Number of representative calibration samples for INT8 PTQ.")
-    p.add_argument("--max-test-samples", type=int, default=0,
-                   help="Cap test set at this many samples for speed (0 = use all).")
-    p.add_argument("--overwrite",        action="store_true", default=False,
-                   help="Re-run even if test_sdf_metrics.json already exists.")
+    p.add_argument("--data-dir",       type=str, required=True,
+                   help="Directory containing tpsf_seq, res, labels, testidx .npy files.")
+    p.add_argument("--results-dir",    type=str, required=True,
+                   help="Root directory to walk for teacher_best.weights.h5 files.")
+    p.add_argument("--bits",           type=str, default="both",
+                   choices=["8", "16", "both"],
+                   help="Bit-width to evaluate: 8, 16, or both.")
+    p.add_argument("--seq-len",        type=int, default=135)
+    p.add_argument("--n-out",          type=int, default=3)
+    p.add_argument("--gate-width-ns",  type=float, default=0.09)
+    p.add_argument("--teacher-units",  type=int, default=128,
+                   help="Default teacher GRU hidden units (overridden by teacher_args.json).")
+    p.add_argument("--teacher-layers", type=int, default=2,
+                   help="Default teacher GRU layers (overridden by teacher_args.json).")
+    p.add_argument("--infer-batch",    type=int, default=8192)
+    p.add_argument("--overwrite",      action="store_true", default=False,
+                   help="Re-compute and overwrite existing test_sdf_metrics.json.")
     return p.parse_args()
 
 
@@ -166,17 +182,6 @@ def find_data_files(data_dir, seq_len):
     file_res    = find_one([f"res_L{seq_len}_*.npy"],         "decoder target (res)")
     file_labels = find_one([f"labels_3ch_L{seq_len}_*.npy"], "labels (labels_3ch)")
 
-    file_train = None
-    for name in ["trainidx.npy", "train_idx.npy"]:
-        candidate = os.path.join(data_dir, name)
-        if os.path.exists(candidate):
-            file_train = candidate
-            break
-    if file_train is None:
-        raise FileNotFoundError(
-            f"Train split index not found in {data_dir}. Tried: trainidx.npy, train_idx.npy"
-        )
-
     file_test = None
     for name in ["testidx.npy", "test_idx.npy"]:
         candidate = os.path.join(data_dir, name)
@@ -188,11 +193,13 @@ def find_data_files(data_dir, seq_len):
             f"Test split index not found in {data_dir}. Tried: testidx.npy, test_idx.npy"
         )
 
-    return file_input, file_res, file_labels, file_train, file_test
+    return file_input, file_res, file_labels, file_test
 
 
 # ==============================================================================
 # Teacher model — EXACT replica of train_teacher.py
+# Stacked GRUCell inside keras.layers.RNN
+# Layer names: enc_input, dec_input, enc_rnn, dec_rnn, dec_dense
 # ==============================================================================
 
 def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
@@ -239,176 +246,116 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
 
 
 # ==============================================================================
-# PTQ: convert Keras model to TFLite with INT8 or FP16 quantization
+# Weight-only symmetric per-tensor quantization
 # ==============================================================================
 
-def convert_to_tflite_ptq(
-    teacher_model,
-    normalized_input,
-    train_idx,
-    seq_len,
-    bits,
-    rep_samples,
-    tflite_save_path,
-    pf,
-):
+def quantize_weights_symmetric(w, bits):
     """
-    Convert teacher_model to TFLite with PTQ at `bits` (8 or 16).
+    Symmetric per-tensor min-max quantization.
 
-    For INT8 (bits=8):
-        Full-integer quantization with float32 I/O.
-        Uses a representative dataset of `rep_samples` samples from train_idx.
-    For FP16 (bits=16):
-        Float16 quantization.
-        No representative dataset needed.
+    Maps the float32 weight tensor w to a quantized grid of (2^(bits-1) - 1)
+    levels, then dequantizes back to float32.  The result has the same dtype
+    as the input (float32) but its values are constrained to the quantized grid
+    defined by scale = max(|w|) / n_levels.
 
-    Saves the .tflite flatbuffer to tflite_save_path and returns the path.
+    Args:
+        w    : np.ndarray of any shape, dtype float32.
+        bits : int — 8 for INT8-equivalent, 16 for INT16-equivalent.
+
+    Returns:
+        np.ndarray of same shape and dtype as w with quantized values.
     """
-    pf(f"  Building TFLite converter for {bits}-bit PTQ...")
+    n_levels = (2 ** (bits - 1)) - 1        # INT8: 127   INT16: 32767
+    w_max = float(np.max(np.abs(w)))
+    if w_max < 1e-8:
+        return w.copy()                      # zero/near-zero — leave unchanged
+    scale = w_max / n_levels
+    w_q = np.clip(np.round(w / scale), -n_levels, n_levels)
+    return (w_q * scale).astype(np.float32)  # dequantize back to float32
+
+
+def apply_weight_quantization(model, bits, pf):
+    """
+    Apply symmetric per-tensor weight-only quantization to every weight tensor
+    in every layer of model in-place via layer.set_weights().
+
+    Only layers that have weights are touched.  The model is modified in-place.
+    A summary of layers modified and their weight shapes is printed.
+
+    Args:
+        model : tf.keras.Model — the loaded teacher model.
+        bits  : int — 8 or 16.
+        pf    : callable print function.
+
+    Returns:
+        n_tensors_quantized : int — total number of weight tensors quantized.
+        n_params_quantized  : int — total number of scalar parameters quantized.
+    """
+    n_tensors_quantized = 0
+    n_params_quantized  = 0
+
+    pf(f"  Applying {bits}-bit weight-only quantization to all layers...")
     sys.stdout.flush()
 
-    # Wrap the Keras model in a concrete function so the converter can trace it.
-    # The model takes two inputs: [enc_input (N,T,1), dec_input (N,T,1)].
-    # TFLite requires a single-input signature.  We fuse both inputs into one
-    # call by creating a wrapper tf.Module.
-    class TeacherWrapper(tf.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
+    for layer in model.layers:
+        weights = layer.get_weights()
+        if not weights:
+            continue
 
-        @tf.function(input_signature=[
-            tf.TensorSpec(shape=[1, None, 1], dtype=tf.float32, name="enc_input"),
-            tf.TensorSpec(shape=[1, None, 1], dtype=tf.float32, name="dec_input"),
-        ])
-        def serve(self, enc_input, dec_input):
-            return self.model([enc_input, dec_input], training=False)
+        quantized_weights = []
+        layer_tensors = 0
+        layer_params  = 0
 
-    wrapper = TeacherWrapper(teacher_model)
+        for w in weights:
+            w_arr = np.array(w, dtype=np.float32)
+            w_q   = quantize_weights_symmetric(w_arr, bits)
+            quantized_weights.append(w_q)
+            layer_tensors += 1
+            layer_params  += w_arr.size
 
-    converter = tf.lite.TFLiteConverter.from_concrete_functions(
-        [wrapper.serve.get_concrete_function()],
-        wrapper,
+        layer.set_weights(quantized_weights)
+        n_tensors_quantized += layer_tensors
+        n_params_quantized  += layer_params
+
+        pf(
+            f"    layer={layer.name:30s}  "
+            f"tensors={layer_tensors}  "
+            f"params={layer_params:>9,}  "
+            f"shapes={[list(w.shape) for w in weights]}"
+        )
+        sys.stdout.flush()
+
+    pf(
+        f"  Quantization complete: "
+        f"{n_tensors_quantized} tensors  "
+        f"{n_params_quantized:,} parameters quantized at {bits}-bit."
     )
-
-    converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-    if bits == 8:
-        # Representative dataset for INT8 calibration
-        rng = np.random.default_rng(42)
-        rep_idx = rng.choice(train_idx, size=min(rep_samples, len(train_idx)), replace=False)
-        rep_enc = normalized_input[rep_idx].astype(np.float32)  # (rep_samples, T, 1)
-
-        def representative_dataset_gen():
-            for i in range(len(rep_idx)):
-                enc_b = rep_enc[i : i + 1]                        # (1, T, 1)
-                dec_b = np.zeros((1, seq_len, 1), dtype=np.float32)
-                yield [enc_b, dec_b]
-
-        converter.representative_dataset = representative_dataset_gen
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        converter.inference_input_type  = tf.float32
-        converter.inference_output_type = tf.float32
-        pf(f"  INT8 PTQ: representative dataset = {len(rep_idx)} samples from train split")
-
-    elif bits == 16:
-        converter.target_spec.supported_types = [tf.float16]
-        pf(f"  FP16 PTQ: no representative dataset needed")
-
     sys.stdout.flush()
-
-    pf(f"  Running converter.convert()  (this may take a few minutes)...")
-    sys.stdout.flush()
-    t0 = time.time()
-    tflite_model = converter.convert()
-    pf(f"  Conversion done in {time.time() - t0:.1f}s  size={len(tflite_model)/1e6:.2f} MB")
-    sys.stdout.flush()
-
-    with open(tflite_save_path, "wb") as f:
-        f.write(tflite_model)
-    pf(f"  TFLite model saved: {tflite_save_path}")
-    sys.stdout.flush()
-
-    return tflite_save_path
+    return n_tensors_quantized, n_params_quantized
 
 
 # ==============================================================================
-# TFLite inference — sequential, sample by sample or small batches
+# Batched GPU inference — identical to eval_teacher_sdf.py
 # ==============================================================================
 
-def run_tflite_inference(tflite_path, enc_arr, seq_len, n_out, pf):
-    """
-    Run inference with the TFLite model on enc_arr.
-    TFLite interpreters are sequential (no batching across samples at the
-    interpreter level when batch dim = 1).  We iterate sample by sample.
-    This is slow for large test sets — use --max-test-samples to cap.
-
-    enc_arr : (N, T, 1) float32
-    Returns preds : (N, T, n_out) float32
-    """
-    pf(f"  Loading TFLite interpreter from: {tflite_path}")
-    sys.stdout.flush()
-
-    interpreter = tf.lite.Interpreter(model_path=tflite_path)
-    interpreter.allocate_tensors()
-
-    input_details  = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-
-    pf(f"  TFLite inputs  : {[(d['name'], d['shape'], d['dtype']) for d in input_details]}")
-    pf(f"  TFLite outputs : {[(d['name'], d['shape'], d['dtype']) for d in output_details]}")
-    sys.stdout.flush()
-
-    # Identify enc and dec input tensor indices by name
-    enc_idx = None
-    dec_idx = None
-    for d in input_details:
-        if "enc_input" in d["name"]:
-            enc_idx = d["index"]
-        elif "dec_input" in d["name"]:
-            dec_idx = d["index"]
-
-    if enc_idx is None or dec_idx is None:
-        # Fallback: assign by order (enc=0, dec=1)
-        pf("  WARNING: could not identify enc/dec inputs by name — using index order 0/1")
-        enc_idx = input_details[0]["index"]
-        dec_idx = input_details[1]["index"]
-
-    out_idx = output_details[0]["index"]
-
-    N = len(enc_arr)
-    preds = np.zeros((N, seq_len, n_out), dtype=np.float32)
-    dec_zero = np.zeros((1, seq_len, 1), dtype=np.float32)
-
-    t0 = time.time()
-    print_every = max(1, N // 20)
-
-    for i in tqdm(
-        range(N),
-        desc="TFLite inference",
-        unit="sample",
+def run_inference(model, enc_arr, seq_len, n_out, batch_size, pf):
+    n     = len(enc_arr)
+    preds = np.zeros((n, seq_len, n_out), dtype=np.float32)
+    for s in tqdm(
+        range(0, n, batch_size),
+        desc="PTQ inference",
+        unit="batch",
         bar_format="{l_bar}{bar:30}{r_bar}",
     ):
-        enc_b = enc_arr[i : i + 1].astype(np.float32)
-        interpreter.set_tensor(enc_idx, enc_b)
-        interpreter.set_tensor(dec_idx, dec_zero)
-        interpreter.invoke()
-        preds[i] = interpreter.get_tensor(out_idx)[0]
-
-        if (i + 1) % print_every == 0 or (i + 1) == N:
-            elapsed = time.time() - t0
-            pct     = 100.0 * (i + 1) / N
-            eta_s   = (elapsed / max(i + 1, 1)) * (N - i - 1)
-            pf(
-                f"  TFLite [{i + 1:>8,}/{N:,}  {pct:5.1f}%]  "
-                f"elapsed={elapsed / 60:.1f}min  ETA={eta_s / 60:.1f}min"
-            )
-            sys.stdout.flush()
-
+        e     = min(s + batch_size, n)
+        enc_b = tf.constant(enc_arr[s:e], dtype=tf.float32)
+        dec_b = tf.zeros((e - s, seq_len, 1), dtype=tf.float32)
+        preds[s:e] = model([enc_b, dec_b], training=False).numpy()
     return preds
 
 
 # ==============================================================================
-# Post-processing helpers (identical to train_student_vanilla_kd.py)
+# Post-processing helpers
 # ==============================================================================
 
 def extract_lifetimes(preds, t):
@@ -446,11 +393,11 @@ def compute_metrics(gt, pred, label, pfn):
 
 def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     """
-    Compute the 4 paper metrics (Table 1/2/3) on raw SDF output sequences.
+    Compute the 4 paper metrics (Table 2) on raw SDF output sequences.
 
     gt_seqs   : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
     pred_seqs : np.ndarray shape (N, T, C)  — model predictions
-    channel_names : list of str, length C   — e.g. ["ch0_full","ch1_short","ch2_long"]
+    channel_names : list of str, length C   — ["ch0_full","ch1_short","ch2_long"]
     pfn       : print function
 
     Returns a dict keyed by channel name, each containing:
@@ -608,143 +555,170 @@ def save_residual_plots(
 
 
 # ==============================================================================
-# Main
+# Discover all teacher run directories — identical walk to eval_teacher_sdf.py
 # ==============================================================================
 
-def main():
-    args = parse_args()
-    pf   = lambda s: print(s, flush=True)
+def find_teacher_run_dirs(results_dir):
+    """
+    Walk results_dir recursively and return every directory that contains
+    teacher_best.weights.h5.
+    """
+    run_dirs = []
+    for root, dirs, files in os.walk(results_dir):
+        if "teacher_best.weights.h5" in files:
+            run_dirs.append(root)
+    run_dirs.sort()
+    return run_dirs
 
-    setup_gpu()
 
-    # ── Resolve per-run teacher hyper-params from teacher_args.json ───────────
-    teacher_units  = args.teacher_units
-    teacher_layers = args.teacher_layers
-    args_path = os.path.join(args.teacher_run_dir, "teacher_args.json")
+# ==============================================================================
+# Evaluate one teacher run at one bit-width
+# ==============================================================================
+
+def evaluate_one_run_at_bits(
+    run_dir,
+    bits,
+    normalized_input,
+    res,
+    labels,
+    test_idx,
+    seq_len,
+    n_out,
+    gate_width_ns,
+    default_teacher_units,
+    default_teacher_layers,
+    infer_batch,
+    save_root,
+    overwrite,
+    pf,
+):
+    """
+    Load teacher from run_dir, quantize weights to `bits`, run batched GPU
+    inference on test_idx, compute and save all metrics.
+
+    Results are saved into:
+        save_root/ptq_{bits}bit_{run_basename}/
+            test_sdf_metrics.json
+            test_metrics.json
+            test_scatter_tau1.png
+            test_scatter_tau2.png
+            test_scatter_fret.png
+            test_residuals.png
+            ptq_args.json
+
+    Args:
+        run_dir               : str — full path to teacher run directory.
+        bits                  : int — 8 or 16.
+        normalized_input      : np.ndarray mmap (N, T, 1)
+        res                   : np.ndarray mmap (N, T, 3)
+        labels                : np.ndarray mmap (N, 3)
+        test_idx              : np.ndarray (n_test,)
+        seq_len               : int
+        n_out                 : int
+        gate_width_ns         : float
+        default_teacher_units : int
+        default_teacher_layers: int
+        infer_batch           : int
+        save_root             : str — root dir under which ptq subdirs are created.
+        overwrite             : bool
+        pf                    : callable print function.
+    """
+    run_basename = os.path.basename(os.path.normpath(run_dir))
+    job_name     = f"ptq_{bits}bit_{run_basename}"
+    job_dir      = os.path.join(save_root, job_name)
+    os.makedirs(job_dir, exist_ok=True)
+
+    sdf_metrics_path = os.path.join(job_dir, "test_sdf_metrics.json")
+    if os.path.exists(sdf_metrics_path) and not overwrite:
+        pf(f"    SKIP (already exists): {sdf_metrics_path}")
+        return
+
+    ckpt_path = os.path.join(run_dir, "teacher_best.weights.h5")
+    pf(f"    Checkpoint : {ckpt_path}")
+    pf(f"    Output dir : {job_dir}")
+
+    # ── Resolve per-run hyper-params ─────────────────────────────────────────
+    teacher_units  = default_teacher_units
+    teacher_layers = default_teacher_layers
+    args_path = os.path.join(run_dir, "teacher_args.json")
     if os.path.exists(args_path):
         with open(args_path, "r") as f:
             run_args = json.load(f)
-        teacher_units  = int(run_args.get("teacher_units",  teacher_units))
-        teacher_layers = int(run_args.get("teacher_layers", teacher_layers))
-        pf(f"[INFO] teacher_args.json: units={teacher_units}  layers={teacher_layers}")
+        teacher_units  = int(run_args.get("teacher_units",  default_teacher_units))
+        teacher_layers = int(run_args.get("teacher_layers", default_teacher_layers))
+        pf(f"    teacher_args.json: units={teacher_units}  layers={teacher_layers}")
     else:
-        pf(f"[INFO] teacher_args.json not found — using CLI: units={teacher_units}  layers={teacher_layers}")
+        pf(
+            f"    teacher_args.json not found — using CLI defaults: "
+            f"units={teacher_units}  layers={teacher_layers}"
+        )
 
-    # ── Job name and output directory ─────────────────────────────────────────
-    teacher_run_name = os.path.basename(os.path.normpath(args.teacher_run_dir))
-    job_name = f"ptq_{args.bits}bit_{teacher_run_name}"
-    job_dir  = os.path.join(args.save_dir, job_name)
-    os.makedirs(job_dir, exist_ok=True)
-
-    pf("=" * 70)
-    pf(f"eval_ptq_sdf.py — Table 2: PTQ {args.bits}-bit evaluation")
-    pf(f"  teacher-run-dir : {args.teacher_run_dir}")
-    pf(f"  job_name        : {job_name}")
-    pf(f"  job_dir         : {job_dir}")
-    pf(f"  bits            : {args.bits}")
-    pf(f"  overwrite       : {args.overwrite}")
-    pf("=" * 70)
-    sys.stdout.flush()
-
-    sdf_metrics_path = os.path.join(job_dir, "test_sdf_metrics.json")
-    if os.path.exists(sdf_metrics_path) and not args.overwrite:
-        pf(f"SKIP — test_sdf_metrics.json already exists: {sdf_metrics_path}")
-        pf("Pass --overwrite to re-run.")
-        sys.exit(0)
-
-    # ── Save args ─────────────────────────────────────────────────────────────
+    # ── Save ptq_args.json ───────────────────────────────────────────────────
+    ptq_args = {
+        "run_dir":        run_dir,
+        "run_basename":   run_basename,
+        "bits":           bits,
+        "teacher_units":  teacher_units,
+        "teacher_layers": teacher_layers,
+        "seq_len":        seq_len,
+        "n_out":          n_out,
+        "gate_width_ns":  gate_width_ns,
+        "infer_batch":    infer_batch,
+        "n_test":         int(len(test_idx)),
+    }
     with open(os.path.join(job_dir, "ptq_args.json"), "w") as f:
-        json.dump(vars(args), f, indent=2)
-    pf(f"ptq_args.json saved.")
+        json.dump(ptq_args, f, indent=2)
+    pf(f"    ptq_args.json saved.")
     sys.stdout.flush()
 
-    # ── Load data ─────────────────────────────────────────────────────────────
-    pf("Loading data files (mmap)...")
-    file_input, file_res, file_labels, file_train, file_test = find_data_files(
-        args.data_dir, args.seq_len
-    )
-    pf(f"  encoder input : {file_input}")
-    pf(f"  decoder target: {file_res}")
-    pf(f"  labels        : {file_labels}")
-    pf(f"  train idx     : {file_train}")
-    pf(f"  test idx      : {file_test}")
-    sys.stdout.flush()
-
-    normalized_input = np.load(file_input,  mmap_mode="r")
-    res              = np.load(file_res,    mmap_mode="r")
-    labels           = np.load(file_labels, mmap_mode="r")
-    train_idx        = np.load(file_train)
-    test_idx         = np.load(file_test)
-
-    if args.max_test_samples > 0 and len(test_idx) > args.max_test_samples:
-        rng      = np.random.default_rng(42)
-        test_idx = rng.choice(test_idx, size=args.max_test_samples, replace=False)
-        pf(f"  Capped test set to {len(test_idx):,} samples (--max-test-samples {args.max_test_samples})")
-
-    pf(
-        f"  N={normalized_input.shape[0]:,}  "
-        f"test_N={len(test_idx):,}  "
-        f"train_N={len(train_idx):,}"
-    )
-    sys.stdout.flush()
-
-    enc_test = normalized_input[test_idx].astype(np.float32)
-    res_test = res[test_idx].astype(np.float32)
-    lab_test = labels[test_idx]
-
-    # ── Build and load teacher (float32) ─────────────────────────────────────
-    pf("Building teacher model...")
+    # ── Build teacher and load float32 weights ───────────────────────────────
     tf.keras.backend.clear_session()
-    teacher_model = build_teacher(args.seq_len, args.n_out, teacher_units, teacher_layers)
-    ckpt_path = os.path.join(args.teacher_run_dir, "teacher_best.weights.h5")
-    pf(f"Loading weights: {ckpt_path}")
+    teacher_model = build_teacher(seq_len, n_out, teacher_units, teacher_layers)
     teacher_model.load_weights(ckpt_path)
     teacher_model.trainable = False
-    pf(f"Weights loaded OK.")
-    teacher_model.summary(print_fn=pf)
+    pf(f"    Float32 weights loaded OK.")
     sys.stdout.flush()
 
-    # ── Convert to TFLite PTQ ─────────────────────────────────────────────────
-    tflite_filename = f"teacher_ptq_{args.bits}bit.tflite"
-    tflite_save_path = os.path.join(job_dir, tflite_filename)
-
-    if os.path.exists(tflite_save_path) and not args.overwrite:
-        pf(f"TFLite model already exists — reusing: {tflite_save_path}")
-    else:
-        pf("Converting to TFLite PTQ...")
-        convert_to_tflite_ptq(
-            teacher_model    = teacher_model,
-            normalized_input = normalized_input,
-            train_idx        = train_idx,
-            seq_len          = args.seq_len,
-            bits             = args.bits,
-            rep_samples      = args.rep_samples,
-            tflite_save_path = tflite_save_path,
-            pf               = pf,
-        )
+    # ── Apply weight-only quantization in-place ──────────────────────────────
+    pf(f"    Applying {bits}-bit weight-only quantization...")
+    sys.stdout.flush()
+    t0_quant = time.time()
+    n_tensors, n_params = apply_weight_quantization(teacher_model, bits, pf)
+    pf(
+        f"    Quantization done in {time.time() - t0_quant:.2f}s  "
+        f"({n_tensors} tensors  {n_params:,} params)"
+    )
     sys.stdout.flush()
 
-    # ── TFLite inference on test set ─────────────────────────────────────────
-    pf(f"Running TFLite inference on {len(test_idx):,} test samples...")
+    # ── Batched GPU inference ────────────────────────────────────────────────
+    enc_test = normalized_input[test_idx]
+    res_test = res[test_idx]
+    lab_test = labels[test_idx]
+
+    pf(f"    Running batched GPU inference on {len(test_idx):,} test samples...")
     sys.stdout.flush()
-    ptq_preds = run_tflite_inference(tflite_save_path, enc_test, args.seq_len, args.n_out, pf)
-    pf(f"ptq_preds shape: {ptq_preds.shape}")
+    t0_infer = time.time()
+    ptq_preds = run_inference(
+        teacher_model, enc_test, seq_len, n_out, infer_batch, pf
+    )
+    pf(
+        f"    Inference done in {time.time() - t0_infer:.1f}s  "
+        f"shape={ptq_preds.shape}"
+    )
     sys.stdout.flush()
 
-    t_ns_axis = np.arange(args.seq_len, dtype=np.float32) * args.gate_width_ns
+    t_ns_axis = np.arange(seq_len, dtype=np.float32) * gate_width_ns
 
-    # ── Lifetime metrics ──────────────────────────────────────────────────────
-    pf("=" * 60)
-    pf("Lifetime metrics (tau1, tau2, FRET)")
-    pf("=" * 60)
+    # ── Lifetime metrics ─────────────────────────────────────────────────────
+    pf(f"    Lifetime metrics (tau1, tau2, FRET):")
     tau1_pred, tau2_pred, fret_pred = extract_lifetimes(ptq_preds, t_ns_axis)
     tau1_gt  = lab_test[:, 0]
     tau2_gt  = lab_test[:, 1]
     fret_gt  = lab_test[:, 2]
 
-    pf(f"  τ₁ pred range: {tau1_pred.min():.3f} – {tau1_pred.max():.3f} ns")
-    pf(f"  τ₂ pred range: {tau2_pred.min():.3f} – {tau2_pred.max():.3f} ns")
-    pf(f"  FRET pred range: {fret_pred.min():.3f} – {fret_pred.max():.3f}")
+    pf(f"      τ₁ pred range : {tau1_pred.min():.3f} – {tau1_pred.max():.3f} ns")
+    pf(f"      τ₂ pred range : {tau2_pred.min():.3f} – {tau2_pred.max():.3f} ns")
+    pf(f"      FRET pred range: {fret_pred.min():.3f} – {fret_pred.max():.3f}")
 
     m1 = compute_metrics(tau1_gt, tau1_pred, "τ₁ (ns)",  pf)
     m2 = compute_metrics(tau2_gt, tau2_pred, "τ₂ (ns)",  pf)
@@ -753,7 +727,7 @@ def main():
     test_metrics = {
         "job_name": job_name,
         "n_test":   int(len(test_idx)),
-        "bits":     args.bits,
+        "bits":     bits,
         "tau1":     {"rmse": m1[0], "r": m1[1], "cov1sigma": m1[2]},
         "tau2":     {"rmse": m2[0], "r": m2[1], "cov1sigma": m2[2]},
         "fret":     {"rmse": mf[0], "r": mf[1], "cov1sigma": mf[2]},
@@ -761,11 +735,11 @@ def main():
     metrics_path = os.path.join(job_dir, "test_metrics.json")
     with open(metrics_path, "w") as f:
         json.dump(test_metrics, f, indent=2)
-    pf(f"test_metrics.json saved: {metrics_path}")
+    pf(f"    test_metrics.json saved: {metrics_path}")
     sys.stdout.flush()
 
     # ── Scatter and residual plots ────────────────────────────────────────────
-    pf("Saving scatter and residual plots...")
+    pf(f"    Saving scatter and residual plots...")
     save_scatter_plots(
         tau1_gt, tau1_pred, m1,
         tau2_gt, tau2_pred, m2,
@@ -781,27 +755,138 @@ def main():
     sys.stdout.flush()
 
     # ── SDF metrics ───────────────────────────────────────────────────────────
-    pf("=" * 60)
-    pf("SDF-domain metrics (paper Table 2): RMSE, R², L2-norm, DTW")
-    pf("=" * 60)
+    pf(f"    SDF-domain metrics (RMSE, R², L2-norm, DTW):")
+    sys.stdout.flush()
     sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
     sdf_metrics = compute_sdf_metrics(
-        gt_seqs       = res_test,
+        gt_seqs       = res_test.astype(np.float32),
         pred_seqs     = ptq_preds,
         channel_names = sdf_channel_names,
         pfn           = pf,
     )
     sdf_metrics["job_name"] = job_name
     sdf_metrics["n_test"]   = int(len(test_idx))
-    sdf_metrics["bits"]     = args.bits
+    sdf_metrics["bits"]     = bits
     with open(sdf_metrics_path, "w") as f:
         json.dump(sdf_metrics, f, indent=2)
-    pf(f"test_sdf_metrics.json saved: {sdf_metrics_path}")
+    pf(f"    test_sdf_metrics.json saved: {sdf_metrics_path}")
     sys.stdout.flush()
 
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+def main():
+    args = parse_args()
+    pf   = lambda s: print(s, flush=True)
+
+    setup_gpu()
+
+    # Determine which bit-widths to run
+    if args.bits == "both":
+        bits_list = [8, 16]
+    else:
+        bits_list = [int(args.bits)]
+
     pf("=" * 70)
-    pf(f"DONE — {job_name}")
-    pf(f"Results in: {job_dir}")
+    pf("eval_ptq_sdf.py — Table 2: Weight-only PTQ evaluation")
+    pf(f"  data-dir    : {args.data_dir}")
+    pf(f"  results-dir : {args.results_dir}")
+    pf(f"  bits        : {bits_list}")
+    pf(f"  overwrite   : {args.overwrite}")
+    pf("=" * 70)
+    sys.stdout.flush()
+
+    # ── Load shared data (mmap) ────────────────────────────────────────────────
+    pf("Loading data files (mmap)...")
+    file_input, file_res, file_labels, file_test = find_data_files(
+        args.data_dir, args.seq_len
+    )
+    pf(f"  encoder input : {file_input}")
+    pf(f"  decoder target: {file_res}")
+    pf(f"  labels        : {file_labels}")
+    pf(f"  test idx      : {file_test}")
+    sys.stdout.flush()
+
+    normalized_input = np.load(file_input,  mmap_mode="r")
+    res              = np.load(file_res,    mmap_mode="r")
+    labels           = np.load(file_labels, mmap_mode="r")
+    test_idx         = np.load(file_test)
+
+    pf(
+        f"  N={normalized_input.shape[0]:,}  "
+        f"seq_len={args.seq_len}  "
+        f"n_out={args.n_out}  "
+        f"test_N={len(test_idx):,}"
+    )
+    sys.stdout.flush()
+
+    # ── Discover all teacher run directories ───────────────────────────────────
+    pf(f"Discovering teacher run directories under: {args.results_dir}")
+    run_dirs = find_teacher_run_dirs(args.results_dir)
+    if not run_dirs:
+        pf("ERROR: No directories with teacher_best.weights.h5 found.")
+        sys.exit(1)
+    pf(f"Found {len(run_dirs)} teacher run(s):")
+    for d in run_dirs:
+        pf(f"  {d}")
+    sys.stdout.flush()
+
+    # ── PTQ save root ─────────────────────────────────────────────────────────
+    save_root = os.path.join(args.results_dir, "ptq")
+    os.makedirs(save_root, exist_ok=True)
+    pf(f"PTQ results root: {save_root}")
+    sys.stdout.flush()
+
+    # ── Main loop: for each run, for each bit-width ───────────────────────────
+    t_total = time.time()
+    total_jobs = len(run_dirs) * len(bits_list)
+    job_idx    = 0
+
+    for run_dir in run_dirs:
+        for bits in bits_list:
+            job_idx += 1
+            pf("")
+            pf("=" * 70)
+            pf(
+                f"[{job_idx}/{total_jobs}]  {bits}-bit PTQ  "
+                f"run={os.path.basename(run_dir)}"
+            )
+            pf(f"  run_dir: {run_dir}")
+            pf("=" * 70)
+            sys.stdout.flush()
+            try:
+                evaluate_one_run_at_bits(
+                    run_dir               = run_dir,
+                    bits                  = bits,
+                    normalized_input      = normalized_input,
+                    res                   = res,
+                    labels                = labels,
+                    test_idx              = test_idx,
+                    seq_len               = args.seq_len,
+                    n_out                 = args.n_out,
+                    gate_width_ns         = args.gate_width_ns,
+                    default_teacher_units  = args.teacher_units,
+                    default_teacher_layers = args.teacher_layers,
+                    infer_batch           = args.infer_batch,
+                    save_root             = save_root,
+                    overwrite             = args.overwrite,
+                    pf                    = pf,
+                )
+            except Exception as exc:
+                pf(f"  ERROR in {run_dir} at {bits}-bit: {exc}")
+                import traceback
+                traceback.print_exc()
+                sys.stdout.flush()
+
+    pf("")
+    pf("=" * 70)
+    pf(
+        f"All PTQ jobs processed.  "
+        f"Total elapsed: {(time.time() - t_total) / 60:.1f} min"
+    )
+    pf(f"Results saved under: {save_root}")
     pf("=" * 70)
     sys.stdout.flush()
 
