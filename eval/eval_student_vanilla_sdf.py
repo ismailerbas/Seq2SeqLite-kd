@@ -629,7 +629,7 @@ def main():
     sys.stdout.flush()
 
     # ── Load shared data (mmap) ────────────────────────────────────────────────
-        pf("Loading data files (mmap)...")
+    pf("Loading data files (mmap)...")
     file_input, file_res, file_labels, file_test = find_data_files(
         args.data_dir, args.seq_len
     )
