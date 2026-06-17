@@ -1,0 +1,207 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=08:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+# ============================================================================
+# eval_ptq_sdf — Post-training quantization evaluation for Table 2.
+# Loads teacher_best.weights.h5 from --teacher-run-dir, converts to TFLite
+# at --bits (8 or 16), runs inference on the test split, computes RMSE, R²,
+# L2-norm, DTW per SDF channel, and saves results under
+#   /scratch/nmi/results/ptq/ptq_{BITS}bit_{TEACHER_RUN_NAME}/
+#
+# TFLite inference is sequential (sample by sample).  Wall time 8h is set
+# for worst-case full test set at 8-bit.  Use --max-test-samples to cap.
+# No resubmission logic: eval is deterministic and idempotent.
+#
+# Positional args:
+#   $1  BITS               (required: 8 or 16)
+#   $2  TEACHER_RUN_NAME   (required: basename of the teacher run directory
+#                           under /scratch/nmi, e.g. teacher_training_gru128x2)
+#   $3  SEQ_LEN            (optional, default 135)
+#   $4  INFER_BATCH        (optional, default 8192  — used only for float32
+#                           reference run inside ptq script; TFLite is always
+#                           sequential)
+#   $5  MAX_TEST_SAMPLES   (optional, default 0 = all; set e.g. 50000 for speed)
+#   $6  REP_SAMPLES        (optional, default 2048; calibration samples for INT8)
+#   $7  OVERWRITE          (optional, pass "overwrite" to add --overwrite flag)
+#
+# Examples:
+#   # 8-bit PTQ on teacher_training_gru128x2, cap test to 50k samples:
+#   sbatch --job-name=eval_ptq_8bit_gru128x2 slurm/eval_ptq_sdf \
+#       8 teacher_training_gru128x2 135 8192 50000 2048
+#
+#   # 16-bit PTQ on teacher_training_gru128x2, full test set:
+#   sbatch --job-name=eval_ptq_16bit_gru128x2 slurm/eval_ptq_sdf \
+#       16 teacher_training_gru128x2 135 8192 0 2048
+#
+#   # 8-bit PTQ, overwrite existing results:
+#   sbatch --job-name=eval_ptq_8bit_gru128x2 slurm/eval_ptq_sdf \
+#       8 teacher_training_gru128x2 135 8192 50000 2048 overwrite
+# ============================================================================
+
+BITS=${1:?"ERROR: \$1 BITS is required (8 or 16)."}
+TEACHER_RUN_NAME=${2:?"ERROR: \$2 TEACHER_RUN_NAME is required (e.g. teacher_training_gru128x2)."}
+SEQ_LEN=${3:-135}
+INFER_BATCH=${4:-8192}
+MAX_TEST_SAMPLES=${5:-0}
+REP_SAMPLES=${6:-2048}
+OVERWRITE_ARG=""
+if [ "${7}" = "overwrite" ]; then
+    OVERWRITE_ARG="--overwrite"
+fi
+
+# Validate BITS
+if [ "${BITS}" != "8" ] && [ "${BITS}" != "16" ]; then
+    echo "FATAL: BITS must be 8 or 16. Got: ${BITS}"
+    exit 1
+fi
+
+# ============================================================================
+# STEP 1 — modules
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+# ============================================================================
+# STEP 2 — activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+# ============================================================================
+# STEP 3 — THE FIX
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+# ============================================================================
+# STEP 4 — GPU / TF settings
+# ============================================================================
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${SCRATCH_BASE}/nmi"
+TEACHER_RUN_DIR="${SCRATCH_BASE}/nmi/${TEACHER_RUN_NAME}"
+SAVE_DIR="${SCRATCH_BASE}/nmi/results/ptq"
+SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}" "${SAVE_DIR}"
+
+# --- Log ---
+echo "============================================================"
+echo "EVAL PTQ SDF — Table 2"
+echo "PTQ ${BITS}-bit on teacher run: ${TEACHER_RUN_NAME}"
+echo "============================================================"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
+echo "NODE                : $(hostname)"
+echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH     : ${LD_LIBRARY_PATH}"
+echo "GPUs available      : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+echo "DATA PATH           : ${DATA_PATH}"
+echo "TEACHER RUN DIR     : ${TEACHER_RUN_DIR}"
+echo "SAVE DIR            : ${SAVE_DIR}"
+echo "SCRIPT DIR          : ${SCRIPT_DIR}"
+echo "BITS                : ${BITS}"
+echo "SEQ LEN             : ${SEQ_LEN}"
+echo "INFER BATCH         : ${INFER_BATCH}"
+echo "MAX TEST SAMPLES    : ${MAX_TEST_SAMPLES}"
+echo "REP SAMPLES         : ${REP_SAMPLES}"
+echo "OVERWRITE ARG       : ${OVERWRITE_ARG}"
+echo "PYTHON              : $(which python)"
+echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "NUMPY VERSION       : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
+
+# --- Sanity checks ---
+GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
+echo "TF physical GPUs found : ${GPU_CHECK}"
+if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
+    echo "FATAL: TensorFlow found 0 GPUs."
+    echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
+    find "${CONDA_PREFIX}/lib" -name "libcudnn.so.8" 2>/dev/null
+    exit 1
+fi
+
+if [ ! -f "${SCRIPT_DIR}/eval/eval_ptq_sdf.py" ]; then
+    echo "FATAL: eval/eval_ptq_sdf.py not found in ${SCRIPT_DIR}/eval/"
+    exit 1
+fi
+
+if [ ! -d "${TEACHER_RUN_DIR}" ]; then
+    echo "FATAL: TEACHER_RUN_DIR does not exist: ${TEACHER_RUN_DIR}"
+    exit 1
+fi
+
+if [ ! -f "${TEACHER_RUN_DIR}/teacher_best.weights.h5" ]; then
+    echo "FATAL: teacher_best.weights.h5 not found in ${TEACHER_RUN_DIR}"
+    echo "  Files present: $(ls ${TEACHER_RUN_DIR} 2>/dev/null)"
+    exit 1
+fi
+
+echo "eval_ptq_sdf.py found."
+echo "teacher_best.weights.h5 found."
+echo "Starting PTQ ${BITS}-bit evaluation..."
+echo "============================================================"
+
+# ============================================================================
+# Launch eval (foreground)
+# ============================================================================
+python "${SCRIPT_DIR}/eval/eval_ptq_sdf.py" \
+    --data-dir           "${DATA_PATH}"          \
+    --teacher-run-dir    "${TEACHER_RUN_DIR}"     \
+    --save-dir           "${SAVE_DIR}"            \
+    --bits               "${BITS}"               \
+    --seq-len            "${SEQ_LEN}"            \
+    --n-out              3                       \
+    --gate-width-ns      0.09                    \
+    --teacher-units      128                     \
+    --teacher-layers     2                       \
+    --rep-samples        "${REP_SAMPLES}"        \
+    --max-test-samples   "${MAX_TEST_SAMPLES}"   \
+    ${OVERWRITE_ARG}
+
+EXIT_CODE=$?
+
+JOB_OUT_DIR="${SAVE_DIR}/ptq_${BITS}bit_${TEACHER_RUN_NAME}"
+
+echo "============================================================"
+echo "Eval Exit Code: ${EXIT_CODE}"
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "PTQ ${BITS}-bit evaluation completed successfully."
+    echo "Results in: ${JOB_OUT_DIR}"
+    echo "  TFLite model : $(find "${JOB_OUT_DIR}" -name "*.tflite" 2>/dev/null)"
+    echo "  JSON count   : $(find "${JOB_OUT_DIR}" -name "*.json"   2>/dev/null | wc -l)"
+    echo "  PNG count    : $(find "${JOB_OUT_DIR}" -name "*.png"    2>/dev/null | wc -l)"
+else
+    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "  grep -i 'error\|traceback\|valueerror\|assertionerror' \\"
+    echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+exit ${EXIT_CODE}
