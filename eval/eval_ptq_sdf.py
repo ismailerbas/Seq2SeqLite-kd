@@ -200,10 +200,23 @@ def find_data_files(data_dir, seq_len):
 # Layer names: enc_input, dec_input, enc_rnn, dec_rnn, dec_dense
 # ==============================================================================
 
-def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
+def build_teacher(seq_len, n_out, teacher_units, teacher_layers, use_old_names=False):
     LAYERS_TEACHER = [teacher_units] * teacher_layers
 
-    encoder_inputs = keras.layers.Input(shape=(None, 1), name="enc_input")
+    if use_old_names:
+        enc_input_name = "encinput"
+        dec_input_name = "decinput"
+        enc_rnn_name   = "encrnn"
+        dec_rnn_name   = "decrnn"
+        dec_dense_name = "decdense"
+    else:
+        enc_input_name = "enc_input"
+        dec_input_name = "dec_input"
+        enc_rnn_name   = "enc_rnn"
+        dec_rnn_name   = "dec_rnn"
+        dec_dense_name = "dec_dense"
+
+    encoder_inputs = keras.layers.Input(shape=(None, 1), name=enc_input_name)
     encoder_cells = [
         keras.layers.GRUCell(units, reset_after=True, name=f"enc_cell{i}")
         for i, units in enumerate(LAYERS_TEACHER)
@@ -211,12 +224,12 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
     encoder_rnn = keras.layers.RNN(
         encoder_cells,
         return_state=True,
-        name="enc_rnn",
+        name=enc_rnn_name,
     )
     encoder_outputs_and_states = encoder_rnn(encoder_inputs)
     encoder_states = encoder_outputs_and_states[1:]
 
-    decoder_inputs = keras.layers.Input(shape=(None, 1), name="dec_input")
+    decoder_inputs = keras.layers.Input(shape=(None, 1), name=dec_input_name)
     decoder_cells = [
         keras.layers.GRUCell(units, reset_after=True, name=f"dec_cell{i}")
         for i, units in enumerate(LAYERS_TEACHER)
@@ -225,14 +238,14 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
         decoder_cells,
         return_sequences=True,
         return_state=True,
-        name="dec_rnn",
+        name=dec_rnn_name,
     )
     decoder_outputs_and_states = decoder_rnn(
         decoder_inputs, initial_state=encoder_states
     )
     decoder_hidden_sequence = decoder_outputs_and_states[0]
 
-    decoder_dense = keras.layers.Dense(n_out, activation="linear", name="dec_dense")
+    decoder_dense = keras.layers.Dense(n_out, activation="linear", name=dec_dense_name)
     decoder_output = decoder_dense(decoder_hidden_sequence)
 
     teacher_model = keras.models.Model(
@@ -241,7 +254,6 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers):
         name="teacher_seq2seq",
     )
     return teacher_model
-
 
 # ==============================================================================
 # Weight-only symmetric per-tensor quantization
@@ -339,6 +351,9 @@ def apply_weight_quantization(model, bits, pf):
 def run_inference(model, enc_arr, seq_len, n_out, batch_size, pf):
     n     = len(enc_arr)
     preds = np.zeros((n, seq_len, n_out), dtype=np.float32)
+    # Detect input names from the model itself
+    enc_input_name = model.input_names[0]
+    dec_input_name = model.input_names[1]
     for s in tqdm(
         range(0, n, batch_size),
         desc="PTQ inference",
@@ -348,9 +363,10 @@ def run_inference(model, enc_arr, seq_len, n_out, batch_size, pf):
         e     = min(s + batch_size, n)
         enc_b = tf.constant(enc_arr[s:e], dtype=tf.float32)
         dec_b = tf.zeros((e - s, seq_len, 1), dtype=tf.float32)
-        preds[s:e] = model({"enc_input": enc_b, "dec_input": dec_b}, training=False).numpy()
+        preds[s:e] = model(
+            {enc_input_name: enc_b, dec_input_name: dec_b}, training=False
+        ).numpy()
     return preds
-
 
 # ==============================================================================
 # Post-processing helpers
@@ -634,8 +650,26 @@ def evaluate_one_run_at_bits(
     sys.stdout.flush()
 
     # ── Build teacher and load float32 weights ───────────────────────────────
+    # Detect which layer naming convention the checkpoint uses.
+    # Old train_teacher.py: encrnn / decrnn / decdense
+    # New train_teacher.py: enc_rnn / dec_rnn / dec_dense
+    # We probe by trying new names first; on failure we fall back to old names.
+    import h5py
+
+    def _detect_layer_name_convention(ckpt_path):
+        with h5py.File(ckpt_path, "r") as f:
+            top_keys = list(f.keys())
+            # HDF5 weight files have a top-level key per layer name
+            if any("encrnn" in k or "decrnn" in k or "decdense" in k for k in top_keys):
+                return "old"
+            return "new"
+
+    convention = _detect_layer_name_convention(ckpt_path)
+    pf(f"    Checkpoint layer naming convention: {convention}")
+
     tf.keras.backend.clear_session()
-    teacher_model = build_teacher(seq_len, n_out, teacher_units, teacher_layers)
+    teacher_model = build_teacher(seq_len, n_out, teacher_units, teacher_layers,
+                                  use_old_names=(convention == "old"))
     teacher_model.load_weights(ckpt_path)
     teacher_model.trainable = False
     pf(f"    Float32 weights loaded OK.")
