@@ -160,7 +160,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REF_BATCH_SIZE=1024
 EFFECTIVE_LR=$(python -c "print(f'{1e-4 * ${BATCH_SIZE} / ${REF_BATCH_SIZE}:.0e}')" 2>/dev/null || echo "1e-3")
 
-JOB_TAG="memoq_b${BITS_KERNEL}k${BITS_KERNEL}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_gru${STUDENT_UNITS}_dense${N_OUT}_effbs${BATCH_SIZE}_microbs${BATCH_SIZE}_lr${EFFECTIVE_LR}_p1-40_2a30_2b30_2c30_p3-170"
+JOB_TAG="memoq_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_gru${STUDENT_UNITS}_dense${N_OUT}_effbs${BATCH_SIZE}_microbs${BATCH_SIZE}_lr${EFFECTIVE_LR}_p1-40_2a30_2b30_2c30_p3-170"
 
 
 
