@@ -268,7 +268,6 @@ def compute_metrics(gt, pred, label, pfn):
     pfn(f"  {label:12s}  RMSE={rmse:.4f}  r={r:.4f}  1σ-cov={cov:.1f}%")
     return rmse, float(r), cov
 
-
 def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     N, T, C = gt_seqs.shape
     results = {}

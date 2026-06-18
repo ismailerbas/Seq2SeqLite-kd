@@ -550,7 +550,7 @@ def evaluate_student_run(
     sys.stdout.flush()
 
     # ── SDF metrics (test_sdf_metrics.json) ───────────────────────────────────
-    pf("  SDF-domain metrics (RMSE, R², L2-norm, DTW):")
+    pf("  SDF-domain metrics (RMSE, R², L2-norm):")
     sys.stdout.flush()
     sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
     sdf_metrics = compute_sdf_metrics(
