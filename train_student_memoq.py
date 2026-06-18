@@ -3902,14 +3902,25 @@ def parse_args():
 # ==============================================================================
 
 def make_job_name(args) -> str:
+    effective_batch = args.batch_size
+    micro_batch     = args.batch_size
+    if args.no_lr_scaling:
+        effective_lr = args.lr
+    else:
+        effective_lr = args.lr * (args.batch_size / args.ref_batch_size)
+    lr_str = f"{effective_lr:.0e}"
     return (
         f"memoq"
-        f"_b{args.bits_kernel}k{args.bits_recurrent}r{args.bits_activation}a{args.bits_state}s"
+        f"_b{args.bits_kernel}"
+        f"k{args.bits_bias}"
+        f"r{args.bits_recurrent}"
+        f"a{args.bits_activation}"
+        f"s{args.bits_state}"
         f"_gru{args.student_units}"
         f"_dense{args.n_out}"
-        f"_effbs{args.batch_size}"
-        f"_microbs{args.batch_size}"
-        f"_lr{args.effective_lr:.0e}"
+        f"_effbs{effective_batch}"
+        f"_microbs{micro_batch}"
+        f"_lr{lr_str}"
         f"_p1-{args.memoq_warmup_epochs}"
         f"_2a{args.memoq_stage2a_epochs}"
         f"_2b{args.memoq_stage2b_epochs}"
