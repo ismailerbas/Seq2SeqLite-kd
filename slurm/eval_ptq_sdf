@@ -5,7 +5,7 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --time=08:00:00
+#SBATCH --time=01:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
 
@@ -15,7 +15,7 @@
 # teacher_best.weights.h5, applies symmetric per-tensor weight-only
 # quantization at 8-bit and/or 16-bit, runs batched GPU inference on the
 # frozen test split, and saves results under:
-#   /scratch/nmi/results/ptq/ptq_{bits}bit_{run_name}/
+#   /scratch/nmi/ptq/ptq_{bits}bit_{run_name}/
 #
 # No TFLite.  Quantized weights are set back via layer.set_weights() and
 # inference runs at full float32 speed on GPU using the normal Keras path.
@@ -99,7 +99,7 @@ export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
 export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
 export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
 mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
-mkdir -p "${RESULTS_PATH}/results/ptq"
+mkdir -p "${RESULTS_PATH}/ptq"
 
 # --- Log ---
 echo "============================================================"
@@ -166,10 +166,10 @@ echo "============================================================"
 echo "Eval Exit Code: ${EXIT_CODE}"
 if [ ${EXIT_CODE} -eq 0 ]; then
     echo "PTQ ${BITS}-bit evaluation completed successfully."
-    echo "Results saved under: ${RESULTS_PATH}/results/ptq/"
-    echo "  Subdirs  : $(find "${RESULTS_PATH}/results/ptq" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
-    echo "  JSONs    : $(find "${RESULTS_PATH}/results/ptq" -name "*.json" 2>/dev/null | wc -l)"
-    echo "  PNGs     : $(find "${RESULTS_PATH}/results/ptq" -name "*.png"  2>/dev/null | wc -l)"
+    echo "Results saved under: ${RESULTS_PATH}/ptq/"
+    echo "  Subdirs  : $(find "${RESULTS_PATH}/ptq" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l)"
+    echo "  JSONs    : $(find "${RESULTS_PATH}/ptq" -name "*.json" 2>/dev/null | wc -l)"
+    echo "  PNGs     : $(find "${RESULTS_PATH}/ptq" -name "*.png"  2>/dev/null | wc -l)"
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
