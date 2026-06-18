@@ -273,42 +273,15 @@ def compute_metrics(gt, pred, label, pfn):
 
 
 def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
-    """
-    Compute the 4 paper metrics (Table 1/2/3) on raw SDF output sequences.
-
-    gt_seqs   : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
-    pred_seqs : np.ndarray shape (N, T, C)  — student predictions
-    channel_names : list of str, length C   — e.g. ["ch0_full","ch1_short","ch2_long"]
-    pfn       : print function
-
-    Returns a dict keyed by channel name, each containing:
-        rmse, r2_score, l2_norm, dtw_distance  (all per-sample means)
-
-    RMSE     : sqrt(mean over samples and timesteps of squared error)
-    R²       : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
-    L2-norm  : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
-    DTW      : mean over samples of FastDTW distance (abs scalar distance per step)
-
-    NOTE: fastdtw is called with dist=lambda a, b: abs(float(a) - float(b))
-    because the sequences are 1-D float arrays and scipy.spatial.distance.euclidean
-    raises ValueError("Input vector should be 1-D.") when called on numpy scalar
-    elements on numpy 1.23.x / scipy 1.9.x (the environment used here: TF 2.10.1).
-    The lambda is mathematically identical to euclidean for scalar pairs.
-    """
     N, T, C = gt_seqs.shape
     results = {}
 
-    def _scalar_dist(a, b):
-        return abs(float(a) - float(b))
-
     for c, ch_name in enumerate(channel_names):
-        gt_c   = gt_seqs[:, :, c].astype(np.float64)    # (N, T)  float64 for fastdtw
-        pred_c = pred_seqs[:, :, c].astype(np.float64)  # (N, T)
+        gt_c   = gt_seqs[:, :, c]
+        pred_c = pred_seqs[:, :, c]
 
-        # ── RMSE ─────────────────────────────────────────────────────────────
         rmse = float(np.sqrt(np.mean((gt_c - pred_c) ** 2)))
 
-        # ── R² ───────────────────────────────────────────────────────────────
         ss_res = np.sum((gt_c - pred_c) ** 2, axis=1)
         ss_tot = np.sum((gt_c - gt_c.mean(axis=1, keepdims=True)) ** 2, axis=1)
         r2_per_sample = np.where(
@@ -318,42 +291,18 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         )
         r2 = float(np.mean(r2_per_sample))
 
-        # ── L2-norm ──────────────────────────────────────────────────────────
         l2_per_sample = np.sqrt(np.sum((gt_c - pred_c) ** 2, axis=1))
         l2_norm = float(np.mean(l2_per_sample))
 
-        # ── DTW ──────────────────────────────────────────────────────────────
-        dtw_total = 0.0
-        print_every_dtw = max(1, N // 10)
-        t0_dtw = time.time()
-        pfn(
-            f"  [SDF DTW] channel={ch_name}  N={N:,}  T={T}  "
-            f"computing FastDTW (radius=1, scalar dist)..."
-        )
-        sys.stdout.flush()
-        for i in range(N):
-            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=_scalar_dist)
-            dtw_total += dist
-            if (i + 1) % print_every_dtw == 0 or (i + 1) == N:
-                pct = 100.0 * (i + 1) / N
-                elapsed_dtw = time.time() - t0_dtw
-                pfn(
-                    f"  [SDF DTW]   {i + 1:>8,}/{N:,}  ({pct:5.1f}%)  "
-                    f"elapsed={elapsed_dtw / 60:.1f}min"
-                )
-                sys.stdout.flush()
-        dtw_distance = float(dtw_total / N)
-
         results[ch_name] = {
-            "rmse":         rmse,
-            "r2_score":     r2,
-            "l2_norm":      l2_norm,
-            "dtw_distance": dtw_distance,
+            "rmse":     rmse,
+            "r2_score": r2,
+            "l2_norm":  l2_norm,
         }
 
         pfn(
             f"  SDF {ch_name:12s}  RMSE={rmse:.4f}  R²={r2:.4f}  "
-            f"L2={l2_norm:.4f}  DTW={dtw_distance:.4f}"
+            f"L2={l2_norm:.4f}"
         )
         sys.stdout.flush()
 

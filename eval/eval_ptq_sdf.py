@@ -390,33 +390,26 @@ def compute_metrics(gt, pred, label, pfn):
     pfn(f"  {label:12s}  RMSE={rmse:.4f}  r={r:.4f}  1σ-cov={cov:.1f}%")
     return rmse, float(r), cov
 
-
 def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     """
-    Compute the 4 paper metrics (Table 2) on raw SDF output sequences.
+    Compute the 3 paper metrics (Table 2) on raw SDF output sequences.
+    DTW has been removed — it caused crashes with fastdtw+scipy.euclidean
+    on scalar 1D sequence elements.
 
-    gt_seqs   : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
-    pred_seqs : np.ndarray shape (N, T, C)  — model predictions
-    channel_names : list of str, length C   — ["ch0_full","ch1_short","ch2_long"]
-    pfn       : print function
+    gt_seqs       : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
+    pred_seqs     : np.ndarray shape (N, T, C)  — model predictions
+    channel_names : list of str, length C       — ["ch0_full","ch1_short","ch2_long"]
+    pfn           : print function
 
     Returns a dict keyed by channel name, each containing:
-        rmse, r2_score, l2_norm, dtw_distance  (all per-sample means)
+        rmse, r2_score, l2_norm  (all per-sample means)
 
-    RMSE     : sqrt(mean over samples and timesteps of squared error)
-    R²       : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
-    L2-norm  : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
-    DTW      : mean over samples of FastDTW distance with abs scalar dist.
-               fastdtw passes individual float scalars (not 1D arrays) to the
-               dist callable for 1D sequences — scipy euclidean crashes on
-               scalars ("Input vector should be 1-D"), so we use a plain
-               abs(float(a) - float(b)) lambda instead.
+    RMSE    : sqrt(mean over samples and timesteps of squared error)
+    R²      : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
+    L2-norm : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
     """
     N, T, C = gt_seqs.shape
     results = {}
-
-    def _scalar_dist(a, b):
-        return abs(float(a) - float(b))
 
     for c, ch_name in enumerate(channel_names):
         gt_c   = gt_seqs[:, :, c]    # (N, T)
@@ -439,38 +432,15 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         l2_per_sample = np.sqrt(np.sum((gt_c - pred_c) ** 2, axis=1))
         l2_norm = float(np.mean(l2_per_sample))
 
-        # ── DTW ──────────────────────────────────────────────────────────────
-        dtw_total = 0.0
-        print_every_dtw = max(1, N // 10)
-        t0_dtw = time.time()
-        pfn(
-            f"  [SDF DTW] channel={ch_name}  N={N:,}  T={T}  "
-            f"computing FastDTW (radius=1)..."
-        )
-        sys.stdout.flush()
-        for i in range(N):
-            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=_scalar_dist)
-            dtw_total += dist
-            if (i + 1) % print_every_dtw == 0 or (i + 1) == N:
-                pct = 100.0 * (i + 1) / N
-                elapsed_dtw = time.time() - t0_dtw
-                pfn(
-                    f"  [SDF DTW]   {i + 1:>8,}/{N:,}  ({pct:5.1f}%)  "
-                    f"elapsed={elapsed_dtw / 60:.1f}min"
-                )
-                sys.stdout.flush()
-        dtw_distance = float(dtw_total / N)
-
         results[ch_name] = {
-            "rmse":         rmse,
-            "r2_score":     r2,
-            "l2_norm":      l2_norm,
-            "dtw_distance": dtw_distance,
+            "rmse":     rmse,
+            "r2_score": r2,
+            "l2_norm":  l2_norm,
         }
 
         pfn(
             f"  SDF {ch_name:12s}  RMSE={rmse:.4f}  R²={r2:.4f}  "
-            f"L2={l2_norm:.4f}  DTW={dtw_distance:.4f}"
+            f"L2={l2_norm:.4f}"
         )
         sys.stdout.flush()
 
@@ -761,7 +731,8 @@ def evaluate_one_run_at_bits(
     sys.stdout.flush()
 
     # ── SDF metrics ───────────────────────────────────────────────────────────
-    pf(f"    SDF-domain metrics (RMSE, R², L2-norm, DTW):")
+    pf(f"    SDF-domain metrics (RMSE, R², L2-norm):")
+
     sys.stdout.flush()
     sdf_channel_names = ["ch0_full", "ch1_short", "ch2_long"]
     sdf_metrics = compute_sdf_metrics(
