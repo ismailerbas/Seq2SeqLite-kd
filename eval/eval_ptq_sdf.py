@@ -105,8 +105,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from fastdtw import fastdtw
-from scipy.spatial.distance import euclidean
 from scipy.stats import pearsonr
 from tqdm import tqdm
 
@@ -350,7 +348,7 @@ def run_inference(model, enc_arr, seq_len, n_out, batch_size, pf):
         e     = min(s + batch_size, n)
         enc_b = tf.constant(enc_arr[s:e], dtype=tf.float32)
         dec_b = tf.zeros((e - s, seq_len, 1), dtype=tf.float32)
-        preds[s:e] = model([enc_b, dec_b], training=False).numpy()
+        preds[s:e] = model({"enc_input": enc_b, "dec_input": dec_b}, training=False).numpy()
     return preds
 
 
@@ -391,34 +389,15 @@ def compute_metrics(gt, pred, label, pfn):
     return rmse, float(r), cov
 
 def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
-    """
-    Compute the 3 paper metrics (Table 2) on raw SDF output sequences.
-    DTW has been removed — it caused crashes with fastdtw+scipy.euclidean
-    on scalar 1D sequence elements.
-
-    gt_seqs       : np.ndarray shape (N, T, C)  — ground truth decoder targets (res)
-    pred_seqs     : np.ndarray shape (N, T, C)  — model predictions
-    channel_names : list of str, length C       — ["ch0_full","ch1_short","ch2_long"]
-    pfn           : print function
-
-    Returns a dict keyed by channel name, each containing:
-        rmse, r2_score, l2_norm  (all per-sample means)
-
-    RMSE    : sqrt(mean over samples and timesteps of squared error)
-    R²      : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
-    L2-norm : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
-    """
     N, T, C = gt_seqs.shape
     results = {}
 
     for c, ch_name in enumerate(channel_names):
-        gt_c   = gt_seqs[:, :, c]    # (N, T)
-        pred_c = pred_seqs[:, :, c]  # (N, T)
+        gt_c   = gt_seqs[:, :, c]
+        pred_c = pred_seqs[:, :, c]
 
-        # ── RMSE ─────────────────────────────────────────────────────────────
         rmse = float(np.sqrt(np.mean((gt_c - pred_c) ** 2)))
 
-        # ── R² ───────────────────────────────────────────────────────────────
         ss_res = np.sum((gt_c - pred_c) ** 2, axis=1)
         ss_tot = np.sum((gt_c - gt_c.mean(axis=1, keepdims=True)) ** 2, axis=1)
         r2_per_sample = np.where(
@@ -428,7 +407,6 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         )
         r2 = float(np.mean(r2_per_sample))
 
-        # ── L2-norm ──────────────────────────────────────────────────────────
         l2_per_sample = np.sqrt(np.sum((gt_c - pred_c) ** 2, axis=1))
         l2_norm = float(np.mean(l2_per_sample))
 
@@ -447,7 +425,7 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     return results
 
 # ==============================================================================
-# Scatter plot helpers
+# Scatter plot helper
 # ==============================================================================
 
 def save_scatter_plots(
@@ -541,7 +519,7 @@ def find_teacher_run_dirs(results_dir):
     """
     run_dirs = []
     for root, dirs, files in os.walk(results_dir):
-        if "teacher_best.weights.h5" in files:
+        if any(f.startswith("teacher_best") and f.endswith(".weights.h5") for f in files):
             run_dirs.append(root)
     run_dirs.sort()
     return run_dirs
@@ -609,7 +587,15 @@ def evaluate_one_run_at_bits(
         pf(f"    SKIP (already exists): {sdf_metrics_path}")
         return
 
-    ckpt_path = os.path.join(run_dir, "teacher_best.weights.h5")
+
+    ckpt_matches = sorted(
+        f for f in os.listdir(run_dir)
+        if f.startswith("teacher_best") and f.endswith(".weights.h5")
+    )
+    if not ckpt_matches:
+        raise FileNotFoundError(f"No teacher_best*.weights.h5 found in {run_dir}")
+    ckpt_path = os.path.join(run_dir, ckpt_matches[0])
+
     pf(f"    Checkpoint : {ckpt_path}")
     pf(f"    Output dir : {job_dir}")
 
