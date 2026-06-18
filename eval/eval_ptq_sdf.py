@@ -406,10 +406,17 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     RMSE     : sqrt(mean over samples and timesteps of squared error)
     R²       : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
     L2-norm  : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
-    DTW      : mean over samples of FastDTW distance (euclidean path cost)
+    DTW      : mean over samples of FastDTW distance with abs scalar dist.
+               fastdtw passes individual float scalars (not 1D arrays) to the
+               dist callable for 1D sequences — scipy euclidean crashes on
+               scalars ("Input vector should be 1-D"), so we use a plain
+               abs(float(a) - float(b)) lambda instead.
     """
     N, T, C = gt_seqs.shape
     results = {}
+
+    def _scalar_dist(a, b):
+        return abs(float(a) - float(b))
 
     for c, ch_name in enumerate(channel_names):
         gt_c   = gt_seqs[:, :, c]    # (N, T)
@@ -442,7 +449,7 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         )
         sys.stdout.flush()
         for i in range(N):
-            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=euclidean)
+            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=_scalar_dist)
             dtw_total += dist
             if (i + 1) % print_every_dtw == 0 or (i + 1) == N:
                 pct = 100.0 * (i + 1) / N
@@ -468,7 +475,6 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         sys.stdout.flush()
 
     return results
-
 
 # ==============================================================================
 # Scatter plot helpers
