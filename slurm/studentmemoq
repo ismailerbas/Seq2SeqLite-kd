@@ -261,11 +261,9 @@ if [ "${RESUME_FLAG}" = "--resume" ]; then
     done
 
     if [ -z "${FOUND_CKPT}" ]; then
-        echo "FATAL: --resume passed but no checkpoint found in:"
-        echo "  ${JOB_RESULTS_DIR}"
+        echo "  No checkpoint found in ${JOB_RESULTS_DIR}."
         echo "  Checked: student_best.weights.h5, stage2c_best.weights.h5, stage2b_best.weights.h5, stage2a_best.weights.h5, phase1_best.weights.h5"
-        echo "Cannot resume without a checkpoint. Run without --resume for a fresh start."
-        exit 1
+        echo "  No prior checkpoint -- train_student_memoq.py will start from Phase 1 (--resume is a no-op for a fresh directory)."
     fi
 
     if [ ! -f "${RESUME_STATE}" ]; then
