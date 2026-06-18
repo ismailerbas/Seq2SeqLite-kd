@@ -531,10 +531,17 @@ def save_residual_plots(
 def find_teacher_run_dirs(results_dir):
     """
     Walk results_dir recursively and return every directory that contains
-    teacher_best.weights.h5.
+    teacher_best.weights.h5 AND whose basename starts with 'teacher_training_'.
+
+    Directories such as the root results_dir itself, 'm740bp',
+    'teacher_gru128x128 12vials', 'teklayer_gru128', etc. are intentionally
+    excluded.  Only teacher_training_* runs are valid PTQ targets.
     """
     run_dirs = []
     for root, dirs, files in os.walk(results_dir):
+        basename = os.path.basename(os.path.normpath(root))
+        if not basename.startswith("teacher_training_"):
+            continue
         if any(f.startswith("teacher_best") and f.endswith(".weights.h5") for f in files):
             run_dirs.append(root)
     run_dirs.sort()
@@ -616,20 +623,46 @@ def evaluate_one_run_at_bits(
     pf(f"    Output dir : {job_dir}")
 
     # ── Resolve per-run hyper-params ─────────────────────────────────────────
+    # Priority 1: parse units from the checkpoint filename itself.
+    # teacher_best_gru128x128.weights.h5  → units=128
+    # teacher_best_gru64x16.weights.h5    → units=64  (encoder units; asymmetric runs)
+    # teacher_best_gru16x16.weights.h5    → units=16
+    # teacher_best_gru45x45.weights.h5    → units=45
+    # teacher_best_gru128.weights.h5      → units=128 (single number, symmetric)
+    # teacher_best.weights.h5             → no number → fall through to JSON / CLI default
+    import re as _re
     teacher_units  = default_teacher_units
     teacher_layers = default_teacher_layers
+
+    ckpt_basename = os.path.basename(ckpt_path)
+    _m = _re.search(r"gru(\d+)(?:x(\d+))?", ckpt_basename)
+    if _m:
+        teacher_units = int(_m.group(1))
+        pf(
+            f"    Checkpoint filename units: {teacher_units} "
+            f"(parsed from '{ckpt_basename}')"
+        )
+    else:
+        args_path = os.path.join(run_dir, "teacher_args.json")
+        if os.path.exists(args_path):
+            with open(args_path, "r") as f:
+                run_args = json.load(f)
+            teacher_units  = int(run_args.get("teacher_units",  default_teacher_units))
+            teacher_layers = int(run_args.get("teacher_layers", default_teacher_layers))
+            pf(f"    teacher_args.json: units={teacher_units}  layers={teacher_layers}")
+        else:
+            pf(
+                f"    teacher_args.json not found — using CLI defaults: "
+                f"units={teacher_units}  layers={teacher_layers}"
+            )
+
+    # Regardless of units source, always read teacher_layers from teacher_args.json
+    # if it exists, since the filename does not encode layer count.
     args_path = os.path.join(run_dir, "teacher_args.json")
     if os.path.exists(args_path):
         with open(args_path, "r") as f:
             run_args = json.load(f)
-        teacher_units  = int(run_args.get("teacher_units",  default_teacher_units))
         teacher_layers = int(run_args.get("teacher_layers", default_teacher_layers))
-        pf(f"    teacher_args.json: units={teacher_units}  layers={teacher_layers}")
-    else:
-        pf(
-            f"    teacher_args.json not found — using CLI defaults: "
-            f"units={teacher_units}  layers={teacher_layers}"
-        )
 
     # ── Save ptq_args.json ───────────────────────────────────────────────────
     ptq_args = {
