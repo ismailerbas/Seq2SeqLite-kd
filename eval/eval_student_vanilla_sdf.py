@@ -287,14 +287,23 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
     RMSE     : sqrt(mean over samples and timesteps of squared error)
     R²       : 1 - SS_res / SS_tot  (computed sample-wise then meaned)
     L2-norm  : mean over samples of sqrt(sum_t (gt_t - pred_t)^2)
-    DTW      : mean over samples of FastDTW distance (euclidean path cost)
+    DTW      : mean over samples of FastDTW distance (abs scalar distance per step)
+
+    NOTE: fastdtw is called with dist=lambda a, b: abs(float(a) - float(b))
+    because the sequences are 1-D float arrays and scipy.spatial.distance.euclidean
+    raises ValueError("Input vector should be 1-D.") when called on numpy scalar
+    elements on numpy 1.23.x / scipy 1.9.x (the environment used here: TF 2.10.1).
+    The lambda is mathematically identical to euclidean for scalar pairs.
     """
     N, T, C = gt_seqs.shape
     results = {}
 
+    def _scalar_dist(a, b):
+        return abs(float(a) - float(b))
+
     for c, ch_name in enumerate(channel_names):
-        gt_c   = gt_seqs[:, :, c]    # (N, T)
-        pred_c = pred_seqs[:, :, c]  # (N, T)
+        gt_c   = gt_seqs[:, :, c].astype(np.float64)    # (N, T)  float64 for fastdtw
+        pred_c = pred_seqs[:, :, c].astype(np.float64)  # (N, T)
 
         # ── RMSE ─────────────────────────────────────────────────────────────
         rmse = float(np.sqrt(np.mean((gt_c - pred_c) ** 2)))
@@ -319,11 +328,11 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         t0_dtw = time.time()
         pfn(
             f"  [SDF DTW] channel={ch_name}  N={N:,}  T={T}  "
-            f"computing FastDTW (radius=1)..."
+            f"computing FastDTW (radius=1, scalar dist)..."
         )
         sys.stdout.flush()
         for i in range(N):
-            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=euclidean)
+            dist, _ = fastdtw(gt_c[i], pred_c[i], radius=1, dist=_scalar_dist)
             dtw_total += dist
             if (i + 1) % print_every_dtw == 0 or (i + 1) == N:
                 pct = 100.0 * (i + 1) / N
@@ -349,7 +358,6 @@ def compute_sdf_metrics(gt_seqs, pred_seqs, channel_names, pfn):
         sys.stdout.flush()
 
     return results
-
 
 # ==============================================================================
 # Scatter and residual plot helpers
