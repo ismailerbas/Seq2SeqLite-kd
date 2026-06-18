@@ -2809,9 +2809,10 @@ def build_final_hidden_model(final_qkeras_student):
     enc_input  = final_qkeras_student.input[0]
     dec_input  = final_qkeras_student.input[1]
 
-    enc_layer   = final_qkeras_student.get_layer("sencgru")
-    dec_layer   = final_qkeras_student.get_layer("sdecgru")
-    dense_layer = final_qkeras_student.get_layer("sdec_dense")
+    enc_layer      = final_qkeras_student.get_layer("sencgru")
+    dec_layer      = final_qkeras_student.get_layer("sdecgru")
+    dense_raw_layer = final_qkeras_student.get_layer("sdec_dense_raw")
+    dense_act_layer = final_qkeras_student.get_layer("sdec_dense")
 
     enc_result = enc_layer(enc_input)
     if isinstance(enc_result, (list, tuple)):
@@ -2825,13 +2826,15 @@ def build_final_hidden_model(final_qkeras_student):
     else:
         dec_hidden_seq = dec_result
 
-    seq_output = dense_layer(dec_hidden_seq)
+    seq_output_raw = dense_raw_layer(dec_hidden_seq)
+    seq_output     = dense_act_layer(seq_output_raw)
 
     return keras.models.Model(
         inputs=[enc_input, dec_input],
         outputs=[seq_output, dec_hidden_seq],
         name="memoq_final_hidden_model",
     )
+
 
 def make_dist_memoq_train_final(
     strategy,
