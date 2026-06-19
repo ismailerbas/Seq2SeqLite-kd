@@ -612,7 +612,10 @@ def build_phase2_student(seq_len, n_out, student_units,
     enc_hidden_seq, enc_state, enc_z_logits = enc_rnn_layer(enc_inputs)
     dec_hidden_seq, dec_state, dec_z_logits = dec_rnn_layer(dec_inputs, initial_state=enc_state)
 
-    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
+    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hidden_seq)
+    s_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x), name="sdec_dense"
+    )(s_output_raw)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
