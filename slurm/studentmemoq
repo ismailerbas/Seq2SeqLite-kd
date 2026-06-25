@@ -388,42 +388,63 @@ fi
 # MemoQ total epoch count = warmup + 2A + 2B + 2C + finetune
 # = 40 + 30 + 30 + 30 + 170 = 300 (matches TOTAL_EPOCHS below).
 # ============================================================================
-
 RESUME_STATE_FILE="${SAVE_DIR}/results/${JOB_TAG}/resume_state.json"
-TOTAL_EPOCHS=300
-PATIENCE_LIMIT=30
+COMPLETION_FLAG="${SAVE_DIR}/results/${JOB_TAG}/training_complete.flag"
 DO_RESUBMIT=0
 
 if [ "${RESUBMIT}" = "1" ]; then
     echo "============================================================"
     echo "RESUBMIT reason: SIGUSR1 fired or SIGTERM preemption detected."
-    DO_RESUBMIT=1
+    # Even on SIGUSR1 resubmit, check if training is actually already done.
+    # This prevents the edge case where SIGUSR1 fires during the final
+    # evaluation pass after mark_training_complete() was already written.
+    if [ -f "${COMPLETION_FLAG}" ]; then
+        echo "  training_complete.flag found — training was finished before preemption."
+        echo "  No resubmission needed."
+        DO_RESUBMIT=0
+    else
+        DO_RESUBMIT=1
+    fi
 
 elif [ "${EXIT_CODE}" = "0" ]; then
-    if [ -f "${RESUME_STATE_FILE}" ]; then
-        NEXT_EPOCH=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('start_epoch', 0))" 2>/dev/null)
-        PATIENCE_CT=$(python -c "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(s.get('patience_ct', 0))" 2>/dev/null)
-        echo "============================================================"
-        echo "Python exited 0. Checking resume_state.json..."
-        echo "  start_epoch  = ${NEXT_EPOCH}"
-        echo "  patience_ct  = ${PATIENCE_CT}"
-        echo "  total epochs = ${TOTAL_EPOCHS}"
-        echo "  patience lim = ${PATIENCE_LIMIT}"
-        if [ -n "${NEXT_EPOCH}" ] && [ "${NEXT_EPOCH}" -lt "${TOTAL_EPOCHS}" ] && \
-           [ -n "${PATIENCE_CT}" ] && [ "${PATIENCE_CT}" -lt "${PATIENCE_LIMIT}" ]; then
-            echo "  Training not complete (${NEXT_EPOCH}/${TOTAL_EPOCHS} epochs, patience ${PATIENCE_CT}/${PATIENCE_LIMIT})."
-            echo "RESUBMIT reason: clean exit but epochs remaining."
-            DO_RESUBMIT=1
-        else
-            echo "  Training complete or early-stopped. No resubmission needed."
-            DO_RESUBMIT=0
-        fi
+    echo "============================================================"
+    echo "Python exited 0. Checking training_complete.flag..."
+
+    if [ -f "${COMPLETION_FLAG}" ]; then
+        echo "  training_complete.flag found — all phases finished."
+        echo "  No resubmission needed."
+        DO_RESUBMIT=0
+
+    elif [ -f "${RESUME_STATE_FILE}" ]; then
+        # Completion flag not written (e.g. Python was killed during final
+        # epoch save but exited 0 via a race). Read stage from resume_state.json
+        # using MemoQ schema (stage / epoch_in_stage, NOT start_epoch).
+        RESUME_STAGE=$(python -c "
+import json, sys
+try:
+    s = json.load(open('${RESUME_STATE_FILE}'))
+    print(s.get('stage', 'P1'))
+except Exception as e:
+    print('P1')
+" 2>/dev/null)
+        RESUME_EP=$(python -c "
+import json, sys
+try:
+    s = json.load(open('${RESUME_STATE_FILE}'))
+    print(int(s.get('epoch_in_stage', 0)))
+except Exception as e:
+    print(0)
+" 2>/dev/null)
+        echo "  resume_state.json found — stage=${RESUME_STAGE}  epoch_in_stage=${RESUME_EP}"
+        echo "  (No completion flag — treating as incomplete run, resubmitting.)"
+        DO_RESUBMIT=1
+
     else
-        echo "============================================================"
-        echo "Python exited 0 but resume_state.json not found at:"
-        echo "  ${RESUME_STATE_FILE}"
-        echo "Cannot determine training state. Not resubmitting to avoid loop."
-        echo "If training is incomplete, resubmit manually with --resume."
+        echo "  No training_complete.flag and no resume_state.json found at:"
+        echo "    ${COMPLETION_FLAG}"
+        echo "    ${RESUME_STATE_FILE}"
+        echo "  Cannot determine training state. Not resubmitting to avoid loop."
+        echo "  If training is incomplete, resubmit manually with --resume."
         DO_RESUBMIT=0
     fi
 
@@ -433,7 +454,6 @@ else
     echo "Fix the error first, then resubmit manually with --resume."
     DO_RESUBMIT=0
 fi
-
 
 
 # --- Execute resubmission ---

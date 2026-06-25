@@ -2190,21 +2190,38 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
         dst_dense = final_qkeras_student.get_layer("sdec_dense")
         src_w = src_dense.get_weights()
         dst_w = dst_dense.get_weights()
-        if len(src_w) == len(dst_w) and all(
-            s.shape == d.shape for s, d in zip(src_w, dst_w)
-        ):
-            dst_dense.set_weights(src_w)
-            pf(f"[EXPORT]   sdec_dense: OK {len(src_w)} tensors transferred")
-        else:
+        if len(src_w) < 2:
             pf(
-                f"[EXPORT]   sdec_dense: shape mismatch "
-                f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]} — SKIPPED"
+                f"[EXPORT]   sdec_dense: source has only {len(src_w)} tensors, "
+                f"cannot transfer kernel+bias — SKIPPED"
             )
+        else:
+            # Overwrite by index: slot 0 = kernel, slot 1 = bias.
+            # Any trailing tensors (QKeras per-tensor scale vars) are kept
+            # at their default values so quantizer state is not corrupted.
+            new_w = list(dst_w)
+            if new_w[0].shape != src_w[0].shape:
+                pf(
+                    f"[EXPORT]   sdec_dense: kernel shape mismatch "
+                    f"src={src_w[0].shape} dst={new_w[0].shape} — SKIPPED"
+                )
+            elif new_w[1].shape != src_w[1].shape:
+                pf(
+                    f"[EXPORT]   sdec_dense: bias shape mismatch "
+                    f"src={src_w[1].shape} dst={new_w[1].shape} — SKIPPED"
+                )
+            else:
+                new_w[0] = src_w[0]
+                new_w[1] = src_w[1]
+                dst_dense.set_weights(new_w)
+                pf(
+                    f"[EXPORT]   sdec_dense: OK 2 tensors transferred "
+                    f"(dst had {len(dst_w)} total slots, trailing slots preserved)"
+                )
     except Exception as exc:
         pf(f"[EXPORT]   sdec_dense: FAILED ({exc}) — skipped")
 
     sys.stdout.flush()
-
 # ==============================================================================
 # MemoQGRUCell — custom training-time GRU cell with split gate variables.
 #
@@ -2501,6 +2518,7 @@ def build_final_qkeras_student(
         bias_quantizer=qwb(),
         state_quantizer=qs(),
         return_state=True,
+        reset_after=True,
         name="sencgru",
     )(enc_inputs)
 
@@ -2513,6 +2531,7 @@ def build_final_qkeras_student(
         state_quantizer=qs(),
         return_sequences=True,
         return_state=True,
+        reset_after=True,
         name="sdecgru",
     )(dec_inputs, initial_state=s_enc_state)
 
@@ -2529,7 +2548,6 @@ def build_final_qkeras_student(
         outputs=s_output,
         name="memoq_final_qkeras_student",
     )
-
 
 # ==============================================================================
 # MemoQ auxiliary losses.
@@ -3714,6 +3732,12 @@ def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_
 def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
     phases_arr = history.get("phase", [])
     n_ep = len(history.get("total", []))
+
+    if n_ep == 0:
+        pf("[CURVES] history is empty (completion-flag early return) — skipping plot to preserve existing training_history.png")
+        sys.stdout.flush()
+        return
+
     epochs_arr = list(range(1, n_ep + 1))
 
     phase_colors = {
@@ -3746,10 +3770,10 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
             mask = [i for i, ph in enumerate(phases_arr) if ph == phase_tag]
             if not mask:
                 continue
-            ep_ph = [epochs_arr[i] for i in mask]
-            tr_vals = [history.get(train_key, [0]*n_ep)[i] for i in mask]
+            ep_ph   = [epochs_arr[i] for i in mask]
+            tr_vals = [history.get(train_key, [0] * n_ep)[i] for i in mask]
             ax.plot(ep_ph, tr_vals, color=ctr, label=f"{phase_tag} train", linewidth=1.2)
-            if val_key and val_key in history:
+            if val_key and val_key in history and len(history[val_key]) == n_ep:
                 va_vals = [history[val_key][i] for i in mask]
                 ax.plot(ep_ph, va_vals, color=cva, linestyle="--", label=f"{phase_tag} val", linewidth=1.0)
         ax.set_title(title, fontsize=9)
@@ -3761,7 +3785,7 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
     axes[8].text(
         0.05, 0.5,
         f"MemoQ  SEQLEN={args.seq_len}\n"
-        f"α={args.alpha}  huber_delta={args.memoq_huber_delta}\n"
+        f"alpha={args.alpha}  huber_delta={args.memoq_huber_delta}\n"
         f"bits: k={args.bits_kernel} r={args.bits_recurrent} "
         f"b={args.bits_bias} a={args.bits_activation} s={args.bits_state}\n"
         f"Student QGRU hidden={args.student_units}\n"
@@ -3788,7 +3812,6 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
     plt.close(fig)
     pf(f"Loss curves saved: {curves_path}")
     sys.stdout.flush()
-
 
 # ==============================================================================
 # evaluate_and_save — identical to vanilla_kd but uses final_qkeras_student.
@@ -3819,7 +3842,6 @@ def evaluate_and_save(
 
     preds = np.empty((n_test, seq_len, n_out), dtype=np.float32)
     n_batches = int(np.ceil(n_test / infer_batch))
-
     for b in range(n_batches):
         s = b * infer_batch
         e = min(s + infer_batch, n_test)
@@ -3830,32 +3852,33 @@ def evaluate_and_save(
     pf(f"[EVAL] Predictions complete: shape={preds.shape}")
     sys.stdout.flush()
 
-    mse_per_sample  = np.mean((preds - tgt_test) ** 2, axis=(1, 2))
-    mae_per_sample  = np.mean(np.abs(preds - tgt_test), axis=(1, 2))
-    overall_mse     = float(np.mean(mse_per_sample))
-    overall_mae     = float(np.mean(mae_per_sample))
-
-    pf(f"[EVAL] Test MSE={overall_mse:.6f}  Test MAE={overall_mae:.6f}")
-    sys.stdout.flush()
+    # ── Sequence-domain metrics (legitimate reconstruction quality) ───────────
+    mse_per_sample = np.mean((preds - tgt_test) ** 2, axis=(1, 2))
+    mae_per_sample = np.mean(np.abs(preds - tgt_test), axis=(1, 2))
+    overall_mse    = float(np.mean(mse_per_sample))
+    overall_mae    = float(np.mean(mae_per_sample))
+    pf(f"[EVAL] Seq-domain  Test MSE={overall_mse:.6f}  Test MAE={overall_mae:.6f}")
 
     channel_names = ["tau1", "tau2", "fret"] if n_out >= 3 else [f"ch{c}" for c in range(n_out)]
 
-    per_channel_mse = {}
-    per_channel_mae = {}
-    per_channel_pearson = {}
+    per_channel_seq_mse     = {}
+    per_channel_seq_mae     = {}
+    per_channel_seq_pearson = {}
     for c in range(n_out):
         ch = channel_names[c] if c < len(channel_names) else f"ch{c}"
         pred_flat = preds[:, :, c].flatten()
         tgt_flat  = tgt_test[:, :, c].flatten()
-        per_channel_mse[ch]     = float(np.mean((pred_flat - tgt_flat) ** 2))
-        per_channel_mae[ch]     = float(np.mean(np.abs(pred_flat - tgt_flat)))
-        r, _ = pearsonr(pred_flat, tgt_flat)
-        per_channel_pearson[ch] = float(r)
+        per_channel_seq_mse[ch]     = float(np.mean((pred_flat - tgt_flat) ** 2))
+        per_channel_seq_mae[ch]     = float(np.mean(np.abs(pred_flat - tgt_flat)))
+        r_seq, _                    = pearsonr(pred_flat, tgt_flat)
+        per_channel_seq_pearson[ch] = float(r_seq)
         pf(
-            f"[EVAL]   {ch}  MSE={per_channel_mse[ch]:.6f}  "
-            f"MAE={per_channel_mae[ch]:.6f}  r={per_channel_pearson[ch]:.4f}"
+            f"[EVAL]   seq {ch}  MSE={per_channel_seq_mse[ch]:.6f}  "
+            f"MAE={per_channel_seq_mae[ch]:.6f}  r={per_channel_seq_pearson[ch]:.4f}"
         )
+    sys.stdout.flush()
 
+    # ── DTW on sequence reconstructions ──────────────────────────────────────
     dtw_scores = []
     n_dtw = min(200, n_test)
     dtw_idx = np.random.choice(n_test, n_dtw, replace=False)
@@ -3865,70 +3888,175 @@ def evaluate_and_save(
         else:
             d = float("nan")
         dtw_scores.append(d)
-    mean_dtw = float(np.mean(dtw_scores))
+    mean_dtw = float(np.nanmean(dtw_scores))
     pf(f"[EVAL] Mean DTW (n={n_dtw}): {mean_dtw:.4f}")
     sys.stdout.flush()
 
+    # ── Lifetime extraction: integrates SDF channel to derive tau in ns ───────
+    # preds shape: (N, T, n_out).
+    # Channel layout (matching vanilla/teacher):
+    #   channel 0 = full decay (not used for lifetime)
+    #   channel 1 = short-lifetime component -> tau1
+    #   channel 2 = long-lifetime component  -> tau2
+    # tau = integral(ch, dt) / ch[0]  for A*exp(-t/tau): = A*tau / A = tau [ns]
+    # FRET efficiency = amp1 / (amp1 + amp2)
+    # labels_test[:,0] = tau1 [ns], labels_test[:,1] = tau2 [ns],
+    # labels_test[:,2] = fret efficiency
+    def extract_lifetimes(seq_arr, t_ns):
+        """
+        seq_arr : (N, T, n_out) float32  — predicted or target SDF sequence
+        t_ns    : (T,)          float64  — time axis in nanoseconds
+
+        Returns tau1_ns, tau2_ns, fret_eff each shape (N,).
+        Uses trapezoidal integration so the result is in the same units as t_ns.
+        Clamps near-zero amplitudes to avoid divide-by-zero.
+        """
+        if seq_arr.shape[2] < 3:
+            # Fewer than 3 output channels: fill with zeros
+            n = seq_arr.shape[0]
+            return np.zeros(n, dtype=np.float32), np.zeros(n, dtype=np.float32), np.full(n, 0.5, dtype=np.float32)
+
+        ch1 = seq_arr[:, :, 1].astype(np.float64)   # short component
+        ch2 = seq_arr[:, :, 2].astype(np.float64)   # long component
+
+        int1 = np.trapz(ch1, t_ns, axis=1)           # (N,)
+        int2 = np.trapz(ch2, t_ns, axis=1)           # (N,)
+
+        amp1 = ch1[:, 0]                              # amplitude at t=0
+        amp2 = ch2[:, 0]
+
+        tau1_ns = np.where(np.abs(amp1) > 1e-9, int1 / amp1, 0.0).astype(np.float32)
+        tau2_ns = np.where(np.abs(amp2) > 1e-9, int2 / amp2, 0.0).astype(np.float32)
+
+        denom    = amp1 + amp2
+        fret_eff = np.where(np.abs(denom) > 1e-9, amp1 / denom, 0.5).astype(np.float32)
+
+        return tau1_ns, tau2_ns, fret_eff
+
+    t_ns = np.arange(seq_len, dtype=np.float64) * gate_width_ns   # (T,)
+
+    tau1_pred, tau2_pred, fret_pred = extract_lifetimes(preds,    t_ns)
+    tau1_tgt,  tau2_tgt,  fret_tgt  = extract_lifetimes(tgt_test, t_ns)
+
+    # ── Ground-truth lifetimes from labels_test (scalar parameters in ns) ────
+    # Use labels_test[:,0], labels_test[:,1], labels_test[:,2] as GT for the
+    # ns scatter plots (these are the physical parameters the dataset was
+    # generated with — independent of the SDF sequence representation).
+    # Fallback to sequence-derived GT if labels_test is missing or wrong shape.
+    if labels_test is not None and labels_test.shape[0] == n_test and labels_test.shape[1] >= 3:
+        tau1_gt  = labels_test[:, 0].astype(np.float32)
+        tau2_gt  = labels_test[:, 1].astype(np.float32)
+        fret_gt  = labels_test[:, 2].astype(np.float32)
+        gt_source = "labels_test (scalar parameters)"
+    else:
+        pf("[EVAL] WARNING: labels_test missing or wrong shape — using sequence-derived GT for scatter")
+        tau1_gt  = tau1_tgt
+        tau2_gt  = tau2_tgt
+        fret_gt  = fret_tgt
+        gt_source = "sequence-derived GT (labels_test unavailable)"
+
+    pf(f"[EVAL] Lifetime scatter GT source: {gt_source}")
+
+    # ── Lifetime Pearson r (the scientifically meaningful numbers) ────────────
+    lifetime_gt_arr   = [tau1_gt,  tau2_gt,  fret_gt]
+    lifetime_pred_arr = [tau1_pred, tau2_pred, fret_pred]
+    lifetime_axis_lim = [
+        (0.0, max(float(tau1_gt.max()), float(tau1_pred.max()), 0.01) * 1.05),
+        (0.0, max(float(tau2_gt.max()), float(tau2_pred.max()), 0.01) * 1.05),
+        (0.0, 1.0),
+    ]
+
+    per_channel_lt_mse     = {}
+    per_channel_lt_mae     = {}
+    per_channel_lt_pearson = {}
+    for c, ch in enumerate(channel_names[:n_out] if n_out <= 3 else channel_names):
+        gt_c   = lifetime_gt_arr[c]
+        pred_c = lifetime_pred_arr[c]
+        per_channel_lt_mse[ch]     = float(np.mean((pred_c - gt_c) ** 2))
+        per_channel_lt_mae[ch]     = float(np.mean(np.abs(pred_c - gt_c)))
+        r_lt, _                    = pearsonr(gt_c.astype(np.float64), pred_c.astype(np.float64))
+        per_channel_lt_pearson[ch] = float(r_lt)
+        pf(
+            f"[EVAL]   lifetime {ch}  MSE={per_channel_lt_mse[ch]:.6f}  "
+            f"MAE={per_channel_lt_mae[ch]:.6f}  r={per_channel_lt_pearson[ch]:.4f}"
+        )
+    sys.stdout.flush()
+
+    # ── Write metrics JSON ────────────────────────────────────────────────────
     metrics = {
-        "overall_mse":       overall_mse,
-        "overall_mae":       overall_mae,
-        "mean_dtw":          mean_dtw,
-        "per_channel_mse":   per_channel_mse,
-        "per_channel_mae":   per_channel_mae,
-        "per_channel_pearson": per_channel_pearson,
+        "overall_seq_mse":          overall_mse,
+        "overall_seq_mae":          overall_mae,
+        "mean_dtw":                 mean_dtw,
+        "per_channel_seq_mse":      per_channel_seq_mse,
+        "per_channel_seq_mae":      per_channel_seq_mae,
+        "per_channel_seq_pearson":  per_channel_seq_pearson,
+        "per_channel_lt_mse":       per_channel_lt_mse,
+        "per_channel_lt_mae":       per_channel_lt_mae,
+        "per_channel_lt_pearson":   per_channel_lt_pearson,
+        "gt_source":                gt_source,
     }
     with open(os.path.join(job_dir, "test_metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
-    pf(f"[EVAL] test_metrics.json saved.")
+    pf("[EVAL] test_metrics.json saved.")
     sys.stdout.flush()
 
-    time_axis = np.arange(seq_len) * gate_width_ns
+    # ── ns-lifetime scatter plots ─────────────────────────────────────────────
+    scatter_titles = {
+        "tau1": "Short lifetime tau1",
+        "tau2": "Long lifetime tau2",
+        "fret": "FRET efficiency",
+    }
+    for c, ch in enumerate(["tau1", "tau2", "fret"][:n_out]):
+        gt_c   = lifetime_gt_arr[c]
+        pred_c = lifetime_pred_arr[c]
+        lo, hi = lifetime_axis_lim[c]
 
-    for c, ch in enumerate(channel_names[:n_out]):
         fig, ax = plt.subplots(figsize=(6, 5))
-        pred_mean = preds[:, :, c].mean(axis=1)
-        tgt_mean  = tgt_test[:, :, c].mean(axis=1)
-        ax.scatter(tgt_mean, pred_mean, alpha=0.3, s=6, rasterized=True)
-        mn = min(tgt_mean.min(), pred_mean.min())
-        mx = max(tgt_mean.max(), pred_mean.max())
-        ax.plot([mn, mx], [mn, mx], "r--", linewidth=1)
-        ax.set_xlabel(f"Ground truth {ch}")
-        ax.set_ylabel(f"Student predicted {ch}")
+        ax.scatter(gt_c, pred_c, alpha=0.3, s=6, rasterized=True)
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.0)
+        ax.set_xlim(lo, hi)
+        ax.set_ylim(lo, hi)
+        ax.set_xlabel(f"Ground truth {ch} (ns)" if ch != "fret" else "Ground truth FRET efficiency")
+        ax.set_ylabel(f"MemoQ predicted {ch} (ns)" if ch != "fret" else "MemoQ predicted FRET efficiency")
         ax.set_title(
-            f"MemoQ Student — {ch}\n"
-            f"r={per_channel_pearson[ch]:.3f}  "
-            f"MSE={per_channel_mse[ch]:.4f}  "
-            f"MAE={per_channel_mae[ch]:.4f}"
+            f"MemoQ Student — {scatter_titles.get(ch, ch)}\n"
+            f"r={per_channel_lt_pearson[ch]:.3f}  "
+            f"MSE={per_channel_lt_mse[ch]:.4f}  "
+            f"MAE={per_channel_lt_mae[ch]:.4f}"
         )
         ax.grid(True, alpha=0.3)
-        scatter_path = os.path.join(job_dir, f"test_scatter_{ch}.png")
         plt.tight_layout()
+        scatter_path = os.path.join(job_dir, f"test_scatter_{ch}.png")
         plt.savefig(scatter_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         pf(f"[EVAL]   scatter saved: {scatter_path}")
 
-    n_res = min(8, n_test)
-    res_idx = np.random.choice(n_test, n_res, replace=False)
+    # ── Sequence residual curves (a random sample of raw SDF reconstructions) ─
+    time_axis = t_ns
+    n_res     = min(8, n_test)
+    res_idx   = np.random.choice(n_test, n_res, replace=False)
     fig, axes_res = plt.subplots(n_res, n_out, figsize=(4 * n_out, 2 * n_res))
     if n_res == 1:
         axes_res = axes_res[np.newaxis, :]
+    if n_out == 1:
+        axes_res = axes_res[:, np.newaxis]
     for row, i in enumerate(res_idx):
         for c, ch in enumerate(channel_names[:n_out]):
             ax = axes_res[row, c]
-            ax.plot(time_axis, tgt_test[i, :, c], "k-",  linewidth=1.0, label="GT")
-            ax.plot(time_axis, preds[i, :, c],    "r--", linewidth=1.0, label="Student")
+            ax.plot(time_axis, tgt_test[i, :, c], "k-",  linewidth=1.0, label="GT seq")
+            ax.plot(time_axis, preds[i, :, c],    "r--", linewidth=1.0, label="MemoQ")
             ax.set_title(f"Sample {i}  {ch}", fontsize=7)
+            ax.set_xlabel("t (ns)", fontsize=6)
             ax.tick_params(labelsize=6)
             if row == 0:
                 ax.legend(fontsize=6)
-    plt.suptitle("MemoQ Student — Test Residual Curves", fontsize=10)
+    plt.suptitle("MemoQ Student — Test SDF Residual Curves", fontsize=10)
     plt.tight_layout()
     res_path = os.path.join(job_dir, "test_residuals.png")
     plt.savefig(res_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     pf(f"[EVAL]   residuals saved: {res_path}")
     sys.stdout.flush()
-
 
 # ==============================================================================
 # parse_args — all MemoQ-specific hyperparameters
