@@ -329,10 +329,7 @@ def build_float_student(seq_len, n_out, student_units):
         student_units, return_sequences=True, return_state=True, name="sdecgru"
     )(dec_inputs, initial_state=enc_state)
 
-    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hid_seq)
-    s_output = keras.layers.Lambda(
-        lambda x: tf.nn.softplus(x), name="sdec_dense"
-    )(s_output_raw)
+    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hid_seq)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
@@ -358,10 +355,7 @@ def build_float_student_with_hidden(seq_len, n_out, student_units):
         student_units, return_sequences=True, return_state=True, name="sdecgru"
     )(dec_inputs, initial_state=enc_state)
 
-    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hid_seq)
-    s_output = keras.layers.Lambda(
-        lambda x: tf.nn.softplus(x), name="sdec_dense"
-    )(s_output_raw)
+    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hid_seq)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
@@ -612,10 +606,7 @@ def build_phase2_student(seq_len, n_out, student_units,
     enc_hidden_seq, enc_state, enc_z_logits = enc_rnn_layer(enc_inputs)
     dec_hidden_seq, dec_state, dec_z_logits = dec_rnn_layer(dec_inputs, initial_state=enc_state)
 
-    s_output_raw = Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hidden_seq)
-    s_output = keras.layers.Lambda(
-        lambda x: tf.nn.softplus(x), name="sdec_dense"
-    )(s_output_raw)
+    s_output = Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
 
     model = Model(
         inputs=[enc_inputs, dec_inputs],
@@ -1096,8 +1087,8 @@ def train_step_phase1_per_replica(batch_x, batch_y, model, optimizer,
 
     with tf.GradientTape() as tape:
         s_out = model([enc_b, dec_b], training=True)
-        l_seq = channel_normalised_huber(tgt_b,   s_out, channel_scales, huber_delta)
-        l_kd  = channel_normalised_huber(tpred_b, s_out, channel_scales, huber_delta)
+        l_seq = channel_normalised_huber_memoq(tgt_b,   s_out, channel_scales, huber_delta)
+        l_kd  = channel_normalised_huber_memoq(tpred_b, s_out, channel_scales, huber_delta)
         total = (1.0 - alpha) * l_seq + alpha * l_kd
 
     grads = tape.gradient(total, model.trainable_variables)
@@ -1118,8 +1109,8 @@ def val_step_phase1_per_replica(batch_x, batch_y, model, alpha, channel_scales, 
     tgt_b   = batch_y
 
     s_out = model([enc_b, dec_b], training=False)
-    l_seq = channel_normalised_huber(tgt_b,   s_out, channel_scales, huber_delta)
-    l_kd  = channel_normalised_huber(tpred_b, s_out, channel_scales, huber_delta)
+    l_seq = channel_normalised_huber_memoq(tgt_b,   s_out, channel_scales, huber_delta)
+    l_kd  = channel_normalised_huber_memoq(tpred_b, s_out, channel_scales, huber_delta)
     total = (1.0 - alpha) * l_seq + alpha * l_kd
     mae   = tf.reduce_mean(tf.abs(s_out - tgt_b))
     return total, l_seq, l_kd, mae
@@ -1324,12 +1315,107 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         cell.quantizer_state = q_s
 
 
+def transfer_float_to_phase2(float_student, phase2_model, enc_cell, dec_cell, pf):
+    """
+    Transfer float student GRU weights (packed Keras [z|r|h] format)
+    into MemoQGRUCell split variables:
+        W_z, W_r, W_h  (input kernels)
+        U_z, U_r, U_h  (recurrent kernels)
+        b_z_inp, b_r_inp, b_h_inp  (input biases)
+        b_z_rec, b_r_rec, b_h_rec  (recurrent biases)
+
+    Keras GRU reset_after=True packed weight layout:
+        kernel           : (input_dim, 3*H)   cols [0:H]=z, [H:2H]=r, [2H:3H]=h
+        recurrent_kernel : (H, 3*H)           same column ordering
+        bias             : (2, 3*H)           row 0=input bias, row 1=recurrent bias
+                           OR (3*H,)          flat input bias only (older Keras builds)
+    """
+    pf("[P1->P2] transfer_float_to_phase2: loading float GRU weights into MemoQGRUCell split vars...")
+
+    def _transfer_one(layer_name, cell):
+        try:
+            src_layer = float_student.get_layer(layer_name)
+        except ValueError:
+            pf(f"  SKIP {layer_name} — not found in float_student")
+            return
+
+        weights = src_layer.get_weights()
+        if len(weights) < 2:
+            pf(f"  SKIP {layer_name} — only {len(weights)} weight tensors found, expected >=2")
+            return
+
+        kernel   = weights[0]   # (input_dim, 3*H)
+        rec_kern = weights[1]   # (H, 3*H)
+        H = cell.units
+
+        if kernel.shape[1] != 3 * H:
+            pf(f"  SKIP {layer_name} — kernel col dim {kernel.shape[1]} != 3*H={3*H}")
+            return
+
+        W_z_val = kernel[:, 0:H]
+        W_r_val = kernel[:, H:2*H]
+        W_h_val = kernel[:, 2*H:3*H]
+
+        U_z_val = rec_kern[:, 0:H]
+        U_r_val = rec_kern[:, H:2*H]
+        U_h_val = rec_kern[:, 2*H:3*H]
+
+        cell.W_z.assign(W_z_val)
+        cell.W_r.assign(W_r_val)
+        cell.W_h.assign(W_h_val)
+        cell.U_z.assign(U_z_val)
+        cell.U_r.assign(U_r_val)
+        cell.U_h.assign(U_h_val)
+
+        if len(weights) >= 3:
+            bias = weights[2]
+            if bias.ndim == 2 and bias.shape[0] == 2 and bias.shape[1] == 3 * H:
+                b_inp = bias[0]
+                b_rec = bias[1]
+            elif bias.ndim == 1 and bias.shape[0] == 3 * H:
+                b_inp = bias
+                b_rec = np.zeros(3 * H, dtype=np.float32)
+            else:
+                pf(f"  WARN {layer_name} — unexpected bias shape {bias.shape}, zeroing all biases")
+                b_inp = np.zeros(3 * H, dtype=np.float32)
+                b_rec = np.zeros(3 * H, dtype=np.float32)
+
+            cell.b_z_inp.assign(b_inp[0:H])
+            cell.b_r_inp.assign(b_inp[H:2*H])
+            cell.b_h_inp.assign(b_inp[2*H:3*H])
+            cell.b_z_rec.assign(b_rec[0:H])
+            cell.b_r_rec.assign(b_rec[H:2*H])
+            cell.b_h_rec.assign(b_rec[2*H:3*H])
+        else:
+            pf(f"  WARN {layer_name} — no bias tensor, leaving zeros")
+
+        pf(f"  OK {layer_name}: kernel={kernel.shape}  recurrent={rec_kern.shape}")
+
+    _transfer_one("sencgru", enc_cell)
+    _transfer_one("sdecgru", dec_cell)
+
+    try:
+        src_dense = float_student.get_layer("sdec_dense")
+        dst_dense = phase2_model.get_layer("sdec_dense")
+        src_w = src_dense.get_weights()
+        dst_w = dst_dense.get_weights()
+        if len(src_w) == len(dst_w) and all(a.shape == b.shape for a, b in zip(src_w, dst_w)):
+            dst_dense.set_weights(src_w)
+            pf("  OK sdec_dense")
+        else:
+            pf(
+                f"  SKIP sdec_dense — shape mismatch "
+                f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]}"
+            )
+    except Exception as exc:
+        pf(f"  SKIP sdec_dense: {exc}")
+
+    sys.stdout.flush()
 
 
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
-
 def training_loop_memoq(
     strategy,
     float_student,
@@ -1348,12 +1434,13 @@ def training_loop_memoq(
     pf,
     teacher_hidden_model=None,
 ):
-    p1_ckpt   = os.path.join(job_dir, "phase1_best.weights.h5")
-    p2a_ckpt  = os.path.join(job_dir, "stage2a_best.weights.h5")
-    p2b_ckpt  = os.path.join(job_dir, "stage2b_best.weights.h5")
-    p2c_ckpt  = os.path.join(job_dir, "stage2c_best.weights.h5")
-    p3_ckpt   = os.path.join(job_dir, "student_best.weights.h5")
-    resume_path = os.path.join(job_dir, "resume_state.json")
+    p1_ckpt         = os.path.join(job_dir, "phase1_best.weights.h5")
+    p2a_ckpt        = os.path.join(job_dir, "stage2a_best.weights.h5")
+    p2b_ckpt        = os.path.join(job_dir, "stage2b_best.weights.h5")
+    p2c_ckpt        = os.path.join(job_dir, "stage2c_best.weights.h5")
+    p3_ckpt         = os.path.join(job_dir, "student_best.weights.h5")
+    resume_path     = os.path.join(job_dir, "resume_state.json")
+    completion_path = os.path.join(job_dir, "training_complete.flag")
 
     history = {
         "total":     [], "seq":       [], "kd":        [],
@@ -1381,6 +1468,40 @@ def training_loop_memoq(
     }
     patience_cts = {"P1": 0, "P2A": 0, "P2B": 0, "P2C": 0, "P3": 0}
 
+    stage_order_list = ["P1", "P2A", "P2B", "P2C", "P3"]
+    max_epochs_per_stage = {
+        "P1":  args.memoq_warmup_epochs,
+        "P2A": args.memoq_stage2a_epochs,
+        "P2B": args.memoq_stage2b_epochs,
+        "P2C": args.memoq_stage2c_epochs,
+        "P3":  args.memoq_stage3_epochs,
+    }
+
+    # ── Check completion sentinel before loading resume state ─────────────────
+    # If training_complete.flag exists, all phases are done. Load the final
+    # weights and return immediately so the caller can do evaluation/PNG
+    # generation without SLURM resubmitting into a training loop.
+    if args.resume and os.path.exists(completion_path):
+        pf(f"[RESUME] Training already complete — found {completion_path}")
+        pf("[RESUME] Skipping all training phases. Loading final weights for evaluation.")
+        if os.path.exists(p3_ckpt):
+            final_qkeras_student.load_weights(p3_ckpt)
+            pf(f"[RESUME] Loaded final QKeras weights from {p3_ckpt}")
+        sys.stdout.flush()
+        _best_final = float("inf")
+        if os.path.exists(resume_path):
+            try:
+                with open(resume_path) as _rf:
+                    _rs = json.load(_rf)
+                _bv = _rs.get("best_vals", {})
+                for _k in ["P3", "P2C", "P2B", "P2A", "P1"]:
+                    if _k in _bv:
+                        _best_final = float(_bv[_k])
+                        break
+            except Exception:
+                pass
+        return history, _best_final
+
     if args.resume and os.path.exists(resume_path):
         pf(f"[RESUME] {resume_path}")
         with open(resume_path) as f:
@@ -1395,8 +1516,7 @@ def training_loop_memoq(
                     history[key] = list(rs["history"][key])
         global_epoch = len(history["phase"])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
-        stage_order = ["P1", "P2A", "P2B", "P2C", "P3"]
-        stage_idx = stage_order.index(resume_stage)
+        stage_idx = stage_order_list.index(resume_stage)
         if stage_idx >= 1 and os.path.exists(p1_ckpt):
             float_student.load_weights(p1_ckpt)
             pf("[RESUME] Loaded P1 weights for float_student")
@@ -1419,8 +1539,6 @@ def training_loop_memoq(
                 "val_mae,lr\n"
             )
 
-    stage_order_list = ["P1", "P2A", "P2B", "P2C", "P3"]
-
     def save_resume(stage_tag, ep_in_stage):
         state = {
             "stage":          stage_tag,
@@ -1435,10 +1553,22 @@ def training_loop_memoq(
         with open(resume_path, "w") as f:
             json.dump(state, f, indent=2)
 
+    def mark_training_complete():
+        with open(completion_path, "w") as f:
+            f.write("done\n")
+        pf(f"[COMPLETE] All training phases finished — wrote {completion_path}")
+        sys.stdout.flush()
+
     def should_run(stage_tag):
         if not args.resume:
             return True
-        return stage_order_list.index(stage_tag) >= stage_order_list.index(resume_stage)
+        resume_idx = stage_order_list.index(resume_stage)
+        stage_idx  = stage_order_list.index(stage_tag)
+        if stage_idx > resume_idx:
+            return True
+        if stage_idx == resume_idx:
+            return resume_epoch_in_stage < max_epochs_per_stage[stage_tag]
+        return False
 
     def start_ep(stage_tag):
         if args.resume and stage_tag == resume_stage:
@@ -1892,6 +2022,8 @@ def training_loop_memoq(
             pf(f"[P3] Loaded best phase3 weights from {p3_ckpt}")
             sys.stdout.flush()
 
+    mark_training_complete()
+
     return history, best_vals.get(
         "P3", best_vals.get(
             "P2C", best_vals.get(
@@ -2319,10 +2451,7 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
         initial_state=[enc_final_h, enc_initial_z],
     )
 
-    seq_output_raw = keras.layers.Dense(n_out, activation="linear", name="sdec_dense_raw")(dec_hidden_seq)
-    seq_output = keras.layers.Lambda(
-        lambda x: tf.nn.softplus(x), name="sdec_dense"
-    )(seq_output_raw)
+    seq_output = keras.layers.Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
 
     model = keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
@@ -2387,16 +2516,13 @@ def build_final_qkeras_student(
         name="sdecgru",
     )(dec_inputs, initial_state=s_enc_state)
 
-    s_output_raw = QDense(
+    s_output = QDense(
         n_out,
         kernel_quantizer=qd(),
         bias_quantizer=qd(),
         activation="linear",
-        name="sdec_dense_raw",
+        name="sdec_dense",
     )(s_dec_hid_seq)
-    s_output = keras.layers.Lambda(
-        lambda x: tf.nn.softplus(x), name="sdec_dense"
-    )(s_output_raw)
 
     return keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
@@ -2801,21 +2927,20 @@ def make_dist_memoq_val(
 # inside the gradient tape. The side model shares weights with
 # final_qkeras_student.
 # ==============================================================================
-
 def build_final_hidden_model(final_qkeras_student):
     """
     Build a side model from the hard QKeras student that returns
     (seq_output, dec_hidden_seq) so Phase 3 recurrent losses can fire.
     Uses explicit layer re-call from shared input tensors so the graph
     stays connected and gradients flow through final_qkeras_student.trainable_variables.
+    sdec_dense is now a QDense with linear activation — no Lambda wrapper.
     """
     enc_input  = final_qkeras_student.input[0]
     dec_input  = final_qkeras_student.input[1]
 
-    enc_layer      = final_qkeras_student.get_layer("sencgru")
-    dec_layer      = final_qkeras_student.get_layer("sdecgru")
-    dense_raw_layer = final_qkeras_student.get_layer("sdec_dense_raw")
-    dense_act_layer = final_qkeras_student.get_layer("sdec_dense")
+    enc_layer   = final_qkeras_student.get_layer("sencgru")
+    dec_layer   = final_qkeras_student.get_layer("sdecgru")
+    dense_layer = final_qkeras_student.get_layer("sdec_dense")
 
     enc_result = enc_layer(enc_input)
     if isinstance(enc_result, (list, tuple)):
@@ -2829,8 +2954,7 @@ def build_final_hidden_model(final_qkeras_student):
     else:
         dec_hidden_seq = dec_result
 
-    seq_output_raw = dense_raw_layer(dec_hidden_seq)
-    seq_output     = dense_act_layer(seq_output_raw)
+    seq_output = dense_layer(dec_hidden_seq)
 
     return keras.models.Model(
         inputs=[enc_input, dec_input],
@@ -2899,8 +3023,8 @@ def make_dist_memoq_train_final(
             l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
             total = total + lambda_r_f * l_r
 
-            if lambda_z > 0.0:
-                excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.95)
+            if lambda_z_f > 0.0:
+                excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
                 l_z = tf.reduce_mean(tf.square(excess_z))
                 total = total + lambda_z_f * l_z
             else:
@@ -2986,8 +3110,8 @@ def make_dist_memoq_val_final(
         l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
         total = total + lambda_r_f * l_r
 
-        if lambda_z > 0.0:
-            excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.95)
+        if lambda_z_f > 0.0:
+            excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
             l_z = tf.reduce_mean(tf.square(excess_z))
             total = total + lambda_z_f * l_z
         else:
