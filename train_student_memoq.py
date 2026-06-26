@@ -1268,51 +1268,59 @@ def val_step_memoq_per_replica(
     mae = tf.reduce_mean(tf.abs(s_pred - tgt_b))
     return total, l_seq, l_kd, l_mem, l_innov, l_zsat, l_railp, mae
 
-
-
 def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     """
-    Assign quantizers to SplitGateGRUCell gate variables based on the
+    Assign quantizers to MemoQGRUCell gate variables based on the
     MemoQ curriculum stage.
 
-    Stage P2A : quantize h gate only (W_h, U_h)
-    Stage P2B : quantize h + r gates
-    Stage P2C : quantize h + r + z gates
-    Stage P3  : quantize h + r + z gates + state (all hard 4-bit)
+    Stage P2A : quantize h gate only (W_h, U_h). State float.
+    Stage P2B : quantize h + r gates. State float.
+    Stage P2C : quantize h + r + z gates + state + activation (full pre-hardening).
+    Stage P3  : same as P2C. Full hard 4-bit. Transfer to QKeras happens next.
 
-    One shared quantized_bits instance per 4-bit setting is intentional:
-    the STE is stateless so sharing is safe and avoids unnecessary objects.
+    KEY FIX: P2C now enables quantizer_state AND quantizer_activation so the
+    cell trains against quantized_tanh-clipped hidden states, matching exactly
+    what the hard QKeras QGRU does at inference. This eliminates the cliff
+    at the P2C->P3 boundary by ensuring the model has already seen discretised
+    tanh-range states for at least memoq_stage2c_epochs epochs before cutover.
     """
     q4 = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
+    q4s = quantized_bits(args.bits_state, 0, 1, alpha=1.0)
+    q4a = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
     if stage == "P2A":
         q_h = q4
         q_r = None
         q_z = None
         q_s = None
+        q_a = None
     elif stage == "P2B":
         q_h = q4
         q_r = q4
         q_z = None
         q_s = None
+        q_a = None
     elif stage == "P2C":
         q_h = q4
         q_r = q4
         q_z = q4
-        q_s = None
+        q_s = q4s
+        q_a = q4a
     elif stage == "P3":
         q_h = q4
         q_r = q4
         q_z = q4
-        q_s = quantized_bits(args.bits_state, 0, 1, alpha=1.0)
+        q_s = q4s
+        q_a = q4a
     else:
         raise ValueError(f"Unknown stage: {stage!r}. Expected one of P2A, P2B, P2C, P3.")
 
     for cell in [enc_cell, dec_cell]:
-        cell.quantizer_h     = q_h
-        cell.quantizer_r     = q_r
-        cell.quantizer_z     = q_z
-        cell.quantizer_state = q_s
+        cell.quantizer_h          = q_h
+        cell.quantizer_r          = q_r
+        cell.quantizer_z          = q_z
+        cell.quantizer_state      = q_s
+        cell.quantizer_activation = q_a
 
 
 def transfer_float_to_phase2(float_student, phase2_model, enc_cell, dec_cell, pf):
@@ -2298,6 +2306,7 @@ class MemoQGRUCell(keras.layers.Layer):
         quantizer_r=None,
         quantizer_h=None,
         quantizer_state=None,
+        quantizer_activation=None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -2307,6 +2316,7 @@ class MemoQGRUCell(keras.layers.Layer):
         self._quantizer_r = quantizer_r
         self._quantizer_h = quantizer_h
         self._quantizer_state = quantizer_state
+        self._quantizer_activation = quantizer_activation
         # state_size must be a list so Keras RNN allocates two state tensors:
         #   states[0] = h_prev (B, units)
         #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
@@ -2341,8 +2351,15 @@ class MemoQGRUCell(keras.layers.Layer):
         return q(w)
 
     def call(self, inputs, states):
-        h_prev     = states[0]   # (B, units)
-        # states[1] is z_logit_prev — carried but not used in forward pass
+        h_prev = states[0]   # (B, units)
+        # states[1] is z_logit_prev -- carried but not used in forward pass
+
+        # Quantize incoming recurrent state so the cell trains against
+        # accumulated quantization error from the previous timestep.
+        if self._quantizer_state is not None:
+            h_prev_q = self._quantizer_state(h_prev)
+        else:
+            h_prev_q = h_prev
 
         W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
         W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
@@ -2353,11 +2370,11 @@ class MemoQGRUCell(keras.layers.Layer):
 
         z_logit = (
             tf.matmul(inputs, W_z) + self.b_z_inp
-            + tf.matmul(h_prev, U_z) + self.b_z_rec
+            + tf.matmul(h_prev_q, U_z) + self.b_z_rec
         )
         r_logit = (
             tf.matmul(inputs, W_r) + self.b_r_inp
-            + tf.matmul(h_prev, U_r) + self.b_r_rec
+            + tf.matmul(h_prev_q, U_r) + self.b_r_rec
         )
 
         z = tf.sigmoid(z_logit)
@@ -2365,16 +2382,21 @@ class MemoQGRUCell(keras.layers.Layer):
 
         h_candidate = tf.tanh(
             tf.matmul(inputs, W_h) + self.b_h_inp
-            + r * (tf.matmul(h_prev, U_h) + self.b_h_rec)
+            + r * (tf.matmul(h_prev_q, U_h) + self.b_h_rec)
         )
-
-        h_prev_q = h_prev
-        if self._quantizer_state is not None:
-            h_prev_q = self._quantizer_state(h_prev_q)
 
         h_t = z * h_prev_q + (1.0 - z) * h_candidate
 
-        if self._quantizer_state is not None:
+        # Apply activation quantizer (quantized_tanh) to h_t BEFORE
+        # state storage so the recurrence trains against the discretised
+        # hidden state -- matching what the hard QKeras QGRU does at
+        # inference (activation=quantized_tanh in build_final_qkeras_student).
+        if self._quantizer_activation is not None:
+            h_t = self._quantizer_activation(h_t)
+        elif self._quantizer_state is not None:
+            # Fall back to state quantizer on the output when no explicit
+            # activation quantizer is set, so the output is still
+            # quantized even if quantizer_activation was not passed.
             h_t = self._quantizer_state(h_t)
 
         # Return h_t as output; carry [h_t, z_logit] as states
@@ -2422,6 +2444,13 @@ class MemoQGRUCell(keras.layers.Layer):
     def quantizer_state(self, q):
         self._quantizer_state = q
 
+    @property
+    def quantizer_activation(self):
+        return self._quantizer_activation
+
+    @quantizer_activation.setter
+    def quantizer_activation(self, q):
+        self._quantizer_activation = q
 # ==============================================================================
 # build_phase2_model:
 # Constructs the training-time phase2 model using MemoQGRUCell instances.
@@ -2522,6 +2551,7 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
     )
 
     return model, enc_cell, dec_cell
+
 # ==============================================================================
 # build_final_qkeras_student:
 # Standard hard 4-bit QKeras QGRU/QDense student with identical layer names
