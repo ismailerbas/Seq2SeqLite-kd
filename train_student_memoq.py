@@ -1433,6 +1433,7 @@ def training_loop_memoq(
     job_dir,
     pf,
     teacher_hidden_model=None,
+    evaluate_fn=None,
 ):
     p1_ckpt         = os.path.join(job_dir, "phase1_best.weights.h5")
     p2a_ckpt        = os.path.join(job_dir, "stage2a_best.weights.h5")
@@ -1635,6 +1636,11 @@ def training_loop_memoq(
             pf(f"[P1] Best weights loaded: {p1_ckpt}")
             sys.stdout.flush()
 
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P1...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P1")
+
     # ── Transfer Phase 1 float weights into Phase 2 split-gate model ──────────
     if should_run("P2A"):
         pf("[P1->P2] Transferring float weights to split-gate model...")
@@ -1762,6 +1768,11 @@ def training_loop_memoq(
             pf(f"[P2A] Loaded best weights from {p2a_ckpt}")
             sys.stdout.flush()
 
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2A...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2A")
+
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2B — Reset gate (r) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
@@ -1849,6 +1860,11 @@ def training_loop_memoq(
             pf(f"[P2B] Loaded best weights from {p2b_ckpt}")
             sys.stdout.flush()
 
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2B...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2B")
+
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2C — Update gate (z) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
@@ -1935,6 +1951,11 @@ def training_loop_memoq(
             phase2_model.load_weights(p2c_ckpt)
             pf(f"[P2C] Loaded best weights from {p2c_ckpt}")
             sys.stdout.flush()
+
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2C...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2C")
 
     # ══════════════════════════════════════════════════════════════════════════
     # Export Phase 2 split-gate weights into final hard QKeras student.
@@ -2040,6 +2061,11 @@ def training_loop_memoq(
             final_qkeras_student.load_weights(p3_ckpt)
             pf(f"[P3] Loaded best phase3 weights from {p3_ckpt}")
             sys.stdout.flush()
+
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P3...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P3")
 
     mark_training_complete()
 
@@ -3835,18 +3861,17 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
 # ==============================================================================
 # evaluate_and_save — identical to vanilla_kd but uses final_qkeras_student.
 # ==============================================================================
-
 def evaluate_and_save(
     final_qkeras_student,
-    normalized_input,
-    res,
-    labels_3ch,
-    test_idx,
-    seq_len,
-    n_out,
+    enc_test,
+    tgt_test,
+    labels_test,
     gate_width_ns,
-    job_dir,
+    n_out,
+    seq_len,
     infer_batch,
+    job_dir,
+    args,
     pf,
     phase_tag=None,
 ):
@@ -3867,11 +3892,8 @@ def evaluate_and_save(
     pf(f"[EVAL] Running evaluate_and_save (phase_tag={phase_tag!r}) ...")
     sys.stdout.flush()
 
-    n_test = len(test_idx)
-    enc_test = normalized_input[test_idx]
+    n_test   = enc_test.shape[0]
     dec_test = np.zeros((n_test, seq_len, 1), dtype=np.float32)
-    tgt_test = res[test_idx]
-    labels_test = labels_3ch[test_idx]
 
     # ── Inference ─────────────────────────────────────────────────────────────
     pf(f"[EVAL] Inference on {n_test} test samples (batch={infer_batch}) ...")
@@ -4062,15 +4084,15 @@ def evaluate_and_save(
 
     # ── Metrics JSON ──────────────────────────────────────────────────────
     metrics = {
-        "mae_seq":  mae_seq,
-        "r_tau1":   r_tau1,
-        "r_tau2":   r_tau2,
-        "r_fret":   r_fret,
-        "n_test":   n_test,
-        "n_valid_tau1": int(np.isfinite(tau1_pred).sum()),
-        "n_valid_tau2": int(np.isfinite(tau2_pred).sum()),
-        "n_valid_fret": int(np.isfinite(fret_pred).sum()),
-        "phase_tag": phase_tag,
+        "mae_seq":          mae_seq,
+        "r_tau1":           r_tau1,
+        "r_tau2":           r_tau2,
+        "r_fret":           r_fret,
+        "n_test":           n_test,
+        "n_valid_tau1":     int(np.isfinite(tau1_pred).sum()),
+        "n_valid_tau2":     int(np.isfinite(tau2_pred).sum()),
+        "n_valid_fret":     int(np.isfinite(fret_pred).sum()),
+        "phase_tag":        phase_tag,
     }
     metrics_path = os.path.join(job_dir, "test_metrics.json")
     with open(metrics_path, "w") as f:
@@ -4084,7 +4106,6 @@ def evaluate_and_save(
     sys.stdout.flush()
 
     return metrics
-
 # ==============================================================================
 # parse_args — all MemoQ-specific hyperparameters
 # ==============================================================================
@@ -4551,8 +4572,43 @@ def main():
     final_qkeras_student._teacher_hidden_model = teacher_hidden_model
     final_qkeras_student.summary(print_fn=pf)
 
+    # ── Pre-materialise test split so _eval_fn closure can use it at any phase ─
+    pf("[MAIN] Materialising test buffers for per-phase evaluation...")
+    enc_te, tgt_te, _ = materialise_memoq_buffers(
+        normalized_input    = normalized_input,
+        res                 = res_data,
+        teacher_predictions = teacher_predictions,
+        idx                 = test_idx,
+        seq_len             = args.seq_len,
+        n_out               = args.n_out,
+        label               = "test",
+        pf                  = pf,
+    )
+
+    labels_data  = np.load(file_labels, mmap_mode="r")
+    labels_test  = labels_data[test_idx].astype(np.float32)
+
     # ── Run training ──────────────────────────────────────────────────────────
     pf("[MAIN] Starting MemoQ training loop...")
+
+    def _eval_fn(phase_tag):
+        pf(f"[EVAL] _eval_fn called with phase_tag={phase_tag!r}")
+        sys.stdout.flush()
+        evaluate_and_save(
+            final_qkeras_student = final_qkeras_student,
+            enc_test             = enc_te,
+            tgt_test             = tgt_te,
+            labels_test          = labels_test,
+            gate_width_ns        = args.gate_width_ns,
+            n_out                = args.n_out,
+            seq_len              = args.seq_len,
+            infer_batch          = args.infer_batch,
+            job_dir              = job_dir,
+            args                 = args,
+            pf                   = pf,
+            phase_tag            = phase_tag,
+        )
+
     history, best_val = training_loop_memoq(
         strategy             = strategy,
         float_student        = float_student,
@@ -4569,10 +4625,9 @@ def main():
         epsilon_innov        = epsilon_innov,
         job_dir              = job_dir,
         pf                   = pf,
-        teacher_hidden_model=teacher_hidden_model,
-
+        teacher_hidden_model = teacher_hidden_model,
+        evaluate_fn          = _eval_fn,
     )
-
     # ── Save final weights ────────────────────────────────────────────────────
     final_path = os.path.join(job_dir, "student_final.weights.h5")
     final_qkeras_student.save_weights(final_path)
@@ -4582,21 +4637,7 @@ def main():
     save_loss_curves_memoq(history, best_val, args, job_dir, pf)
 
     # ── Test evaluation ───────────────────────────────────────────────────────
-    pf("[MAIN] Materialising test buffers for evaluation...")
-    enc_te, tgt_te, _ = materialise_memoq_buffers(
-        normalized_input    = normalized_input,
-        res                 = res_data,
-        teacher_predictions = teacher_predictions,
-        idx                 = test_idx,
-        seq_len             = args.seq_len,
-        n_out               = args.n_out,
-        label               = "test",
-        pf                  = pf,
-    )
-
-    labels_data = np.load(file_labels, mmap_mode="r")
-    labels_test = labels_data[test_idx].astype(np.float32)
-
+    # enc_te, tgt_te, labels_test already materialised above before training loop.
     evaluate_and_save(
         final_qkeras_student = final_qkeras_student,
         enc_test             = enc_te,
@@ -4609,6 +4650,7 @@ def main():
         job_dir              = job_dir,
         args                 = args,
         pf                   = pf,
+        phase_tag            = "final",
     )
 
     pf(f"[MAIN] best_val={best_val:.6f}")
