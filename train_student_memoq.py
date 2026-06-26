@@ -4624,6 +4624,19 @@ def main():
     def _eval_fn(phase_tag):
         pf(f"[EVAL] _eval_fn called with phase_tag={phase_tag!r}")
         sys.stdout.flush()
+        # Guard: final_qkeras_student has random weights during P1/P2A/P2B/P2C
+        # because transfer_splitgate_to_qkeras has not fired yet.
+        # Scatter plots on an untrained model produce pure noise (r~0) and are
+        # byte-identical across all P1-P2C phases. Only evaluate when the model
+        # actually has trained hard 4-bit weights. Read val_mae from the CSV
+        # for P1/P2 signal instead.
+        if phase_tag not in ("P3", "final"):
+            pf(
+                f"[EVAL] Skipping scatter plot for phase={phase_tag!r} — "
+                f"final_qkeras_student not yet trained. Read val_mae from training_history.csv."
+            )
+            sys.stdout.flush()
+            return
         evaluate_and_save(
             final_qkeras_student = final_qkeras_student,
             enc_test             = enc_te,
@@ -4658,6 +4671,32 @@ def main():
         teacher_hidden_model = teacher_hidden_model,
         evaluate_fn          = _eval_fn,
     )
+
+    # ── Transfer fidelity check ───────────────────────────────────────────────
+    # Run AFTER training_loop_memoq returns so enc_va is in scope.
+    # Compares phase2_model output vs final_qkeras_student on 256 val samples.
+    # This fires unconditionally so you always get the diff in the log.
+    # A large diff with live quantizers is expected (the cliff).
+    # If the diff is large even with float/identity quantizers on the QKeras
+    # model then it is a packing bug — check recurrent_activation="sigmoid"
+    # in build_final_qkeras_student.
+    pf("[TRANSFER CHECK] Comparing phase2_model vs final_qkeras_student on 256 val samples...")
+    try:
+        _xb = enc_va[:256]
+        _db = np.zeros((256, args.seq_len, 1), dtype=np.float32)
+        _p2_out  = phase2_model([_xb, _db], training=False)
+        _p2_pred = _p2_out[0].numpy() if isinstance(_p2_out, (list, tuple)) else _p2_out.numpy()
+        _q3_pred = final_qkeras_student([_xb, _db], training=False).numpy()
+        _diff    = float(np.abs(_p2_pred - _q3_pred).mean())
+        pf(
+            f"[TRANSFER CHECK] mean |p2 - q3| = {_diff:.6f}  "
+            f"(near 0 = packing faithful, large = packing bug OR quantisation cliff)"
+        )
+    except Exception as _te:
+        pf(f"[TRANSFER CHECK] Failed (non-fatal): {_te}")
+    sys.stdout.flush()
+    # ── End transfer fidelity check ───────────────────────────────────────────
+
     # ── Save final weights ────────────────────────────────────────────────────
     final_path = os.path.join(job_dir, "student_final.weights.h5")
     final_qkeras_student.save_weights(final_path)
