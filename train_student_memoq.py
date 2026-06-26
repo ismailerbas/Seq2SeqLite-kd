@@ -825,79 +825,47 @@ def cache_teacher_predictions_and_hidden(
     data_dir,
     pf,
 ):
-    file_pred   = os.path.join(data_dir, f"teacherPred_L{seq_len}{n_samples}.npy")
-    file_hidden = os.path.join(data_dir, f"teacherHidden_L{seq_len}{n_samples}.npy")
+    """
+    Cache ONLY teacher predictions to disk (mmap). Teacher hidden states are
+    NOT cached — they are recomputed live inside the train/val step from
+    teacher_hidden_model. Writing the full (N, T, teacher_units) hidden cache
+    costs hundreds of GB and is never read, so it is skipped entirely.
+    Returns (teacher_predictions_memmap, None).
+    """
+    file_pred = os.path.join(data_dir, f"teacherPred_L{seq_len}{n_samples}.npy")
 
-    need_pred   = not os.path.exists(file_pred)
-    need_hidden = not os.path.exists(file_hidden)
-
-    if not need_pred:
+    if os.path.exists(file_pred):
         pf(f"[CACHE] Teacher pred cache found: {file_pred}")
-    if not need_hidden:
-        pf(f"[CACHE] Teacher hidden cache found: {file_hidden}")
+        teacher_predictions = np.load(file_pred, mmap_mode="r")
+        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}")
+        return teacher_predictions, None
 
-    if not need_pred and not need_hidden:
-        teacher_predictions = np.load(file_pred,   mmap_mode="r")
-        teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-        pf(f"[CACHE] Loaded pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}")
-        return teacher_predictions, teacher_hidden
+    pf("[CACHE] Teacher pred cache NOT found — computing predictions only "
+       "(hidden is recomputed live and is NOT cached).")
+    fp_pred = np.lib.format.open_memmap(
+        file_pred, mode="w+", dtype=np.float32,
+        shape=(n_samples, seq_len, n_out),
+    )
 
-    # ── Allocate output files as memory-mapped so we never hold the full
-    #    array in RAM. Write predictions in one pass, then hidden in a
-    #    separate pass to avoid having both live simultaneously.
-    if need_pred:
-        fp_pred = np.lib.format.open_memmap(
-            file_pred, mode="w+",
-            dtype=np.float32,
-            shape=(n_samples, seq_len, n_out),
-        )
-    if need_hidden:
-        fp_hidden = np.lib.format.open_memmap(
-            file_hidden, mode="w+",
-            dtype=np.float32,
-            shape=(n_samples, seq_len, teacher_units),
-        )
-
-    # Build decoder input: zeros with shape (n_samples, seq_len, 1)
-    # Do NOT materialise the full decoder input array — build per-batch.
     pf(f"[CACHE] Building teacher predictions — {n_samples} samples, batch {infer_batch}")
     for start in range(0, n_samples, infer_batch):
         end = min(start + infer_batch, n_samples)
-        enc_batch = normalized_input[start:end]                         # (B, seq_len, 1)
+        enc_batch = normalized_input[start:end]
         dec_batch = np.zeros((end - start, seq_len, 1), dtype=np.float32)
-
-        if need_pred:
-            pred = teacher_model.predict(
-                [enc_batch, dec_batch], batch_size=len(enc_batch), verbose=0
-            )
-            fp_pred[start:end] = pred.astype(np.float32)
-            del pred
-
-        if need_hidden:
-            hidden = teacher_hidden_model.predict(
-                [enc_batch, dec_batch], batch_size=len(enc_batch), verbose=0
-            )
-            fp_hidden[start:end] = hidden.astype(np.float32)
-            del hidden
-
-        del enc_batch, dec_batch
-
+        pred = teacher_model.predict(
+            [enc_batch, dec_batch], batch_size=len(enc_batch), verbose=0
+        )
+        fp_pred[start:end] = pred.astype(np.float32)
+        del pred, enc_batch, dec_batch
         if (start // infer_batch) % 10 == 0:
             pf(f"  [{start}/{n_samples}] cached")
 
-    if need_pred:
-        fp_pred.flush()
-        del fp_pred
-    if need_hidden:
-        fp_hidden.flush()
-        del fp_hidden
-
-    pf("[CACHE] Teacher cache written.")
-
-    teacher_predictions = np.load(file_pred,   mmap_mode="r")
-    teacher_hidden      = np.load(file_hidden, mmap_mode="r")
-    pf(f"[CACHE] Re-opened as memmap: pred {teacher_predictions.shape}  hidden {teacher_hidden.shape}")
-    return teacher_predictions, teacher_hidden
+    fp_pred.flush()
+    del fp_pred
+    pf("[CACHE] Teacher prediction cache written.")
+    teacher_predictions = np.load(file_pred, mmap_mode="r")
+    pf(f"[CACHE] Re-opened as memmap: pred {teacher_predictions.shape}")
+    return teacher_predictions, None
 
 # ==============================================================================
 # Materialise split buffers into contiguous RAM
@@ -2351,56 +2319,56 @@ class MemoQGRUCell(keras.layers.Layer):
         return q(w)
 
     def call(self, inputs, states):
-        h_prev = states[0]   # (B, units)
-        # states[1] is z_logit_prev -- carried but not used in forward pass
+            h_prev = states[0]   # (B, units)
+            # states[1] is z_logit_prev -- carried but not used in the forward pass
 
-        # Quantize incoming recurrent state so the cell trains against
-        # accumulated quantization error from the previous timestep.
-        if self._quantizer_state is not None:
-            h_prev_q = self._quantizer_state(h_prev)
-        else:
-            h_prev_q = h_prev
+            # state_quantizer: quantize the incoming recurrent state (quantized_bits),
+            # matching QKeras QGRU state_quantizer applied to h_tm1 at the step input.
+            if self._quantizer_state is not None:
+                h_prev_q = self._quantizer_state(h_prev)
+            else:
+                h_prev_q = h_prev
 
-        W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
-        W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
-        W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
-        U_z = self._apply_quantizer(self._quantizer_z, self.U_z)
-        U_r = self._apply_quantizer(self._quantizer_r, self.U_r)
-        U_h = self._apply_quantizer(self._quantizer_h, self.U_h)
+            W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
+            W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
+            W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
+            U_z = self._apply_quantizer(self._quantizer_z, self.U_z)
+            U_r = self._apply_quantizer(self._quantizer_r, self.U_r)
+            U_h = self._apply_quantizer(self._quantizer_h, self.U_h)
 
-        z_logit = (
-            tf.matmul(inputs, W_z) + self.b_z_inp
-            + tf.matmul(h_prev_q, U_z) + self.b_z_rec
-        )
-        r_logit = (
-            tf.matmul(inputs, W_r) + self.b_r_inp
-            + tf.matmul(h_prev_q, U_r) + self.b_r_rec
-        )
+            z_logit = (
+                tf.matmul(inputs, W_z) + self.b_z_inp
+                + tf.matmul(h_prev_q, U_z) + self.b_z_rec
+            )
+            r_logit = (
+                tf.matmul(inputs, W_r) + self.b_r_inp
+                + tf.matmul(h_prev_q, U_r) + self.b_r_rec
+            )
 
-        z = tf.sigmoid(z_logit)
-        r = tf.sigmoid(r_logit)
+            z = tf.sigmoid(z_logit)
+            r = tf.sigmoid(r_logit)
 
-        h_candidate = tf.tanh(
-            tf.matmul(inputs, W_h) + self.b_h_inp
-            + r * (tf.matmul(h_prev_q, U_h) + self.b_h_rec)
-        )
+            # Candidate pre-activation (reset_after=True form).
+            cand_preact = (
+                tf.matmul(inputs, W_h) + self.b_h_inp
+                + r * (tf.matmul(h_prev_q, U_h) + self.b_h_rec)
+            )
 
-        h_t = z * h_prev_q + (1.0 - z) * h_candidate
+            # Candidate activation. When quantizer_activation is set it IS
+            # quantized_tanh, which computes tanh(x) then snaps to the 4-bit grid --
+            # exactly what QKeras QGRU does via activation=quantized_tanh.
+            # P2A/P2B (quantizer_activation None): plain tanh.
+            if self._quantizer_activation is not None:
+                h_candidate = self._quantizer_activation(cand_preact)
+            else:
+                h_candidate = tf.tanh(cand_preact)
 
-        # Apply activation quantizer (quantized_tanh) to h_t BEFORE
-        # state storage so the recurrence trains against the discretised
-        # hidden state -- matching what the hard QKeras QGRU does at
-        # inference (activation=quantized_tanh in build_final_qkeras_student).
-        if self._quantizer_activation is not None:
-            h_t = self._quantizer_activation(h_t)
-        elif self._quantizer_state is not None:
-            # Fall back to state quantizer on the output when no explicit
-            # activation quantizer is set, so the output is still
-            # quantized even if quantizer_activation was not passed.
-            h_t = self._quantizer_state(h_t)
+            # Final state: convex combination. Do NOT re-quantize here -- the next
+            # step's state_quantizer regrids h_t. QKeras never applies the cell
+            # activation to the combined state.
+            h_t = z * h_prev_q + (1.0 - z) * h_candidate
 
-        # Return h_t as output; carry [h_t, z_logit] as states
-        return h_t, [h_t, z_logit]
+            return h_t, [h_t, z_logit]
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
         if batch_size is None and inputs is not None:
@@ -2588,6 +2556,7 @@ def build_final_qkeras_student(
     s_enc_out, s_enc_state = QGRU(
         units=student_units,
         activation=qa(),
+        recurrent_activation="sigmoid",
         kernel_quantizer=qwk(),
         recurrent_quantizer=qwr(),
         bias_quantizer=qwb(),
@@ -2600,6 +2569,7 @@ def build_final_qkeras_student(
     s_dec_hid_seq, _ = QGRU(
         units=student_units,
         activation=qa(),
+        recurrent_activation="sigmoid",
         kernel_quantizer=qwk(),
         recurrent_quantizer=qwr(),
         bias_quantizer=qwb(),
@@ -4003,7 +3973,18 @@ def evaluate_and_save(
         return tau1_ns, tau2_ns, fret_eff
 
     tau1_pred, tau2_pred, fret_pred = extract_lifetimes(preds, t_ns)
-    tau1_gt,   tau2_gt,   fret_gt   = extract_lifetimes(tgt_test, t_ns)
+
+    # Ground truth = physical scalar labels, NOT lifetimes re-derived from the
+    # target SDF. extract(pred) vs extract(target) only checks SDF-reconstruction
+    # and shares the extraction's bias on both sides; extract(pred) vs the
+    # physical labels is the real accuracy measure (matches vanilla_kd).
+    if labels_test is not None and labels_test.ndim == 2 and labels_test.shape[1] >= 3:
+        tau1_gt = labels_test[:, 0].astype(np.float32)
+        tau2_gt = labels_test[:, 1].astype(np.float32)
+        fret_gt = labels_test[:, 2].astype(np.float32)
+    else:
+        pf("[EVAL] WARNING: labels_test missing or !=3ch — falling back to target-derived GT")
+        tau1_gt, tau2_gt, fret_gt = extract_lifetimes(tgt_test, t_ns)
 
     # ── Hard-coded physical axes (identical to vanilla_kd) ────────────────
     # Do NOT auto-scale from pred.max() — one outlier stretches the axis to
