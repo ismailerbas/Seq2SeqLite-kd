@@ -329,13 +329,21 @@ def train_step_phase1_per_replica(batch_x, batch_y, model, optimizer,
 
     grads = tape.gradient(total, model.trainable_variables)
     grads = [tf.zeros_like(v) if g is None else g for g, v in zip(grads, model.trainable_variables)]
-    nan_flag = tf.cast(
-        tf.reduce_any(tf.stack([tf.reduce_any(tf.math.is_nan(g)) for g in grads])),
-        tf.float32
-    )
-    grads, _ = tf.clip_by_global_norm(grads, clip_norm=1.0)
-    optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    return total, l_seq, l_kd, nan_flag
+    nan_in_grads = tf.reduce_any(tf.stack([
+        tf.reduce_any(tf.math.is_nan(g)) | tf.reduce_any(tf.math.is_inf(g))
+        for g in grads
+    ]))
+    # Skip the update entirely on a bad batch (Fix 3): zero the grads so
+    # apply_gradients is a no-op instead of writing NaN/Inf into the weights.
+    safe_grads = [
+        tf.where(nan_in_grads, tf.zeros_like(g), g) for g in grads
+    ]
+    safe_grads, _ = tf.clip_by_global_norm(safe_grads, clip_norm=1.0)
+    optimizer.apply_gradients(zip(safe_grads, model.trainable_variables))
+
+    zero = tf.constant(0.0, dtype=tf.float32)
+    # 9-tuple contract: (total, seq, kd, mem, innov, zsat, rail, shape, nan)
+    return total, l_seq, l_kd, zero, zero, zero, zero, zero, tf.cast(nan_in_grads, tf.float32)
 
 def val_step_phase1_per_replica(batch_x, batch_y, model, alpha, channel_scales, huber_delta, output_loss):
     enc_b   = batch_x["enc_input"]
@@ -348,18 +356,27 @@ def val_step_phase1_per_replica(batch_x, batch_y, model, alpha, channel_scales, 
     l_kd  = output_loss_fn(tpred_b, s_out, channel_scales, huber_delta, output_loss)
     total = (1.0 - alpha) * l_seq + alpha * l_kd
     mae   = tf.reduce_mean(tf.abs(s_out - tgt_b))
-    return total, l_seq, l_kd, mae
+
+    zero = tf.constant(0.0, dtype=tf.float32)
+    # 9-tuple contract: (total, seq, kd, mem, innov, zsat, rail, shape, mae)
+    return total, l_seq, l_kd, zero, zero, zero, zero, zero, mae
 
 def make_dist_phase1_train(strategy, model, optimizer, alpha, channel_scales, huber_delta, output_loss):
     @tf.function
     def step(bx, by):
         pr = strategy.run(train_step_phase1_per_replica,
                           args=(bx, by, model, optimizer, alpha, channel_scales, huber_delta, output_loss))
+        # pr = (total, seq, kd, mem, innov, zsat, rail, shape, nan)
         return (
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[0], axis=None),
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[1], axis=None),
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[2], axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.SUM,  pr[3], axis=None) > 0.0,
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[3], axis=None),
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[4], axis=None),
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[5], axis=None),
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[6], axis=None),
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[7], axis=None),
+            strategy.reduce(tf.distribute.ReduceOp.SUM,  pr[8], axis=None),
         )
     return step
 
@@ -368,11 +385,10 @@ def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta, ou
     def step(bx, by):
         pr = strategy.run(val_step_phase1_per_replica,
                           args=(bx, by, model, alpha, channel_scales, huber_delta, output_loss))
-        return (
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[0], axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[1], axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[2], axis=None),
-            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[3], axis=None),
+        # pr = (total, seq, kd, mem, innov, zsat, rail, shape, mae)
+        return tuple(
+            strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[i], axis=None)
+            for i in range(9)
         )
     return step
 
@@ -544,15 +560,39 @@ def training_loop_memoq(
         global_epoch = len(history["phase"])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
         stage_idx = stage_order_list.index(resume_stage)
-        if stage_idx >= 1 and os.path.exists(p1_ckpt):
+        # Always restore P1 float weights first (needed for the P1->P2 transfer
+        # if we somehow resume at the P2A boundary before transfer).
+        if os.path.exists(p1_ckpt):
             float_student.load_weights(p1_ckpt)
             pf("[RESUME] Loaded P1 weights for float_student")
-        if stage_idx >= 2:
-            ckpt = p2a_ckpt if stage_idx == 2 else (p2b_ckpt if stage_idx == 3 else p2c_ckpt)
-            if os.path.exists(ckpt):
-                phase2_model.load_weights(ckpt)
-                pf(f"[RESUME] Loaded P2 weights for phase2_model from {ckpt}")
-        if stage_idx >= 4 and os.path.exists(p3_ckpt):
+
+        # Load the checkpoint of the stage we are ACTUALLY resuming into, not the
+        # previous stage. Resuming into P2B must load stage2b_best, not stage2a.
+        # Loading the previous stage's weights while continuing from the current
+        # stage's saved epoch number silently trains on wrong weights.
+        if resume_stage == "P2A" and os.path.exists(p2a_ckpt):
+            phase2_model.load_weights(p2a_ckpt)
+            pf(f"[RESUME] Loaded P2A weights for phase2_model from {p2a_ckpt}")
+        elif resume_stage == "P2B" and os.path.exists(p2b_ckpt):
+            phase2_model.load_weights(p2b_ckpt)
+            pf(f"[RESUME] Loaded P2B weights for phase2_model from {p2b_ckpt}")
+        elif resume_stage == "P2C" and os.path.exists(p2c_ckpt):
+            phase2_model.load_weights(p2c_ckpt)
+            pf(f"[RESUME] Loaded P2C weights for phase2_model from {p2c_ckpt}")
+        elif resume_stage in ("P2B", "P2C") and not os.path.exists(
+            p2b_ckpt if resume_stage == "P2B" else p2c_ckpt
+        ):
+            # The current stage has no checkpoint yet (interrupted before its
+            # first save). Fall back to the most recent EARLIER stage checkpoint
+            # and restart THIS stage from epoch 0 to avoid wrong-weight training.
+            fallback = p2a_ckpt if resume_stage == "P2B" else p2b_ckpt
+            if os.path.exists(fallback):
+                phase2_model.load_weights(fallback)
+                pf(f"[RESUME] {resume_stage} checkpoint missing — loaded earlier "
+                   f"{fallback} and restarting {resume_stage} from epoch 0")
+                resume_epoch_in_stage = 0
+
+        if resume_stage == "P3" and os.path.exists(p3_ckpt):
             final_qkeras_student.load_weights(p3_ckpt)
             pf("[RESUME] Loaded P3 weights for final_qkeras_student")
         sys.stdout.flush()
@@ -2056,10 +2096,15 @@ def make_dist_memoq_train(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        if teacher_hidden_model is not None:
+        # Only run the teacher-hidden forward pass if a hidden loss actually
+        # consumes it. For the control run (mem=innov=0) this skips a full
+        # teacher forward every batch.
+        if (use_mem or use_innov) and teacher_hidden_model is not None:
             h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
-        else:
+        elif (use_mem or use_innov):
             h_teacher = batch_x.get("teacher_hidden", None)
+        else:
+            h_teacher = None
 
         with tf.GradientTape() as tape:
             model_out = phase2_model([enc_b, dec_b], training=True)
@@ -2114,8 +2159,12 @@ def make_dist_memoq_train(
             for g, v in zip(grads, phase2_model.trainable_variables)
         ]
         nan_in_grads = tf.reduce_any(tf.stack([
-            tf.reduce_any(tf.math.is_nan(g)) for g in grads
+            tf.reduce_any(tf.math.is_nan(g)) | tf.reduce_any(tf.math.is_inf(g))
+            for g in grads
         ]))
+        # Skip the update on a bad batch: zero every gradient so apply_gradients
+        # is a no-op instead of writing NaN/Inf into the weights.
+        grads = [tf.where(nan_in_grads, tf.zeros_like(g), g) for g in grads]
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, phase2_model.trainable_variables))
 
@@ -2182,10 +2231,12 @@ def make_dist_memoq_val(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        if teacher_hidden_model is not None:
+        if (use_mem or use_innov) and teacher_hidden_model is not None:
             h_teacher = teacher_hidden_model([enc_b, dec_b], training=False)
-        else:
+        elif (use_mem or use_innov):
             h_teacher = batch_x.get("teacher_hidden", None)
+        else:
+            h_teacher = None
 
         model_out = phase2_model([enc_b, dec_b], training=False)
 
@@ -2333,18 +2384,19 @@ def make_dist_memoq_train_final(
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,      tf.float32)
     seq_len_int  = int(seq_len)
+    use_teacher_hidden = (float(lambda_m) > 0.0) or (float(lambda_i) > 0.0)
 
     def train_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
         dec_b   = batch_x["dec_input"]
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
-
-        if teacher_hidden_model is not None:
+        if use_teacher_hidden and teacher_hidden_model is not None:
             teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
-        else:
+        elif use_teacher_hidden:
             teacher_hid_b = batch_x.get("teacher_hidden", None)
-
+        else:
+            teacher_hid_b = None
         with tf.GradientTape() as tape:
             seq_out, dec_h_seq = final_hidden_model([enc_b, dec_b], training=True)
 
@@ -2395,8 +2447,12 @@ def make_dist_memoq_train_final(
             for g, v in zip(grads, final_qkeras_student.trainable_variables)
         ]
         nan_in_grads = tf.reduce_any(tf.stack([
-            tf.reduce_any(tf.math.is_nan(g)) for g in grads
+            tf.reduce_any(tf.math.is_nan(g)) | tf.reduce_any(tf.math.is_inf(g))
+            for g in grads
         ]))
+        # Skip the update on a bad batch: zero every gradient so apply_gradients
+        # is a no-op instead of writing NaN/Inf into the weights.
+        grads = [tf.where(nan_in_grads, tf.zeros_like(g), g) for g in grads]
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, final_qkeras_student.trainable_variables))
 
@@ -2449,10 +2505,13 @@ def make_dist_memoq_val_final(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        if teacher_hidden_model is not None:
+        # Skip the teacher-hidden forward pass when neither mem nor innov is on.
+        if (lambda_m_f > 0.0 or lambda_i_f > 0.0) and teacher_hidden_model is not None:
             teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
-        else:
+        elif (lambda_m_f > 0.0 or lambda_i_f > 0.0):
             teacher_hid_b = batch_x.get("teacher_hidden", None)
+        else:
+            teacher_hid_b = None
 
         seq_out, dec_h_seq = final_hidden_model_val([enc_b, dec_b], training=False)
 
