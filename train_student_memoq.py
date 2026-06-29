@@ -1241,19 +1241,14 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     Assign quantizers to MemoQGRUCell gate variables based on the
     MemoQ curriculum stage.
 
-    Stage P2A : quantize h gate only (W_h, U_h). State float.
-    Stage P2B : quantize h + r gates. State float.
-    Stage P2C : quantize h + r + z gates + state + activation (full pre-hardening).
-    Stage P3  : same as P2C. Full hard 4-bit. Transfer to QKeras happens next.
-
-    KEY FIX: P2C now enables quantizer_state AND quantizer_activation so the
-    cell trains against quantized_tanh-clipped hidden states, matching exactly
-    what the hard QKeras QGRU does at inference. This eliminates the cliff
-    at the P2C->P3 boundary by ensuring the model has already seen discretised
-    tanh-range states for at least memoq_stage2c_epochs epochs before cutover.
+    Weight/recurrent quantizers now use alpha="auto_po2" to match the final
+    QKeras student (build_final_qkeras_student). Using alpha=1.0 here while
+    the final model used auto_po2 would create a scale mismatch at the
+    P2C->P3 packing boundary; keeping them identical removes that source of
+    the cliff. State stays at alpha=1.0 (bounded [-1, 1] hidden state).
     """
-    q4 = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
-    q4s = quantized_bits(args.bits_state, 0, 1, alpha=1.0)
+    q4  = quantized_bits(args.bits_kernel,     0, 1, alpha="auto_po2")
+    q4s = quantized_bits(args.bits_state,      0, 1, alpha=1.0)
     q4a = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
     if stage == "P2A":
@@ -1289,7 +1284,6 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         cell.quantizer_z          = q_z
         cell.quantizer_state      = q_s
         cell.quantizer_activation = q_a
-
 
 def transfer_float_to_phase2(float_student, phase2_model, enc_cell, dec_cell, pf):
     """
@@ -1637,7 +1631,7 @@ def training_loop_memoq(
             pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_h = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
+        qbits_h = quantized_bits(args.bits_kernel, 0, 1, alpha="auto_po2")        
         enc_cell_p2.quantizer_h = qbits_h
         dec_cell_p2.quantizer_h = qbits_h
         enc_cell_p2.quantizer_z = None
@@ -1762,7 +1756,7 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_r = quantized_bits(args.bits_recurrent, 0, 1, alpha=1.0)
+        qbits_r = quantized_bits(args.bits_recurrent, 0, 1, alpha="auto_po2")
         enc_cell_p2.quantizer_r = qbits_r
         dec_cell_p2.quantizer_r = qbits_r
 
@@ -1854,7 +1848,7 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_z = quantized_bits(args.bits_kernel, 0, 1, alpha=1.0)
+        qbits_z = quantized_bits(args.bits_kernel, 0, 1, alpha="auto_po2")
         enc_cell_p2.quantizer_z = qbits_z
         dec_cell_p2.quantizer_z = qbits_z
 
@@ -1870,24 +1864,26 @@ def training_loop_memoq(
         dist_train_p2c = make_dist_memoq_train(
             strategy, phase2_model, opt_p2c,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.05, 0.005, 0.002, 0.001,
+            0.05, 0.005, 0.002, 0.0002,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             use_mem=True, use_innov=True,
             use_zsat=True, use_rail=True,
             has_z_logit=True, clipnorm=1.0,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=0.5 * args.memoq_lambda_shape,
         )
         dist_val_p2c = make_dist_memoq_val(
             strategy, phase2_model,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.05, 0.005, 0.002, 0.001,
+            0.05, 0.005, 0.002, 0.0002,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             use_mem=True, use_innov=True,
             use_zsat=True, use_rail=True,
             has_z_logit=True,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=0.5 * args.memoq_lambda_shape,
         )
 
         for ep_in_phase in range(ep2c_start, args.memoq_stage2c_epochs):
@@ -1985,19 +1981,21 @@ def training_loop_memoq(
         dist_train_p3 = make_dist_memoq_train_final(
             strategy, final_qkeras_student, opt_p3,
             0.5, channel_scales, args.memoq_huber_delta,
-            0.03, 0.00002, 0.0, 0.0005,
+            0.03, 0.00002, 0.0, 0.0,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             clipnorm=0.5,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape,
         )
         dist_val_p3 = make_dist_memoq_val_final(
             strategy, final_qkeras_student,
             0.5, channel_scales, args.memoq_huber_delta,
-            0.03, 0.00002, 0.0, 0.0005,
+            0.03, 0.00002, 0.0, 0.0,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape,
         )
 
         for ep_in_phase in range(ep3_start, args.memoq_stage3_epochs):
@@ -2532,14 +2530,18 @@ def build_final_qkeras_student(
     bits_kernel, bits_recurrent, bits_bias,
     bits_activation, bits_state,
 ):
+    # auto_po2 lets each weight tensor learn a per-tensor power-of-2 scale,
+    # so all 2^bits levels land where the weights actually live instead of
+    # being wasted on an unused +/-1 range. State stays at alpha=1.0 because
+    # the convex-combination hidden state is genuinely bounded to [-1, 1].
     def qwk():
-        return quantized_bits(bits_kernel, 0, 1, alpha=1.0)
+        return quantized_bits(bits_kernel, 0, 1, alpha="auto_po2")
 
     def qwr():
-        return quantized_bits(bits_recurrent, 0, 1, alpha=1.0)
+        return quantized_bits(bits_recurrent, 0, 1, alpha="auto_po2")
 
     def qwb():
-        return quantized_bits(bits_bias, 0, 1, alpha=1.0)
+        return quantized_bits(bits_bias, 0, 1, alpha="auto_po2")
 
     def qa():
         return quantized_tanh(bits=bits_activation, symmetric=True)
@@ -2548,7 +2550,7 @@ def build_final_qkeras_student(
         return quantized_bits(bits_state, 0, 1, alpha=1.0)
 
     def qd():
-        return quantized_bits(bits_kernel, 0)
+        return quantized_bits(bits_kernel, 0, 1, alpha="auto_po2")
 
     enc_inputs = keras.layers.Input(shape=(None, 1), name="senc_input")
     dec_inputs = keras.layers.Input(shape=(None, 1), name="sdec_input")
@@ -2652,12 +2654,10 @@ def loss_innov(h_student, h_teacher, epsilon_innov):
     Temporal innovation-profile matching loss L_innov.
 
     Matches the per-timestep innovation curve between teacher and student
-    using a log-scale squared difference. This prevents a bad 4-bit GRU from
-    gaming a scalar variance match by shifting changes to the wrong timesteps.
-
-    Formula:
-      v_t(h) = (1/H) * sum_d (h_t_d - h_{t-1}_d)^2   [per timestep]
-      L_innov = (1/(T-1)) * sum_t [ log(v_t(h^S) + eps) - log(v_t(h^T) + eps) ]^2
+    using a log-scale squared difference. The per-timestep log-ratio is now
+    clipped to [-3, 3] so a transiently frozen quantised state (v_s -> 0)
+    cannot inject an unbounded gradient. The unbounded form was producing
+    raw values of 15-25 in P3 and destabilising the hard fine-tune.
 
     h_student     : (batch, T, Hs)
     h_teacher     : (batch, T, Ht)
@@ -2674,6 +2674,7 @@ def loss_innov(h_student, h_teacher, epsilon_innov):
     v_t = tf.reduce_mean(tf.square(diff_t), axis=[0, 2])
 
     log_diff = tf.math.log(v_s + eps) - tf.math.log(v_t + eps)
+    log_diff = tf.clip_by_value(log_diff, -3.0, 3.0)
     return tf.reduce_mean(tf.square(log_diff))
 
 
@@ -2709,24 +2710,20 @@ def loss_zsat_value(z_values, rho_z=0.98):
     return tf.reduce_mean(tf.square(penalty_hi) + tf.square(penalty_lo))
 
 
-def loss_railpred(h_student, rho_rail=0.90, mu_rail=1.0):
+def loss_railpred(h_student, rho_rail=0.97, mu_rail=0.0):
     """
-    Predictive rail-margin regularization L_railpred.
+    Hidden-state rail barrier.
 
-    Penalises hidden states that are not yet at the quantizer rail but are
-    moving toward it fast enough to hit it at the next step. This fires
-    BEFORE the boundary hit, solving early rail collision.
+    Only penalises states inside the top (1 - rho) fraction of the quantiser
+    range, i.e. about to clip at the +/-1 boundary. The previous version also
+    penalised the one-step velocity |h_t - h_{t-1}| (mu_rail=0.9), which
+    actively suppressed the fast hidden-state transitions required to encode
+    short and long decay constants and therefore COMPRESSED the predicted-tau
+    dynamic range toward the mean. The velocity term is removed (mu_rail=0.0
+    by default) and the magnitude threshold is raised to 0.97 so only genuine
+    saturation is discouraged, never normal use of the state range.
 
-    Formula:
-      L_railpred = E_{t,d} [ ReLU( |h_t^q| + mu * |h_t^q - h_{t-1}^q| - rho )^2 ]
-
-    rho  = 0.90  (spec: rho=0.90)
-    mu   = 1.0   (spec: mu=1.0, one-step predictive weight)
-
-    h_student : (batch, T, H) — student decoder hidden sequence
-    rho_rail  : float, boundary threshold, default 0.90 per spec
-    mu_rail   : float, predictive step weight, default 1.0 per spec
-
+    h_student : (batch, T, H)
     Returns scalar tf.Tensor.
     """
     rho = tf.cast(rho_rail, tf.float32)
@@ -2739,6 +2736,48 @@ def loss_railpred(h_student, rho_rail=0.90, mu_rail=1.0):
     excess = tf.nn.relu(predicted_mag - rho)
     return tf.reduce_mean(tf.square(excess))
 
+
+def loss_shape(y_true, y_pred, huber_delta, amp_floor_frac=0.05, eps=1e-6):
+    """
+    Amplitude-decoupled decay-shape loss.
+
+    For the two lifetime-bearing channels (ch1 -> tau1, ch2 -> tau2) each
+    per-sample curve is normalised by its own t=0 amplitude. Because
+    tau = trapz(curve) / curve[t=0], the trapezoidal integral of the
+    t0-normalised curve is EXACTLY the lifetime tau. Matching the normalised
+    curves therefore forces the student to reproduce the teacher/target
+    lifetimes AND the full decay shape, WITHOUT ever computing tau in the
+    graph and WITHOUT a division-by-tiny-amplitude instability (a relative
+    amplitude floor guards the denominator).
+
+    For decay curves the peak is at t=0, so denom == amp0 and the floor
+    almost never binds; it only protects the rare dim-signal sample.
+
+    y_true, y_pred : (B, T, C) with C >= 3
+    Returns scalar tf.Tensor.
+    """
+    delta = tf.cast(huber_delta, tf.float32)
+    floor = tf.cast(amp_floor_frac, tf.float32)
+    eps_f = tf.cast(eps, tf.float32)
+
+    def normalise(seq):
+        ch   = seq[:, :, 1:3]                                   # (B, T, 2)
+        amp0 = ch[:, 0:1, :]                                    # (B, 1, 2) value at t=0
+        peak = tf.reduce_max(tf.abs(ch), axis=1, keepdims=True) # (B, 1, 2)
+        denom = tf.maximum(tf.abs(amp0), floor * peak)
+        denom = tf.maximum(denom, eps_f)
+        return ch / denom
+
+    n_true   = normalise(y_true)
+    n_pred   = normalise(y_pred)
+    residual = n_pred - n_true
+    abs_res  = tf.abs(residual)
+    huber = tf.where(
+        abs_res <= delta,
+        0.5 * tf.square(residual),
+        delta * (abs_res - 0.5 * delta),
+    )
+    return tf.reduce_mean(huber)
 
 def channel_normalised_huber_memoq(y_true, y_pred, channel_scales, huber_delta):
     """
@@ -2790,12 +2829,14 @@ def make_dist_memoq_train(
     has_z_logit,
     clipnorm,
     teacher_hidden_model=None,
+    lambda_s=0.0,
 ):
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
+    lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,      tf.float32)
     seq_len_int  = int(seq_len)
@@ -2849,6 +2890,12 @@ def make_dist_memoq_train(
             else:
                 l_r = tf.constant(0.0, dtype=tf.float32)
 
+            l_shape = (
+                (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
+                + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
+            )
+            total = total + lambda_s_f * l_shape
+
         grads = tape.gradient(total, phase2_model.trainable_variables)
         grads = [
             tf.zeros_like(v) if g is None else g
@@ -2866,7 +2913,7 @@ def make_dist_memoq_train(
             l_kd,
             l_m,
             l_i,
-            l_z,
+            l_shape,
             l_r,
             tf.cast(nan_in_grads, tf.float32),
         )
@@ -2901,12 +2948,14 @@ def make_dist_memoq_val(
     use_rail,
     has_z_logit,
     teacher_hidden_model=None,
+    lambda_s=0.0,
 ):
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
+    lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     seq_len_int  = int(seq_len)
 
@@ -2958,6 +3007,12 @@ def make_dist_memoq_val(
         else:
             l_r = tf.constant(0.0, dtype=tf.float32)
 
+        l_shape = (
+            (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
+            + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
+        )
+        total = total + lambda_s_f * l_shape
+
         mae = tf.reduce_mean(tf.abs(s_pred - tgt_b))
 
         return (
@@ -2966,7 +3021,7 @@ def make_dist_memoq_val(
             l_kd,
             l_m,
             l_i,
-            l_z,
+            l_shape,
             l_r,
             mae,
         )
@@ -2980,7 +3035,6 @@ def make_dist_memoq_val(
         )
 
     return dist_val_step
-
 
 # ==============================================================================
 # make_dist_memoq_train_final / make_dist_memoq_val_final:
@@ -3043,6 +3097,7 @@ def make_dist_memoq_train_final(
     mu_rail,
     clipnorm,
     teacher_hidden_model=None,
+    lambda_s=0.0,
 ):
     final_hidden_model = build_final_hidden_model(final_qkeras_student)
 
@@ -3051,6 +3106,7 @@ def make_dist_memoq_train_final(
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
+    lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,      tf.float32)
     seq_len_int  = int(seq_len)
@@ -3086,12 +3142,13 @@ def make_dist_memoq_train_final(
             l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
             total = total + lambda_r_f * l_r
 
-            if lambda_z_f > 0.0:
-                excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
-                l_z = tf.reduce_mean(tf.square(excess_z))
-                total = total + lambda_z_f * l_z
-            else:
-                l_z = tf.constant(0.0, dtype=tf.float32)
+            l_shape = (
+                (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
+                + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
+            )
+            total = total + lambda_s_f * l_shape
+
+            l_z = tf.constant(0.0, dtype=tf.float32)
 
         grads = tape.gradient(total, final_qkeras_student.trainable_variables)
         grads = [
@@ -3104,7 +3161,7 @@ def make_dist_memoq_train_final(
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, final_qkeras_student.trainable_variables))
 
-        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, tf.cast(nan_in_grads, tf.float32)
+        return total, l_seq, l_kd, l_m, l_i, l_shape, l_r, tf.cast(nan_in_grads, tf.float32)
 
     @tf.function
     def dist_step(batch_x, batch_y):
@@ -3115,7 +3172,6 @@ def make_dist_memoq_train_final(
         )
 
     return dist_step
-
 
 def make_dist_memoq_val_final(
     strategy,
@@ -3132,6 +3188,7 @@ def make_dist_memoq_val_final(
     rho_rail,
     mu_rail,
     teacher_hidden_model=None,
+    lambda_s=0.0,
 ):
     final_hidden_model_val = build_final_hidden_model(final_qkeras_student)
 
@@ -3140,6 +3197,7 @@ def make_dist_memoq_val_final(
     lambda_i_f   = tf.cast(lambda_i,      tf.float32)
     lambda_z_f   = tf.cast(lambda_z,      tf.float32)
     lambda_r_f   = tf.cast(lambda_r,      tf.float32)
+    lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     seq_len_int  = int(seq_len)
 
@@ -3173,15 +3231,16 @@ def make_dist_memoq_val_final(
         l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
         total = total + lambda_r_f * l_r
 
-        if lambda_z_f > 0.0:
-            excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
-            l_z = tf.reduce_mean(tf.square(excess_z))
-            total = total + lambda_z_f * l_z
-        else:
-            l_z = tf.constant(0.0, dtype=tf.float32)
+        l_shape = (
+            (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
+            + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
+        )
+        total = total + lambda_s_f * l_shape
+
+        l_z = tf.constant(0.0, dtype=tf.float32)
 
         mae = tf.reduce_mean(tf.abs(seq_out - tgt_b))
-        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, mae
+        return total, l_seq, l_kd, l_m, l_i, l_shape, l_r, mae
 
     @tf.function
     def dist_val_step(batch_x, batch_y):
@@ -3192,6 +3251,7 @@ def make_dist_memoq_val_final(
         )
 
     return dist_val_step
+
 
 # ==============================================================================
 # run_epoch for MemoQ — extended to handle 8-output step functions.
@@ -4164,11 +4224,15 @@ def parse_args():
     p.add_argument("--memoq-lambda-innov", type=float, default=0.005)
     p.add_argument("--memoq-lambda-zsat",  type=float, default=0.002)
     p.add_argument("--memoq-lambda-rail",  type=float, default=0.001)
+    p.add_argument("--memoq-lambda-shape", type=float, default=0.15,
+                   help="Weight on the amplitude-decoupled decay-shape loss "
+                        "(t0-normalised curve = exact tau surrogate). "
+                        "P2C uses half this value, P3 uses the full value.")
 
     p.add_argument("--memoq-huber-delta",    type=float, default=0.1)
     p.add_argument("--memoq-rho-z",          type=float, default=0.98)
-    p.add_argument("--memoq-rho-rail",       type=float, default=0.88)
-    p.add_argument("--memoq-mu-rail",        type=float, default=0.9)
+    p.add_argument("--memoq-rho-rail",       type=float, default=0.97)
+    p.add_argument("--memoq-mu-rail",        type=float, default=0.0)
     p.add_argument("--memoq-innov-burnin",   type=int,   default=5)
 
     p.add_argument("--memoq-phase3-lr",        type=float, default=5e-6)
