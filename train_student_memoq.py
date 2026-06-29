@@ -3,85 +3,59 @@
 train_student_memoq_full.py  —  MemoQ: Memory-Preserving 4-bit Recurrent
 Quantization for GRU-based Sequence-to-Sequence Knowledge Distillation.
 
+CONTROLLED-EXPERIMENT DESIGN:
+  The final exported model is the SAME inference graph and quantization config
+  as the vanilla 4-bit KD student. MemoQ differs ONLY in the training path, so
+  any improvement is attributable to memory-preserving training, not to a
+  different architecture, head, or quantizer family. Use --quantizer-alpha 1.0
+  and --output-loss mse for the vanilla-identical control.
+
 ROOT CAUSE TARGETED:
   Small 4-bit GRUs fail through two coupled recurrent mechanisms:
   (1) Memory-gate saturation: simultaneous 4-bit quantization of z/r/h gates
-      destabilises the update gate. Saturation toward 1 makes the cell
-      feedforward (overwrites memory); saturation toward 0 freezes
-      quantisation error in the hidden state.
+      destabilises the update gate.
   (2) Recurrent state-error accumulation: per-step quantisation errors
-      accumulate through the recurrence, driving the hidden state to the
-      4-bit boundary before output KD can recover temporal memory.
+      accumulate through the recurrence before output KD can recover memory.
 
-METHOD — THREE PHASES:
-  Phase 1  (float/8-bit warm-up, 30-50 ep):
-    Float student, same topology+layer names as final QKeras student.
-    L = (1-alpha)*HuberCN(s, gt) + alpha*HuberCN(s, teacher)  [alpha=0.7]
-    Channel scales from teacher predictions over training split.
+PHASES:
+  Phase 1  — float warm-up. Loss obeys --output-loss (mse | huber_cn),
+             blended teacher/target by --alpha. LR = effective_lr * --memoq-lr-mult-p1.
+  Phase 2  — gate-decoupled hardening (2A/2B/2C). When --memoq-gate-curriculum
+             True, gates harden causally h -> r -> z (kernel, recurrent, bias,
+             then state+activation once all gates are 4-bit). When False, all
+             gates harden at 2A (control rung B). QDense head is quantized from
+             Phase 2 onward. Per-phase, per-loss lambdas via CLI.
+  Phase 3  — hard 4-bit QKeras polish. LR = max(effective_lr * --memoq-lr-mult-p3,
+             --memoq-phase3-lr-floor). Per-phase lambdas via the *-p3 args.
 
-  Phase 2  (gate-decoupled 4-bit hardening, stages 2A/2B/2C):
-    Custom SplitGateQGRUCell with separate W_z, W_r, W_h / U_z, U_r, U_h.
-    Quantise gates in causal order: h first, then r, then z (NOT packed order).
-    Stage 2A: quantise h-gate (candidate). L += 0.01 L_mem + 0.0005 L_rail
-              After 5 epochs activate L_innov (lambda=0.005).
-    Stage 2B: quantise r-gate. L weights escalated.
-    Stage 2C: quantise z-gate. Activate L_zsat (logit barrier).
-    Full MemoQ loss:
-      L = L_seq + alpha*L_KD + lm*L_mem + li*L_innov + lz*L_zsat + lr*L_rail
+AUXILIARY LOSSES (all per-phase args, default 0.0 => disabled):
+  L_mem    — lagged temporal memory-kernel distillation
+  L_innov  — temporal innovation-profile matching (clipped log-ratio)
+  L_zsat   — update-gate saturation barrier (gate-value form; hidden-rail
+             proxy in Phase 3)
+  L_rail   — hidden-state rail-margin regulariser
+  L_shape  — amplitude-decoupled decay-shape match (t0-normalised curve)
 
-  Phase 3  (hard 4-bit polish):
-    All gates/kernels/biases/activations/states hard 4-bit via standard
-    QKeras QGRU. Weights transferred by concatenating split-gate variables
-    in Keras/QKeras packed order [z|r|h]. Low LR ~5e-6, clipnorm=0.5.
+EXPERIMENTAL LADDER (no code edits — CLI only):
+  A/B control : --output-loss mse --quantizer-alpha 1.0
+                --memoq-gate-curriculum false   (all aux lambdas 0.0)
+  C gate      : --memoq-gate-curriculum true
+  D +memory   : add --memoq-lambda-mem-p2a/p2b/p2c/p3
+  E +innov    : add --memoq-lambda-innov-*
+  F full      : add small --memoq-lambda-zsat-* / -rail-* / -shape-*
 
-AUXILIARY LOSSES:
-  L_mem    — lagged temporal memory kernel distillation (dimension-free)
-  L_innov  — temporal innovation-profile matching (log-ratio)
-  L_zsat   — update-gate saturation barrier (logit barrier |logit|>3)
-  L_rail   — predictive rail-margin regularisation on hidden state
+DIAGNOSTICS:
+  [EQUIV P1->P2] : float student vs split-gate cell with quantizers off (~<1e-4).
+  [EQUIV P2C->P3]: phase2 model vs packed QKeras student (small => faithful export).
+  [CONFIG]       : instantiated QGRU/QDense configs for vanilla-identity check.
 
-FINAL EXPORT:
-  Standard QKeras QGRU encoder (sencgru) + QGRU decoder (sdecgru) +
-  QDense head (sdec_dense). No auxiliary parameters at inference.
-
-USAGE:
-  python train_student_memoq_full.py \\
-      --data-dir /path/to/data \\
-      --teacher-ckpt /path/to/teacher_best.weights.h5 \\
-      --save-dir /path/to/runs \\
-      --bits-kernel 4 --bits-bias 4 --bits-recurrent 4 \\
-      --bits-activation 4 --bits-state 4 \\
-      --student-units 32 --teacher-units 128 --teacher-layers 2 \\
-      --seq-len 135 --n-out 3 --gate-width-ns 0.09 \\
-      --batch-size 16384 --lr 1e-4 --ref-batch-size 1024 \\
-      --lr-factor 0.5 --lr-patience 8 --lr-min 1e-6 \\
-      --temperature 4.0 --alpha 0.7 \\
-      --memoq-warmup-epochs 40 \\
-      --memoq-stage2a-epochs 30 --memoq-stage2b-epochs 30 \\
-      --memoq-stage2c-epochs 30 --memoq-finetune-epochs 170 \\
-      --memoq-lambda-mem 0.03 --memoq-lambda-innov 0.005 \\
-      --memoq-lambda-zsat 0.002 --memoq-lambda-rail 0.001 \\
-      --memoq-huber-delta 0.1 --memoq-rho-z 0.98 \\
-      --memoq-rho-rail 0.88 --memoq-mu-rail 0.9 \\
-      --patience 30 --log-interval 10 --infer-batch 8192 \\
-      --prefetch-batches 4 --pipeline-workers 4 \\
-      --split-seed 42
-
-OUTPUTS (all inside --save-dir / results / job_name /):
-  phase1_best.weights.h5
-  stage2a_best.weights.h5
-  stage2b_best.weights.h5
-  stage2c_best.weights.h5
-  student_best.weights.h5       <- final hard 4-bit QKeras model
-  student_final.weights.h5
-  student_args.json
-  training_history.csv
-  training_history.png
-  test_metrics.json
-  test_scatter_tau1.png  test_scatter_tau2.png  test_scatter_fret.png
-  test_residuals.png
+OUTPUTS (inside --save-dir / results / job_name /):
+  phase1_best.weights.h5  stage2a_best.weights.h5  stage2b_best.weights.h5
+  stage2c_best.weights.h5  student_best.weights.h5  student_final.weights.h5
+  student_args.json  training_history.csv  training_history.png
+  test_metrics.json  test_scatter_tau1.png  test_scatter_tau2.png
+  test_scatter_fret.png  test_residuals.png
 """
-
 import argparse
 import glob
 import json
@@ -341,7 +315,7 @@ def bar(step, total, metrics: dict, epoch_start_time: float, width=28):
 # ==============================================================================
 
 def train_step_phase1_per_replica(batch_x, batch_y, model, optimizer,
-                                  alpha, channel_scales, huber_delta):
+                                  alpha, channel_scales, huber_delta, output_loss):
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
     tpred_b = batch_x["tpred"]
@@ -349,8 +323,8 @@ def train_step_phase1_per_replica(batch_x, batch_y, model, optimizer,
 
     with tf.GradientTape() as tape:
         s_out = model([enc_b, dec_b], training=True)
-        l_seq = channel_normalised_huber_memoq(tgt_b,   s_out, channel_scales, huber_delta)
-        l_kd  = channel_normalised_huber_memoq(tpred_b, s_out, channel_scales, huber_delta)
+        l_seq = output_loss_fn(tgt_b,   s_out, channel_scales, huber_delta, output_loss)
+        l_kd  = output_loss_fn(tpred_b, s_out, channel_scales, huber_delta, output_loss)
         total = (1.0 - alpha) * l_seq + alpha * l_kd
 
     grads = tape.gradient(total, model.trainable_variables)
@@ -363,26 +337,24 @@ def train_step_phase1_per_replica(batch_x, batch_y, model, optimizer,
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
     return total, l_seq, l_kd, nan_flag
 
-
-def val_step_phase1_per_replica(batch_x, batch_y, model, alpha, channel_scales, huber_delta):
+def val_step_phase1_per_replica(batch_x, batch_y, model, alpha, channel_scales, huber_delta, output_loss):
     enc_b   = batch_x["enc_input"]
     dec_b   = batch_x["dec_input"]
     tpred_b = batch_x["tpred"]
     tgt_b   = batch_y
 
     s_out = model([enc_b, dec_b], training=False)
-    l_seq = channel_normalised_huber_memoq(tgt_b,   s_out, channel_scales, huber_delta)
-    l_kd  = channel_normalised_huber_memoq(tpred_b, s_out, channel_scales, huber_delta)
+    l_seq = output_loss_fn(tgt_b,   s_out, channel_scales, huber_delta, output_loss)
+    l_kd  = output_loss_fn(tpred_b, s_out, channel_scales, huber_delta, output_loss)
     total = (1.0 - alpha) * l_seq + alpha * l_kd
     mae   = tf.reduce_mean(tf.abs(s_out - tgt_b))
     return total, l_seq, l_kd, mae
 
-
-def make_dist_phase1_train(strategy, model, optimizer, alpha, channel_scales, huber_delta):
+def make_dist_phase1_train(strategy, model, optimizer, alpha, channel_scales, huber_delta, output_loss):
     @tf.function
     def step(bx, by):
         pr = strategy.run(train_step_phase1_per_replica,
-                          args=(bx, by, model, optimizer, alpha, channel_scales, huber_delta))
+                          args=(bx, by, model, optimizer, alpha, channel_scales, huber_delta, output_loss))
         return (
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[0], axis=None),
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[1], axis=None),
@@ -391,12 +363,11 @@ def make_dist_phase1_train(strategy, model, optimizer, alpha, channel_scales, hu
         )
     return step
 
-
-def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta):
+def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta, output_loss):
     @tf.function
     def step(bx, by):
         pr = strategy.run(val_step_phase1_per_replica,
-                          args=(bx, by, model, alpha, channel_scales, huber_delta))
+                          args=(bx, by, model, alpha, channel_scales, huber_delta, output_loss))
         return (
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[0], axis=None),
             strategy.reduce(tf.distribute.ReduceOp.MEAN, pr[1], axis=None),
@@ -405,48 +376,67 @@ def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta):
         )
     return step
 
+
 def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     """
     Assign quantizers to MemoQGRUCell gate variables based on the curriculum
     stage AND the controlled-experiment quantizer family (args.q_alpha).
 
-    Phase 2 weight/recurrent quantizers use the SAME alpha family as the final
-    QKeras student (args.q_alpha), so the P2C->P3 packing boundary has no scale
-    mismatch. State stays at alpha=1.0 (bounded [-1, 1] hidden state).
+    Now also assigns:
+      - separate recurrent-kernel quantizers per gate using args.bits_recurrent
+        (Fix 7), so the CLI recurrent-bit setting is truthful even if it differs
+        from bits_kernel.
+      - a bias quantizer using args.bits_bias (Fix 6), hardening biases in the
+        same stage their gate hardens, matching the final QGRU bias_quantizer.
 
-    When args.memoq_gate_curriculum is False, P2A already quantises all gates
-    (z, r, h) plus state+activation — this is the MemoQ-control rung B with no
-    causal gate hardening. When True, gates harden h -> r -> z across A/B/C.
+    A gate's recurrent and bias quantizers turn on at the SAME stage as that
+    gate's input kernel, so P2A hardens h (kernel+recurrent+bias), P2B adds r,
+    P2C adds z. When --memoq-gate-curriculum False, all of them turn on at P2A.
+    State stays at alpha=1.0 (bounded [-1, 1] hidden state).
     """
-    q4  = quantized_bits(args.bits_kernel, 0, 1, alpha=args.q_alpha)
-    q4s = quantized_bits(args.bits_state,  0, 1, alpha=1.0)
-    q4a = quantized_tanh(bits=args.bits_activation, symmetric=True)
+    q4k  = quantized_bits(args.bits_kernel,    0, 1, alpha=args.q_alpha)
+    q4r  = quantized_bits(args.bits_recurrent, 0, 1, alpha=args.q_alpha)
+    q4b  = quantized_bits(args.bits_bias,      0, 1, alpha=args.q_alpha)
+    q4s  = quantized_bits(args.bits_state,     0, 1, alpha=1.0)
+    q4a  = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
     curriculum = args.memoq_gate_curriculum
 
+    # Decide which gates are hardened at this stage.
     if stage == "P2A":
-        if curriculum:
-            q_h, q_r, q_z, q_s, q_a = q4, None, None, None, None
-        else:
-            q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
+        gates_on = {"h"} if curriculum else {"h", "r", "z"}
     elif stage == "P2B":
-        if curriculum:
-            q_h, q_r, q_z, q_s, q_a = q4, q4, None, None, None
-        else:
-            q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
-    elif stage == "P2C":
-        q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
-    elif stage == "P3":
-        q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
+        gates_on = {"h", "r"} if curriculum else {"h", "r", "z"}
+    elif stage in ("P2C", "P3"):
+        gates_on = {"h", "r", "z"}
     else:
         raise ValueError(f"Unknown stage: {stage!r}. Expected one of P2A, P2B, P2C, P3.")
 
+    # Per-gate input + recurrent kernel quantizers.
+    q_h  = q4k if "h" in gates_on else None
+    q_r  = q4k if "r" in gates_on else None
+    q_z  = q4k if "z" in gates_on else None
+    rq_h = q4r if "h" in gates_on else None
+    rq_r = q4r if "r" in gates_on else None
+    rq_z = q4r if "z" in gates_on else None
+
+    # State + activation + bias turn on once ALL gates are hardened (P2C/P3),
+    # OR immediately at P2A when curriculum is disabled (all gates at once).
+    all_gates = gates_on == {"h", "r", "z"}
+    q_s    = q4s if all_gates else None
+    q_a    = q4a if all_gates else None
+    q_bias = q4b if all_gates else None
+
     for cell in [enc_cell, dec_cell]:
-        cell.quantizer_h          = q_h
-        cell.quantizer_r          = q_r
-        cell.quantizer_z          = q_z
-        cell.quantizer_state      = q_s
-        cell.quantizer_activation = q_a
+        cell.quantizer_h            = q_h
+        cell.quantizer_r            = q_r
+        cell.quantizer_z            = q_z
+        cell.quantizer_recurrent_h  = rq_h
+        cell.quantizer_recurrent_r  = rq_r
+        cell.quantizer_recurrent_z  = rq_z
+        cell.quantizer_state        = q_s
+        cell.quantizer_activation   = q_a
+        cell.quantizer_bias         = q_bias
 
 # ==============================================================================
 # Main MemoQ training loop
@@ -567,14 +557,18 @@ def training_loop_memoq(
             pf("[RESUME] Loaded P3 weights for final_qkeras_student")
         sys.stdout.flush()
 
-        csv_path = os.path.join(job_dir, "training_history.csv")
-        if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
-            with open(csv_path, "w") as f:
-                f.write(
-                    "epoch,phase,total,seq,kd,mem,innov,zsat,rail,shape,"
-                    "val_total,val_seq,val_kd,val_mem,val_innov,val_zsat,val_rail,val_shape,"
-                    "val_mae,lr\n"
-                )
+    # ── CSV path + header — runs for BOTH fresh and resumed jobs ──────────────
+    # This MUST live outside the resume `if` block above, otherwise a fresh run
+    # never assigns csv_path and Phase 1 crashes with UnboundLocalError.
+    csv_path = os.path.join(job_dir, "training_history.csv")
+    if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
+        with open(csv_path, "w") as f:
+            f.write(
+                "epoch,phase,total,seq,kd,mem,innov,zsat,rail,shape,"
+                "val_total,val_seq,val_kd,val_mem,val_innov,val_zsat,val_rail,val_shape,"
+                "val_mae,lr\n"
+            )
+
     def save_resume(stage_tag, ep_in_stage):
         state = {
             "stage":          stage_tag,
@@ -620,7 +614,7 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
 
-        lr_p1 = args.effective_lr
+        lr_p1 = args.effective_lr * args.memoq_lr_mult_p1
         opt_p1 = keras.optimizers.Adam(learning_rate=lr_p1)
         sched_p1 = ReduceLROnPlateau(
             opt_p1, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
@@ -628,10 +622,12 @@ def training_loop_memoq(
         sched_p1.reset(lr_p1)
 
         dist_train_p1 = make_dist_phase1_train(
-            strategy, float_student, opt_p1, args.alpha, channel_scales, args.memoq_huber_delta
+            strategy, float_student, opt_p1, args.alpha, channel_scales,
+            args.memoq_huber_delta, args.output_loss
         )
         dist_val_p1 = make_dist_phase1_val(
-            strategy, float_student, args.alpha, channel_scales, args.memoq_huber_delta
+            strategy, float_student, args.alpha, channel_scales,
+            args.memoq_huber_delta, args.output_loss
         )
 
         for ep_in_phase in range(start_ep("P1"), args.memoq_warmup_epochs):
@@ -692,22 +688,21 @@ def training_loop_memoq(
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2A — Candidate gate (h) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
+
     if should_run("P2A"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2A — Candidate gate h 4-bit ({args.memoq_stage2a_epochs} epochs)")
-        pf("  Quantising W_h, U_h only. z and r gates float.")
-        if should_run("P2A"):
-            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2A")
-            pf("=" * 60)
+        pf("  Curriculum=h-only (z,r float) when --memoq-gate-curriculum True; "
+           "all gates 4-bit when False.")
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2A")
+        pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_h = quantized_bits(args.bits_kernel, 0, 1, alpha="auto_po2")        
-        enc_cell_p2.quantizer_h = qbits_h
-        dec_cell_p2.quantizer_h = qbits_h
-        enc_cell_p2.quantizer_z = None
-        dec_cell_p2.quantizer_z = None
-        enc_cell_p2.quantizer_r = None
-        dec_cell_p2.quantizer_r = None
+        # NOTE: no manual quantizer override here. set_phase2_quantizers() is the
+        # single source of truth and already used args.q_alpha + the curriculum
+        # toggle. A manual auto_po2 override would (a) break the controlled
+        # vanilla-identical experiment and (b) force z/r back to float even when
+        # --memoq-gate-curriculum False asked for all gates quantized.
 
         lr_p2a = args.effective_lr * args.memoq_lr_mult_p2a
         opt_p2a = keras.optimizers.Adam(learning_rate=lr_p2a)
@@ -716,71 +711,53 @@ def training_loop_memoq(
         )
         sched_p2a.reset(lr_p2a)
 
-        innov_active = False
         ep2a_start = start_ep("P2A")
-
         innov_active = ep2a_start >= args.memoq_innov_burnin
 
+        def _build_p2a(innov_on):
+            lambda_i_2a = args.memoq_lambda_innov_p2a if innov_on else 0.0
+            train_fn = make_dist_memoq_train(
+                strategy, phase2_model, opt_p2a,
+                args.alpha, channel_scales, args.memoq_huber_delta,
+                args.memoq_lambda_mem_p2a, lambda_i_2a,
+                args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
+                epsilon_innov, args.seq_len,
+                args.memoq_rho_rail, args.memoq_mu_rail,
+                use_mem=(args.memoq_lambda_mem_p2a > 0.0),
+                use_innov=(innov_on and args.memoq_lambda_innov_p2a > 0.0),
+                use_zsat=(args.memoq_lambda_zsat_p2a > 0.0),
+                use_rail=(args.memoq_lambda_rail_p2a > 0.0),
+                has_z_logit=True, clipnorm=1.0,
+                teacher_hidden_model=teacher_hidden_model,
+                lambda_s=args.memoq_lambda_shape_p2a,
+                rho_z=args.memoq_rho_z,
+                output_loss=args.output_loss,
+            )
+            val_fn = make_dist_memoq_val(
+                strategy, phase2_model,
+                args.alpha, channel_scales, args.memoq_huber_delta,
+                args.memoq_lambda_mem_p2a, lambda_i_2a,
+                args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
+                epsilon_innov, args.seq_len,
+                args.memoq_rho_rail, args.memoq_mu_rail,
+                use_mem=(args.memoq_lambda_mem_p2a > 0.0),
+                use_innov=(innov_on and args.memoq_lambda_innov_p2a > 0.0),
+                use_zsat=(args.memoq_lambda_zsat_p2a > 0.0),
+                use_rail=(args.memoq_lambda_rail_p2a > 0.0),
+                has_z_logit=True,
+                teacher_hidden_model=teacher_hidden_model,
+                lambda_s=args.memoq_lambda_shape_p2a,
+                rho_z=args.memoq_rho_z,
+                output_loss=args.output_loss,
+            )
+            return train_fn, val_fn
 
-        lambda_i_2a = args.memoq_lambda_innov_p2a if innov_active else 0.0
-        dist_train_p2a = make_dist_memoq_train(
-            strategy, phase2_model, opt_p2a,
-            args.alpha, channel_scales, args.memoq_huber_delta,
-            args.memoq_lambda_mem_p2a, lambda_i_2a,
-            args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
-            epsilon_innov, args.seq_len,
-            args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=(args.memoq_lambda_mem_p2a > 0.0), use_innov=innov_active,
-            use_zsat=(args.memoq_lambda_zsat_p2a > 0.0), use_rail=(args.memoq_lambda_rail_p2a > 0.0),
-            has_z_logit=True, clipnorm=1.0,
-            teacher_hidden_model=teacher_hidden_model,
-            lambda_s=args.memoq_lambda_shape_p2a,
-            rho_z=args.memoq_rho_z,
-            output_loss=args.output_loss,
-        )
-        dist_val_p2a = make_dist_memoq_val(
-            strategy, phase2_model,
-            args.alpha, channel_scales, args.memoq_huber_delta,
-            args.memoq_lambda_mem_p2a, lambda_i_2a,
-            args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
-            epsilon_innov, args.seq_len,
-            args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=(args.memoq_lambda_mem_p2a > 0.0), use_innov=innov_active,
-            use_zsat=(args.memoq_lambda_zsat_p2a > 0.0), use_rail=(args.memoq_lambda_rail_p2a > 0.0),
-            has_z_logit=True,
-            teacher_hidden_model=teacher_hidden_model,
-            lambda_s=args.memoq_lambda_shape_p2a,
-            rho_z=args.memoq_rho_z,
-            output_loss=args.output_loss,
-        )
-
+        dist_train_p2a, dist_val_p2a = _build_p2a(innov_active)
 
         for ep_in_phase in range(ep2a_start, args.memoq_stage2a_epochs):
             if ep_in_phase == args.memoq_innov_burnin and not innov_active:
                 innov_active = True
-                lambda_i_2a = args.memoq_lambda_innov
-                dist_train_p2a = make_dist_memoq_train(
-                    strategy, phase2_model, opt_p2a,
-                    args.alpha, channel_scales, args.memoq_huber_delta,
-                    0.01, lambda_i_2a, 0.0, 0.0005,
-                    epsilon_innov, args.seq_len,
-                    args.memoq_rho_rail, args.memoq_mu_rail,
-                    use_mem=True, use_innov=True,
-                    use_zsat=False, use_rail=True,
-                    has_z_logit=True, clipnorm=1.0,
-                    teacher_hidden_model=teacher_hidden_model,
-                )
-                dist_val_p2a = make_dist_memoq_val(
-                    strategy, phase2_model,
-                    args.alpha, channel_scales, args.memoq_huber_delta,
-                    0.01, lambda_i_2a, 0.0, 0.0005,
-                    epsilon_innov, args.seq_len,
-                    args.memoq_rho_rail, args.memoq_mu_rail,
-                    use_mem=True, use_innov=True,
-                    use_zsat=False, use_rail=True,
-                    has_z_logit=True,
-                    teacher_hidden_model=teacher_hidden_model,
-                )
+                dist_train_p2a, dist_val_p2a = _build_p2a(True)
 
             history, best_vals["P2A"], patience_cts["P2A"], early_stop = run_epoch(
                 phase_tag="P2A",
@@ -836,10 +813,8 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_r = quantized_bits(args.bits_recurrent, 0, 1, alpha="auto_po2")
-        enc_cell_p2.quantizer_r = qbits_r
-        dec_cell_p2.quantizer_r = qbits_r
-
+        # set_phase2_quantizers("P2B") already assigned r-gate quantizers using
+        # args.q_alpha. No manual auto_po2 override (controlled-experiment fix).
         lr_p2b = args.effective_lr * args.memoq_lr_mult_p2b
         opt_p2b = keras.optimizers.Adam(learning_rate=lr_p2b)
         sched_p2b = ReduceLROnPlateau(
@@ -936,10 +911,8 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
 
-        qbits_z = quantized_bits(args.bits_kernel, 0, 1, alpha="auto_po2")
-        enc_cell_p2.quantizer_z = qbits_z
-        dec_cell_p2.quantizer_z = qbits_z
-
+        # set_phase2_quantizers("P2C") already assigned z-gate quantizers using
+        # args.q_alpha. No manual auto_po2 override (controlled-experiment fix).
         lr_p2c = args.effective_lr * args.memoq_lr_mult_p2c
         opt_p2c = keras.optimizers.Adam(learning_rate=lr_p2c)
         sched_p2c = ReduceLROnPlateau(
@@ -1369,29 +1342,42 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
 
 class MemoQGRUCell(keras.layers.Layer):
     def __init__(
-        self,
-        units,
-        input_dim,
-        quantizer_z=None,
-        quantizer_r=None,
-        quantizer_h=None,
-        quantizer_state=None,
-        quantizer_activation=None,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.units = units
-        self.input_dim = input_dim
-        self._quantizer_z = quantizer_z
-        self._quantizer_r = quantizer_r
-        self._quantizer_h = quantizer_h
-        self._quantizer_state = quantizer_state
-        self._quantizer_activation = quantizer_activation
-        # state_size must be a list so Keras RNN allocates two state tensors:
-        #   states[0] = h_prev (B, units)
-        #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
-        self.state_size = [units, units]
-        self.output_size = units
+            self,
+            units,
+            input_dim,
+            quantizer_z=None,
+            quantizer_r=None,
+            quantizer_h=None,
+            quantizer_state=None,
+            quantizer_activation=None,
+            quantizer_recurrent_z=None,
+            quantizer_recurrent_r=None,
+            quantizer_recurrent_h=None,
+            quantizer_bias=None,
+            **kwargs,
+        ):
+            super().__init__(**kwargs)
+            self.units = units
+            self.input_dim = input_dim
+            self._quantizer_z = quantizer_z
+            self._quantizer_r = quantizer_r
+            self._quantizer_h = quantizer_h
+            self._quantizer_state = quantizer_state
+            self._quantizer_activation = quantizer_activation
+            # Separate recurrent-kernel quantizers (Fix 7). When None, the input
+            # kernel quantizer for the same gate is reused, preserving old behaviour
+            # for the 4/4/4/4/4 case.
+            self._quantizer_recurrent_z = quantizer_recurrent_z
+            self._quantizer_recurrent_r = quantizer_recurrent_r
+            self._quantizer_recurrent_h = quantizer_recurrent_h
+            # Bias quantizer (Fix 6). When None, biases stay float.
+            self._quantizer_bias = quantizer_bias
+            # state_size must be a list so Keras RNN allocates two state tensors:
+            #   states[0] = h_prev (B, units)
+            #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
+            self.state_size = [units, units]
+            self.output_size = units
+
 
     def build(self, input_shape):
         d = self.input_dim
@@ -1421,56 +1407,73 @@ class MemoQGRUCell(keras.layers.Layer):
         return q(w)
 
     def call(self, inputs, states, training=None):
-            h_prev = states[0]   # (B, units)
-            # states[1] is z_logit_prev -- carried but not used in the forward pass
+                h_prev = states[0]   # (B, units)
+                # states[1] is z_logit_prev -- carried but not used in the forward pass
 
-            # state_quantizer: quantize the incoming recurrent state (quantized_bits),
-            # matching QKeras QGRU state_quantizer applied to h_tm1 at the step input.
-            if self._quantizer_state is not None:
-                h_prev_q = self._quantizer_state(h_prev)
-            else:
-                h_prev_q = h_prev
+                # state_quantizer: quantize the incoming recurrent state (quantized_bits),
+                # matching QKeras QGRU state_quantizer applied to h_tm1 at the step input.
+                if self._quantizer_state is not None:
+                    h_prev_q = self._quantizer_state(h_prev)
+                else:
+                    h_prev_q = h_prev
 
-            W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
-            W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
-            W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
-            U_z = self._apply_quantizer(self._quantizer_z, self.U_z)
-            U_r = self._apply_quantizer(self._quantizer_r, self.U_r)
-            U_h = self._apply_quantizer(self._quantizer_h, self.U_h)
+                # Input kernels.
+                W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
+                W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
+                W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
 
-            z_logit = (
-                tf.matmul(inputs, W_z) + self.b_z_inp
-                + tf.matmul(h_prev_q, U_z) + self.b_z_rec
-            )
-            r_logit = (
-                tf.matmul(inputs, W_r) + self.b_r_inp
-                + tf.matmul(h_prev_q, U_r) + self.b_r_rec
-            )
+                # Recurrent kernels — use the dedicated recurrent quantizer when set,
+                # otherwise fall back to the per-gate input-kernel quantizer so the
+                # 4/4/4/4/4 case is unchanged.
+                rq_z = self._quantizer_recurrent_z if self._quantizer_recurrent_z is not None else self._quantizer_z
+                rq_r = self._quantizer_recurrent_r if self._quantizer_recurrent_r is not None else self._quantizer_r
+                rq_h = self._quantizer_recurrent_h if self._quantizer_recurrent_h is not None else self._quantizer_h
+                U_z = self._apply_quantizer(rq_z, self.U_z)
+                U_r = self._apply_quantizer(rq_r, self.U_r)
+                U_h = self._apply_quantizer(rq_h, self.U_h)
 
-            z = tf.sigmoid(z_logit)
-            r = tf.sigmoid(r_logit)
+                # Biases — quantized when a bias quantizer is set (Fix 6).
+                b_z_inp = self._apply_quantizer(self._quantizer_bias, self.b_z_inp)
+                b_r_inp = self._apply_quantizer(self._quantizer_bias, self.b_r_inp)
+                b_h_inp = self._apply_quantizer(self._quantizer_bias, self.b_h_inp)
+                b_z_rec = self._apply_quantizer(self._quantizer_bias, self.b_z_rec)
+                b_r_rec = self._apply_quantizer(self._quantizer_bias, self.b_r_rec)
+                b_h_rec = self._apply_quantizer(self._quantizer_bias, self.b_h_rec)
 
-            # Candidate pre-activation (reset_after=True form).
-            cand_preact = (
-                tf.matmul(inputs, W_h) + self.b_h_inp
-                + r * (tf.matmul(h_prev_q, U_h) + self.b_h_rec)
-            )
+                z_logit = (
+                    tf.matmul(inputs, W_z) + b_z_inp
+                    + tf.matmul(h_prev_q, U_z) + b_z_rec
+                )
+                r_logit = (
+                    tf.matmul(inputs, W_r) + b_r_inp
+                    + tf.matmul(h_prev_q, U_r) + b_r_rec
+                )
 
-            # Candidate activation. When quantizer_activation is set it IS
-            # quantized_tanh, which computes tanh(x) then snaps to the 4-bit grid --
-            # exactly what QKeras QGRU does via activation=quantized_tanh.
-            # P2A/P2B (quantizer_activation None): plain tanh.
-            if self._quantizer_activation is not None:
-                h_candidate = self._quantizer_activation(cand_preact)
-            else:
-                h_candidate = tf.tanh(cand_preact)
+                z = tf.sigmoid(z_logit)
+                r = tf.sigmoid(r_logit)
 
-            # Final state: convex combination. Do NOT re-quantize here -- the next
-            # step's state_quantizer regrids h_t. QKeras never applies the cell
-            # activation to the combined state.
-            h_t = z * h_prev_q + (1.0 - z) * h_candidate
+                # Candidate pre-activation (reset_after=True form).
+                cand_preact = (
+                    tf.matmul(inputs, W_h) + b_h_inp
+                    + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
+                )
 
-            return h_t, [h_t, z_logit]
+                # Candidate activation. When quantizer_activation is set it IS
+                # quantized_tanh, which computes tanh(x) then snaps to the 4-bit grid --
+                # exactly what QKeras QGRU does via activation=quantized_tanh.
+                # P2A/P2B (quantizer_activation None): plain tanh.
+                if self._quantizer_activation is not None:
+                    h_candidate = self._quantizer_activation(cand_preact)
+                else:
+                    h_candidate = tf.tanh(cand_preact)
+
+                # Final state: convex combination. Do NOT re-quantize here -- the next
+                # step's state_quantizer regrids h_t. QKeras never applies the cell
+                # activation to the combined state.
+                h_t = z * h_prev_q + (1.0 - z) * h_candidate
+
+                return h_t, [h_t, z_logit]
+
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
         if batch_size is None and inputs is not None:
@@ -1517,6 +1520,39 @@ class MemoQGRUCell(keras.layers.Layer):
     @property
     def quantizer_activation(self):
         return self._quantizer_activation
+
+    @property
+    def quantizer_recurrent_z(self):
+        return self._quantizer_recurrent_z
+
+    @quantizer_recurrent_z.setter
+    def quantizer_recurrent_z(self, q):
+        self._quantizer_recurrent_z = q
+
+    @property
+    def quantizer_recurrent_r(self):
+        return self._quantizer_recurrent_r
+
+    @quantizer_recurrent_r.setter
+    def quantizer_recurrent_r(self, q):
+        self._quantizer_recurrent_r = q
+
+    @property
+    def quantizer_recurrent_h(self):
+        return self._quantizer_recurrent_h
+
+    @quantizer_recurrent_h.setter
+    def quantizer_recurrent_h(self, q):
+        self._quantizer_recurrent_h = q
+
+    @property
+    def quantizer_bias(self):
+        return self._quantizer_bias
+
+    @quantizer_bias.setter
+    def quantizer_bias(self, q):
+        self._quantizer_bias = q
+
 
     @quantizer_activation.setter
     def quantizer_activation(self, q):
@@ -1728,7 +1764,30 @@ def build_final_qkeras_student(
         outputs=s_output,
         name="memoq_final_qkeras_student",
     )
-
+def log_final_student_config(final_qkeras_student, pf):
+    """
+    Print the instantiated QGRU/QDense configs of the final student so the
+    'vanilla-identical' claim is verifiable rather than assumed. Compare these
+    lines against the vanilla student's get_config() output. The control is
+    only valid if recurrent_activation, reset_after, the quantizer configs,
+    and units match between the two builders.
+    """
+    for layer_name in ["sencgru", "sdecgru", "sdec_dense"]:
+        try:
+            layer = final_qkeras_student.get_layer(layer_name)
+        except ValueError:
+            pf(f"[CONFIG] {layer_name}: not found")
+            continue
+        cfg = layer.get_config()
+        keys = [
+            "units", "activation", "recurrent_activation", "reset_after",
+            "kernel_quantizer", "recurrent_quantizer", "bias_quantizer",
+            "state_quantizer",
+        ]
+        shown = {k: cfg.get(k, "<absent>") for k in keys if k in cfg or k in (
+            "units", "recurrent_activation", "reset_after")}
+        pf(f"[CONFIG] {layer_name}: {shown}")
+    sys.stdout.flush()
 # ==============================================================================
 # MemoQ auxiliary losses.
 # All losses are tf.function-traceable.
@@ -3057,13 +3116,21 @@ def run_equivalence_checks(float_student, phase2_model, enc_cell_p2, dec_cell_p2
     if stage == "P1->P2":
         saved = []
         for cell in (enc_cell_p2, dec_cell_p2):
-            saved.append((cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
-                          cell.quantizer_state, cell.quantizer_activation))
+            saved.append((
+                cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
+                cell.quantizer_state, cell.quantizer_activation,
+                cell.quantizer_recurrent_z, cell.quantizer_recurrent_r,
+                cell.quantizer_recurrent_h, cell.quantizer_bias,
+            ))
             cell.quantizer_z = None
             cell.quantizer_r = None
             cell.quantizer_h = None
             cell.quantizer_state = None
             cell.quantizer_activation = None
+            cell.quantizer_recurrent_z = None
+            cell.quantizer_recurrent_r = None
+            cell.quantizer_recurrent_h = None
+            cell.quantizer_bias = None
 
         f_out = float_student([xb, db], training=False)
         f_pred = f_out.numpy() if hasattr(f_out, "numpy") else np.asarray(f_out)
@@ -3072,8 +3139,10 @@ def run_equivalence_checks(float_student, phase2_model, enc_cell_p2, dec_cell_p2
         diff = float(np.abs(f_pred - p_pred).mean())
 
         for cell, q in zip((enc_cell_p2, dec_cell_p2), saved):
-            cell.quantizer_z, cell.quantizer_r, cell.quantizer_h, \
-                cell.quantizer_state, cell.quantizer_activation = q
+            (cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
+             cell.quantizer_state, cell.quantizer_activation,
+             cell.quantizer_recurrent_z, cell.quantizer_recurrent_r,
+             cell.quantizer_recurrent_h, cell.quantizer_bias) = q
 
         pf(f"[EQUIV P1->P2] mean |float - phase2(no-quant)| = {diff:.6e}  "
            f"(should be < 1e-4; large => split-gate or transfer bug)")
@@ -3588,7 +3657,10 @@ def parse_args():
     p.add_argument("--pipeline-workers",  type=int,   default=4)
     p.add_argument("--split-seed",        type=int,   default=42)
     p.add_argument("--warmup-epochs",     type=int,   default=5)
-    p.add_argument("--accumulation-steps", type=int,  default=1)
+# Accepted for CLI compatibility but UNUSED — there is no gradient
+    # accumulation in this pipeline. Kept so existing sbatch scripts don't break.
+    p.add_argument("--accumulation-steps", type=int, default=1,
+                   help="UNUSED — accepted for CLI compatibility only.")
     p.add_argument("--resume",            action="store_true", default=False)
 
     args = p.parse_args()
@@ -3990,7 +4062,7 @@ def main():
     # Attach live teacher hidden model for Phase 3 loss computation
     final_qkeras_student._teacher_hidden_model = teacher_hidden_model
     final_qkeras_student.summary(print_fn=pf)
-
+    log_final_student_config(final_qkeras_student, pf)
     # ── Pre-materialise test split so _eval_fn closure can use it at any phase ─
     pf("[MAIN] Materialising test buffers for per-phase evaluation...")
     enc_te, tgt_te, _ = materialise_memoq_buffers(
