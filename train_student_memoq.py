@@ -407,43 +407,37 @@ def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta):
 
 def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     """
-    Assign quantizers to MemoQGRUCell gate variables based on the
-    MemoQ curriculum stage.
+    Assign quantizers to MemoQGRUCell gate variables based on the curriculum
+    stage AND the controlled-experiment quantizer family (args.q_alpha).
 
-    Weight/recurrent quantizers now use alpha="auto_po2" to match the final
-    QKeras student (build_final_qkeras_student). Using alpha=1.0 here while
-    the final model used auto_po2 would create a scale mismatch at the
-    P2C->P3 packing boundary; keeping them identical removes that source of
-    the cliff. State stays at alpha=1.0 (bounded [-1, 1] hidden state).
+    Phase 2 weight/recurrent quantizers use the SAME alpha family as the final
+    QKeras student (args.q_alpha), so the P2C->P3 packing boundary has no scale
+    mismatch. State stays at alpha=1.0 (bounded [-1, 1] hidden state).
+
+    When args.memoq_gate_curriculum is False, P2A already quantises all gates
+    (z, r, h) plus state+activation — this is the MemoQ-control rung B with no
+    causal gate hardening. When True, gates harden h -> r -> z across A/B/C.
     """
-    q4  = quantized_bits(args.bits_kernel,     0, 1, alpha="auto_po2")
-    q4s = quantized_bits(args.bits_state,      0, 1, alpha=1.0)
+    q4  = quantized_bits(args.bits_kernel, 0, 1, alpha=args.q_alpha)
+    q4s = quantized_bits(args.bits_state,  0, 1, alpha=1.0)
     q4a = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
+    curriculum = args.memoq_gate_curriculum
+
     if stage == "P2A":
-        q_h = q4
-        q_r = None
-        q_z = None
-        q_s = None
-        q_a = None
+        if curriculum:
+            q_h, q_r, q_z, q_s, q_a = q4, None, None, None, None
+        else:
+            q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
     elif stage == "P2B":
-        q_h = q4
-        q_r = q4
-        q_z = None
-        q_s = None
-        q_a = None
+        if curriculum:
+            q_h, q_r, q_z, q_s, q_a = q4, q4, None, None, None
+        else:
+            q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
     elif stage == "P2C":
-        q_h = q4
-        q_r = q4
-        q_z = q4
-        q_s = q4s
-        q_a = q4a
+        q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
     elif stage == "P3":
-        q_h = q4
-        q_r = q4
-        q_z = q4
-        q_s = q4s
-        q_a = q4a
+        q_h, q_r, q_z, q_s, q_a = q4, q4, q4, q4s, q4a
     else:
         raise ValueError(f"Unknown stage: {stage!r}. Expected one of P2A, P2B, P2C, P3.")
 
@@ -453,7 +447,6 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         cell.quantizer_z          = q_z
         cell.quantizer_state      = q_s
         cell.quantizer_activation = q_a
-
 
 # ==============================================================================
 # Main MemoQ training loop
@@ -476,6 +469,7 @@ def training_loop_memoq(
     pf,
     teacher_hidden_model=None,
     evaluate_fn=None,
+    equiv_enc_sample=None,
 ):
     p1_ckpt         = os.path.join(job_dir, "phase1_best.weights.h5")
     p2a_ckpt        = os.path.join(job_dir, "stage2a_best.weights.h5")
@@ -486,12 +480,12 @@ def training_loop_memoq(
     completion_path = os.path.join(job_dir, "training_complete.flag")
 
     history = {
-        "total":     [], "seq":       [], "kd":        [],
-        "mem":       [], "innov":     [], "zsat":      [], "rail":      [],
-        "val_total": [], "val_seq":   [], "val_kd":    [],
-        "val_mem":   [], "val_innov": [], "val_zsat":  [], "val_rail":  [],
-        "val_mae":   [], "phase":     [],
-    }
+            "total":     [], "seq":       [], "kd":        [],
+            "mem":       [], "innov":     [], "zsat":      [], "rail":      [], "shape": [],
+            "val_total": [], "val_seq":   [], "val_kd":    [],
+            "val_mem":   [], "val_innov": [], "val_zsat":  [], "val_rail":  [], "val_shape": [],
+            "val_mae":   [], "phase":     [],
+        }
 
     total_planned = (
         args.memoq_warmup_epochs
@@ -573,15 +567,14 @@ def training_loop_memoq(
             pf("[RESUME] Loaded P3 weights for final_qkeras_student")
         sys.stdout.flush()
 
-    csv_path = os.path.join(job_dir, "training_history.csv")
-    if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
-        with open(csv_path, "w") as f:
-            f.write(
-                "epoch,phase,total,seq,kd,mem,innov,zsat,rail,"
-                "val_total,val_seq,val_kd,val_mem,val_innov,val_zsat,val_rail,"
-                "val_mae,lr\n"
-            )
-
+        csv_path = os.path.join(job_dir, "training_history.csv")
+        if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
+            with open(csv_path, "w") as f:
+                f.write(
+                    "epoch,phase,total,seq,kd,mem,innov,zsat,rail,shape,"
+                    "val_total,val_seq,val_kd,val_mem,val_innov,val_zsat,val_rail,val_shape,"
+                    "val_mae,lr\n"
+                )
     def save_resume(stage_tag, ep_in_stage):
         state = {
             "stage":          stage_tag,
@@ -688,6 +681,11 @@ def training_loop_memoq(
         pf("[P1->P2] Transferring float weights to split-gate model...")
         transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_p2, pf)
         sys.stdout.flush()
+        if equiv_enc_sample is not None:
+            run_equivalence_checks(
+                float_student, phase2_model, enc_cell_p2, dec_cell_p2,
+                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P1->P2",
+            )
 
 
 
@@ -711,7 +709,7 @@ def training_loop_memoq(
         enc_cell_p2.quantizer_r = None
         dec_cell_p2.quantizer_r = None
 
-        lr_p2a = args.effective_lr * 0.5
+        lr_p2a = args.effective_lr * args.memoq_lr_mult_p2a
         opt_p2a = keras.optimizers.Adam(learning_rate=lr_p2a)
         sched_p2a = ReduceLROnPlateau(
             opt_p2a, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
@@ -723,29 +721,39 @@ def training_loop_memoq(
 
         innov_active = ep2a_start >= args.memoq_innov_burnin
 
-        lambda_i_2a = args.memoq_lambda_innov if innov_active else 0.0
+
+        lambda_i_2a = args.memoq_lambda_innov_p2a if innov_active else 0.0
         dist_train_p2a = make_dist_memoq_train(
             strategy, phase2_model, opt_p2a,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.01, lambda_i_2a, 0.0, 0.0005,
+            args.memoq_lambda_mem_p2a, lambda_i_2a,
+            args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=innov_active,
-            use_zsat=False, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2a > 0.0), use_innov=innov_active,
+            use_zsat=(args.memoq_lambda_zsat_p2a > 0.0), use_rail=(args.memoq_lambda_rail_p2a > 0.0),
             has_z_logit=True, clipnorm=1.0,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2a,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
         dist_val_p2a = make_dist_memoq_val(
             strategy, phase2_model,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.01, lambda_i_2a, 0.0, 0.0005,
+            args.memoq_lambda_mem_p2a, lambda_i_2a,
+            args.memoq_lambda_zsat_p2a, args.memoq_lambda_rail_p2a,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=innov_active,
-            use_zsat=False, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2a > 0.0), use_innov=innov_active,
+            use_zsat=(args.memoq_lambda_zsat_p2a > 0.0), use_rail=(args.memoq_lambda_rail_p2a > 0.0),
             has_z_logit=True,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2a,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
+
 
         for ep_in_phase in range(ep2a_start, args.memoq_stage2a_epochs):
             if ep_in_phase == args.memoq_innov_burnin and not innov_active:
@@ -832,7 +840,7 @@ def training_loop_memoq(
         enc_cell_p2.quantizer_r = qbits_r
         dec_cell_p2.quantizer_r = qbits_r
 
-        lr_p2b = args.effective_lr * 0.3
+        lr_p2b = args.effective_lr * args.memoq_lr_mult_p2b
         opt_p2b = keras.optimizers.Adam(learning_rate=lr_p2b)
         sched_p2b = ReduceLROnPlateau(
             opt_p2b, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
@@ -844,24 +852,32 @@ def training_loop_memoq(
         dist_train_p2b = make_dist_memoq_train(
             strategy, phase2_model, opt_p2b,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.03, 0.005, 0.0, 0.001,
+            args.memoq_lambda_mem_p2b, args.memoq_lambda_innov_p2b,
+            args.memoq_lambda_zsat_p2b, args.memoq_lambda_rail_p2b,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=True,
-            use_zsat=False, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2b > 0.0), use_innov=(args.memoq_lambda_innov_p2b > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2b > 0.0), use_rail=(args.memoq_lambda_rail_p2b > 0.0),
             has_z_logit=True, clipnorm=1.0,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2b,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
         dist_val_p2b = make_dist_memoq_val(
             strategy, phase2_model,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.03, 0.005, 0.0, 0.001,
+            args.memoq_lambda_mem_p2b, args.memoq_lambda_innov_p2b,
+            args.memoq_lambda_zsat_p2b, args.memoq_lambda_rail_p2b,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=True,
-            use_zsat=False, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2b > 0.0), use_innov=(args.memoq_lambda_innov_p2b > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2b > 0.0), use_rail=(args.memoq_lambda_rail_p2b > 0.0),
             has_z_logit=True,
             teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2b,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
 
         for ep_in_phase in range(ep2b_start, args.memoq_stage2b_epochs):
@@ -924,7 +940,7 @@ def training_loop_memoq(
         enc_cell_p2.quantizer_z = qbits_z
         dec_cell_p2.quantizer_z = qbits_z
 
-        lr_p2c = args.effective_lr * 0.2
+        lr_p2c = args.effective_lr * args.memoq_lr_mult_p2c
         opt_p2c = keras.optimizers.Adam(learning_rate=lr_p2c)
         sched_p2c = ReduceLROnPlateau(
             opt_p2c, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
@@ -936,27 +952,34 @@ def training_loop_memoq(
         dist_train_p2c = make_dist_memoq_train(
             strategy, phase2_model, opt_p2c,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.05, 0.005, 0.002, 0.0002,
+            args.memoq_lambda_mem_p2c, args.memoq_lambda_innov_p2c,
+            args.memoq_lambda_zsat_p2c, args.memoq_lambda_rail_p2c,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=True,
-            use_zsat=True, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2c > 0.0), use_innov=(args.memoq_lambda_innov_p2c > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2c > 0.0), use_rail=(args.memoq_lambda_rail_p2c > 0.0),
             has_z_logit=True, clipnorm=1.0,
             teacher_hidden_model=teacher_hidden_model,
-            lambda_s=0.5 * args.memoq_lambda_shape,
+            lambda_s=args.memoq_lambda_shape_p2c,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
         dist_val_p2c = make_dist_memoq_val(
             strategy, phase2_model,
             args.alpha, channel_scales, args.memoq_huber_delta,
-            0.05, 0.005, 0.002, 0.0002,
+            args.memoq_lambda_mem_p2c, args.memoq_lambda_innov_p2c,
+            args.memoq_lambda_zsat_p2c, args.memoq_lambda_rail_p2c,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
-            use_mem=True, use_innov=True,
-            use_zsat=True, use_rail=True,
+            use_mem=(args.memoq_lambda_mem_p2c > 0.0), use_innov=(args.memoq_lambda_innov_p2c > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2c > 0.0), use_rail=(args.memoq_lambda_rail_p2c > 0.0),
             has_z_logit=True,
             teacher_hidden_model=teacher_hidden_model,
-            lambda_s=0.5 * args.memoq_lambda_shape,
+            lambda_s=args.memoq_lambda_shape_p2c,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
         )
+
 
         for ep_in_phase in range(ep2c_start, args.memoq_stage2c_epochs):
 
@@ -1019,6 +1042,11 @@ def training_loop_memoq(
         pf("=" * 60)
         sys.stdout.flush()
         transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, phase2_model, final_qkeras_student, pf)
+        if equiv_enc_sample is not None:
+            run_equivalence_checks(
+                float_student, phase2_model, enc_cell_p2, dec_cell_p2,
+                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P2C->P3",
+            )
     else:
         pf("[EXPORT] Skipping transfer_splitgate_to_qkeras — resuming Phase 3 from checkpoint, weights already loaded.")
         sys.stdout.flush()
@@ -1029,18 +1057,18 @@ def training_loop_memoq(
     if should_run("P3"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 3 — Hard 4-bit QKeras polish ({args.memoq_stage3_epochs} epochs)")
-        pf("  All QGRU/QDense weights hard 4-bit. LR=5e-6. clipnorm=0.5.")
-        pf("  Loss: L_seq+0.5*L_KD+0.03*L_mem+0.002*L_innov+0.001*L_zsat+0.0005*L_rail")
+        pf(f"  output_loss={args.output_loss}  q_alpha={args.quantizer_alpha}")
+        pf(f"  lambdas: mem={args.memoq_lambda_mem_p3}  innov={args.memoq_lambda_innov_p3}  "
+           f"zsat={args.memoq_lambda_zsat_p3}  rail={args.memoq_lambda_rail_p3}  "
+           f"shape={args.memoq_lambda_shape_p3}")
         pf("=" * 60)
         sys.stdout.flush()
-
-        # Use a meaningful starting LR for Phase 3.
-        # The default memoq_phase3_lr (5e-6) is too low to recover from the
-        # quantisation cliff. We use effective_lr * factor but enforce a
-        # floor of 1e-5 so there is enough gradient signal on first entry.
+        
+        # Phase 3 LR = effective_lr * mult, floored so the hard graph can
+        # actually recover from the P2C->P3 transfer (task-doc item 8).
         lr_p3 = max(
-            min(args.effective_lr * args.memoq_phase3_lr_factor, args.memoq_phase3_lr),
-            1e-5,
+            args.effective_lr * args.memoq_lr_mult_p3,
+            args.memoq_phase3_lr_floor,
         )
         opt_p3 = keras.optimizers.Adam(learning_rate=lr_p3)
         sched_p3 = ReduceLROnPlateau(
@@ -1052,22 +1080,26 @@ def training_loop_memoq(
 
         dist_train_p3 = make_dist_memoq_train_final(
             strategy, final_qkeras_student, opt_p3,
-            0.5, channel_scales, args.memoq_huber_delta,
-            0.03, 0.00002, 0.0, 0.0,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p3, args.memoq_lambda_innov_p3,
+            args.memoq_lambda_zsat_p3, args.memoq_lambda_rail_p3,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             clipnorm=0.5,
             teacher_hidden_model=teacher_hidden_model,
-            lambda_s=args.memoq_lambda_shape,
+            lambda_s=args.memoq_lambda_shape_p3,
+            output_loss=args.output_loss,
         )
         dist_val_p3 = make_dist_memoq_val_final(
             strategy, final_qkeras_student,
-            0.5, channel_scales, args.memoq_huber_delta,
-            0.03, 0.00002, 0.0, 0.0,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p3, args.memoq_lambda_innov_p3,
+            args.memoq_lambda_zsat_p3, args.memoq_lambda_rail_p3,
             epsilon_innov, args.seq_len,
             args.memoq_rho_rail, args.memoq_mu_rail,
             teacher_hidden_model=teacher_hidden_model,
-            lambda_s=args.memoq_lambda_shape,
+            lambda_s=args.memoq_lambda_shape_p3,
+            output_loss=args.output_loss,
         )
 
         for ep_in_phase in range(ep3_start, args.memoq_stage3_epochs):
@@ -1550,7 +1582,17 @@ class MemoQRNNUnroll(keras.layers.Layer):
         return cfg
 
 
-def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
+def build_phase2_model(seq_len, n_out, student_units, input_dim=1, q_alpha=1.0, bits_kernel=4):
+    """
+    Phase 2 split-gate training model.
+
+    The dense head is now a QDense with the SAME quantizer as the final QKeras
+    student's sdec_dense (task-doc item 4). Training the readout under 4-bit
+    quantisation from Phase 2 onward removes the float-Dense -> QDense transfer
+    cliff that previously destroyed scatter performance at export.
+
+    Outputs: (seq_output, dec_hidden_seq, dec_z_logit_seq).
+    """
     enc_cell = MemoQGRUCell(
         units=student_units,
         input_dim=input_dim,
@@ -1580,7 +1622,21 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
         initial_state=[enc_final_h, enc_initial_z],
     )
 
-    seq_output = keras.layers.Dense(n_out, activation="linear", name="sdec_dense")(dec_hidden_seq)
+    # QDense head matching the final QKeras student exactly (item 4).
+    if q_alpha == 1.0:
+        dense_kq = quantized_bits(bits_kernel, 0)
+        dense_bq = quantized_bits(bits_kernel, 0)
+    else:
+        dense_kq = quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
+        dense_bq = quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
+
+    seq_output = QDense(
+        n_out,
+        kernel_quantizer=dense_kq,
+        bias_quantizer=dense_bq,
+        activation="linear",
+        name="sdec_dense",
+    )(dec_hidden_seq)
 
     model = keras.models.Model(
         inputs=[enc_inputs, dec_inputs],
@@ -1589,6 +1645,7 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1):
     )
 
     return model, enc_cell, dec_cell
+
 
 # ==============================================================================
 # build_final_qkeras_student:
@@ -1601,19 +1658,21 @@ def build_final_qkeras_student(
     seq_len, n_out, student_units,
     bits_kernel, bits_recurrent, bits_bias,
     bits_activation, bits_state,
+    q_alpha=1.0,
 ):
-    # auto_po2 lets each weight tensor learn a per-tensor power-of-2 scale,
-    # so all 2^bits levels land where the weights actually live instead of
-    # being wasted on an unused +/-1 range. State stays at alpha=1.0 because
-    # the convex-combination hidden state is genuinely bounded to [-1, 1].
+    # q_alpha selects the weight quantizer scaling family for the controlled
+    # experiment. For the paper q_alpha=1.0 makes this graph byte-identical to
+    # the vanilla 4-bit KD student, so any MemoQ gain is attributable purely to
+    # the training procedure, not to a different quantizer. State stays at
+    # alpha=1.0 because the convex-combination hidden state is bounded to [-1,1].
     def qwk():
-        return quantized_bits(bits_kernel, 0, 1, alpha="auto_po2")
+        return quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
 
     def qwr():
-        return quantized_bits(bits_recurrent, 0, 1, alpha="auto_po2")
+        return quantized_bits(bits_recurrent, 0, 1, alpha=q_alpha)
 
     def qwb():
-        return quantized_bits(bits_bias, 0, 1, alpha="auto_po2")
+        return quantized_bits(bits_bias, 0, 1, alpha=q_alpha)
 
     def qa():
         return quantized_tanh(bits=bits_activation, symmetric=True)
@@ -1622,7 +1681,9 @@ def build_final_qkeras_student(
         return quantized_bits(bits_state, 0, 1, alpha=1.0)
 
     def qd():
-        return quantized_bits(bits_kernel, 0, 1, alpha="auto_po2")
+        if q_alpha == 1.0:
+            return quantized_bits(bits_kernel, 0)
+        return quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
 
     enc_inputs = keras.layers.Input(shape=(None, 1), name="senc_input")
     dec_inputs = keras.layers.Input(shape=(None, 1), name="sdec_input")
@@ -1872,6 +1933,20 @@ def channel_normalised_huber_memoq(y_true, y_pred, channel_scales, huber_delta):
     return tf.reduce_mean(huber)
 
 
+def output_loss_fn(y_true, y_pred, channel_scales, huber_delta, output_loss):
+    """
+    Base output KD loss selector.
+
+    output_loss == "mse"      -> plain MSE, byte-for-byte the vanilla KD objective.
+    output_loss == "huber_cn" -> channel-normalised Huber (original MemoQ).
+
+    Passing "mse" with all auxiliary lambdas at 0.0 makes the MemoQ output
+    objective identical to vanilla, which is the required control (ladder A/B).
+    """
+    if output_loss == "mse":
+        return tf.reduce_mean(tf.square(y_pred - y_true))
+    return channel_normalised_huber_memoq(y_true, y_pred, channel_scales, huber_delta)
+
 # ==============================================================================
 # make_dist_memoq_train:
 # Factory that returns a distributed training step function for
@@ -1902,6 +1977,8 @@ def make_dist_memoq_train(
     clipnorm,
     teacher_hidden_model=None,
     lambda_s=0.0,
+    rho_z=0.98,
+    output_loss="mse",
 ):
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -1912,6 +1989,7 @@ def make_dist_memoq_train(
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     clipnorm_f   = tf.cast(clipnorm,      tf.float32)
     seq_len_int  = int(seq_len)
+    rho_z_f      = float(rho_z)
 
     def train_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
@@ -1933,8 +2011,8 @@ def make_dist_memoq_train(
                 s_pred, s_hid = model_out[0], model_out[1]
                 z_logits = None
 
-            l_seq = channel_normalised_huber_memoq(tgt_b,   s_pred, channel_scales, huber_delta)
-            l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
+            l_seq = output_loss_fn(tgt_b,   s_pred, channel_scales, huber_delta, output_loss)
+            l_kd  = output_loss_fn(tpred_b, s_pred, channel_scales, huber_delta, output_loss)
             total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
             if use_mem and h_teacher is not None:
@@ -1951,7 +2029,7 @@ def make_dist_memoq_train(
 
             if use_zsat and has_z_logit and z_logits is not None:
                 z_vals = tf.sigmoid(z_logits)
-                l_z = loss_zsat_value(z_vals, rho_z=0.98)
+                l_z = loss_zsat_value(z_vals, rho_z=rho_z_f)
                 total = total + lambda_z_f * l_z
             else:
                 l_z = tf.constant(0.0, dtype=tf.float32)
@@ -1962,11 +2040,14 @@ def make_dist_memoq_train(
             else:
                 l_r = tf.constant(0.0, dtype=tf.float32)
 
-            l_shape = (
-                (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
-                + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
-            )
-            total = total + lambda_s_f * l_shape
+            if lambda_s_f > 0.0:
+                l_shape = (
+                    (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
+                    + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
+                )
+                total = total + lambda_s_f * l_shape
+            else:
+                l_shape = tf.constant(0.0, dtype=tf.float32)
 
         grads = tape.gradient(total, phase2_model.trainable_variables)
         grads = [
@@ -1979,14 +2060,16 @@ def make_dist_memoq_train(
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, phase2_model.trainable_variables))
 
+        # Return contract: (total, seq, kd, mem, innov, zsat, rail, shape, nan)
         return (
             total,
             l_seq,
             l_kd,
             l_m,
             l_i,
-            l_shape,
+            l_z,
             l_r,
+            l_shape,
             tf.cast(nan_in_grads, tf.float32),
         )
 
@@ -2021,6 +2104,8 @@ def make_dist_memoq_val(
     has_z_logit,
     teacher_hidden_model=None,
     lambda_s=0.0,
+    rho_z=0.98,
+    output_loss="mse",
 ):
     alpha_f      = tf.cast(alpha,         tf.float32)
     lambda_m_f   = tf.cast(lambda_m,      tf.float32)
@@ -2030,6 +2115,7 @@ def make_dist_memoq_val(
     lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     seq_len_int  = int(seq_len)
+    rho_z_f      = float(rho_z)
 
     def val_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
@@ -2050,8 +2136,8 @@ def make_dist_memoq_val(
             s_pred, s_hid = model_out[0], model_out[1]
             z_logits = None
 
-        l_seq = channel_normalised_huber_memoq(tgt_b,   s_pred, channel_scales, huber_delta)
-        l_kd  = channel_normalised_huber_memoq(tpred_b, s_pred, channel_scales, huber_delta)
+        l_seq = output_loss_fn(tgt_b,   s_pred, channel_scales, huber_delta, output_loss)
+        l_kd  = output_loss_fn(tpred_b, s_pred, channel_scales, huber_delta, output_loss)
         total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
         if use_mem and h_teacher is not None:
@@ -2068,7 +2154,7 @@ def make_dist_memoq_val(
 
         if use_zsat and has_z_logit and z_logits is not None:
             z_vals = tf.sigmoid(z_logits)
-            l_z = loss_zsat_value(z_vals, rho_z=0.98)
+            l_z = loss_zsat_value(z_vals, rho_z=rho_z_f)
             total = total + lambda_z_f * l_z
         else:
             l_z = tf.constant(0.0, dtype=tf.float32)
@@ -2079,22 +2165,27 @@ def make_dist_memoq_val(
         else:
             l_r = tf.constant(0.0, dtype=tf.float32)
 
-        l_shape = (
-            (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
-            + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
-        )
-        total = total + lambda_s_f * l_shape
+        if lambda_s_f > 0.0:
+            l_shape = (
+                (1.0 - alpha_f) * loss_shape(tgt_b,   s_pred, huber_delta)
+                + alpha_f       * loss_shape(tpred_b, s_pred, huber_delta)
+            )
+            total = total + lambda_s_f * l_shape
+        else:
+            l_shape = tf.constant(0.0, dtype=tf.float32)
 
         mae = tf.reduce_mean(tf.abs(s_pred - tgt_b))
 
+        # Return contract: (total, seq, kd, mem, innov, zsat, rail, shape, mae)
         return (
             total,
             l_seq,
             l_kd,
             l_m,
             l_i,
-            l_shape,
+            l_z,
             l_r,
+            l_shape,
             mae,
         )
 
@@ -2170,6 +2261,7 @@ def make_dist_memoq_train_final(
     clipnorm,
     teacher_hidden_model=None,
     lambda_s=0.0,
+    output_loss="mse",
 ):
     final_hidden_model = build_final_hidden_model(final_qkeras_student)
 
@@ -2197,30 +2289,46 @@ def make_dist_memoq_train_final(
         with tf.GradientTape() as tape:
             seq_out, dec_h_seq = final_hidden_model([enc_b, dec_b], training=True)
 
-            l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
-            l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
+            l_seq = output_loss_fn(tgt_b,   seq_out, channel_scales, huber_delta, output_loss)
+            l_kd  = output_loss_fn(tpred_b, seq_out, channel_scales, huber_delta, output_loss)
             total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            if teacher_hid_b is not None:
+            if lambda_m_f > 0.0 and teacher_hid_b is not None:
                 l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
                 total = total + lambda_m_f * l_m
+            else:
+                l_m = tf.constant(0.0, dtype=tf.float32)
 
+            if lambda_i_f > 0.0 and teacher_hid_b is not None:
                 l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
                 total = total + lambda_i_f * l_i
             else:
-                l_m = tf.constant(0.0, dtype=tf.float32)
                 l_i = tf.constant(0.0, dtype=tf.float32)
 
-            l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
-            total = total + lambda_r_f * l_r
+            if lambda_r_f > 0.0:
+                l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
+                total = total + lambda_r_f * l_r
+            else:
+                l_r = tf.constant(0.0, dtype=tf.float32)
 
-            l_shape = (
-                (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
-                + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
-            )
-            total = total + lambda_s_f * l_shape
+            # Phase 3 has no z_logit output, so zsat is applied as a hidden-state
+            # rail-magnitude proxy (|h| > 0.90). This is reported in slot 5 so the
+            # zsat column is honest about what Phase 3 actually optimises.
+            if lambda_z_f > 0.0:
+                excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
+                l_z = tf.reduce_mean(tf.square(excess_z))
+                total = total + lambda_z_f * l_z
+            else:
+                l_z = tf.constant(0.0, dtype=tf.float32)
 
-            l_z = tf.constant(0.0, dtype=tf.float32)
+            if lambda_s_f > 0.0:
+                l_shape = (
+                    (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
+                    + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
+                )
+                total = total + lambda_s_f * l_shape
+            else:
+                l_shape = tf.constant(0.0, dtype=tf.float32)
 
         grads = tape.gradient(total, final_qkeras_student.trainable_variables)
         grads = [
@@ -2233,7 +2341,8 @@ def make_dist_memoq_train_final(
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, final_qkeras_student.trainable_variables))
 
-        return total, l_seq, l_kd, l_m, l_i, l_shape, l_r, tf.cast(nan_in_grads, tf.float32)
+        # Return contract: (total, seq, kd, mem, innov, zsat, rail, shape, nan)
+        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, l_shape, tf.cast(nan_in_grads, tf.float32)
 
     @tf.function
     def dist_step(batch_x, batch_y):
@@ -2244,6 +2353,7 @@ def make_dist_memoq_train_final(
         )
 
     return dist_step
+
 
 def make_dist_memoq_val_final(
     strategy,
@@ -2261,6 +2371,7 @@ def make_dist_memoq_val_final(
     mu_rail,
     teacher_hidden_model=None,
     lambda_s=0.0,
+    output_loss="mse",
 ):
     final_hidden_model_val = build_final_hidden_model(final_qkeras_student)
 
@@ -2286,33 +2397,48 @@ def make_dist_memoq_val_final(
 
         seq_out, dec_h_seq = final_hidden_model_val([enc_b, dec_b], training=False)
 
-        l_seq = channel_normalised_huber_memoq(tgt_b,   seq_out, channel_scales, huber_delta)
-        l_kd  = channel_normalised_huber_memoq(tpred_b, seq_out, channel_scales, huber_delta)
+        l_seq = output_loss_fn(tgt_b,   seq_out, channel_scales, huber_delta, output_loss)
+        l_kd  = output_loss_fn(tpred_b, seq_out, channel_scales, huber_delta, output_loss)
         total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        if teacher_hid_b is not None:
+        if lambda_m_f > 0.0 and teacher_hid_b is not None:
             l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
             total = total + lambda_m_f * l_m
+        else:
+            l_m = tf.constant(0.0, dtype=tf.float32)
 
+        if lambda_i_f > 0.0 and teacher_hid_b is not None:
             l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
             total = total + lambda_i_f * l_i
         else:
-            l_m = tf.constant(0.0, dtype=tf.float32)
             l_i = tf.constant(0.0, dtype=tf.float32)
 
-        l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
-        total = total + lambda_r_f * l_r
+        if lambda_r_f > 0.0:
+            l_r = loss_railpred(dec_h_seq, rho_rail, mu_rail)
+            total = total + lambda_r_f * l_r
+        else:
+            l_r = tf.constant(0.0, dtype=tf.float32)
 
-        l_shape = (
-            (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
-            + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
-        )
-        total = total + lambda_s_f * l_shape
+        if lambda_z_f > 0.0:
+            excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
+            l_z = tf.reduce_mean(tf.square(excess_z))
+            total = total + lambda_z_f * l_z
+        else:
+            l_z = tf.constant(0.0, dtype=tf.float32)
 
-        l_z = tf.constant(0.0, dtype=tf.float32)
+        if lambda_s_f > 0.0:
+            l_shape = (
+                (1.0 - alpha_f) * loss_shape(tgt_b,   seq_out, huber_delta)
+                + alpha_f       * loss_shape(tpred_b, seq_out, huber_delta)
+            )
+            total = total + lambda_s_f * l_shape
+        else:
+            l_shape = tf.constant(0.0, dtype=tf.float32)
 
         mae = tf.reduce_mean(tf.abs(seq_out - tgt_b))
-        return total, l_seq, l_kd, l_m, l_i, l_shape, l_r, mae
+
+        # Return contract: (total, seq, kd, mem, innov, zsat, rail, shape, mae)
+        return total, l_seq, l_kd, l_m, l_i, l_z, l_r, l_shape, mae
 
     @tf.function
     def dist_val_step(batch_x, batch_y):
@@ -2323,7 +2449,6 @@ def make_dist_memoq_val_final(
         )
 
     return dist_val_step
-
 
 # ==============================================================================
 # run_epoch for MemoQ — extended to handle 8-output step functions.
@@ -2359,11 +2484,11 @@ def run_epoch(
     """
     Run one epoch of training + validation for any MemoQ phase.
 
+    Step functions return a 9-tuple:
+      (total, seq, kd, mem, innov, zsat, rail, shape, nan/mae)
+    Index 5 = zsat (honest), index 7 = shape, index 8 = nan_flag (train) or mae (val).
+
     Returns: (history, best_val, patience_ct, early_stop)
-      history      : updated dict
-      best_val     : updated best validation total loss
-      patience_ct  : updated patience counter
-      early_stop   : bool — True if patience exceeded
     """
     t_epoch = time.time()
 
@@ -2374,7 +2499,7 @@ def run_epoch(
         lr_scheduler.lr_var.assign(float(warmup_lr))
 
     # ── Train ─────────────────────────────────────────────────────────────────
-    train_acc   = [0.0] * 8
+    train_acc   = [0.0] * 8   # total, seq, kd, mem, innov, zsat, rail, shape
     nan_batches = 0
     step_count  = 0
 
@@ -2382,11 +2507,11 @@ def run_epoch(
         result = dist_train_step_fn(bx, by)
         result_np = [float(r) for r in result]
 
-        nan_flag = result_np[7] if len(result_np) > 7 else 0.0
+        nan_flag = result_np[8] if len(result_np) > 8 else 0.0
         if nan_flag > 0.0:
             nan_batches += 1
 
-        for i in range(min(7, len(result_np))):
+        for i in range(min(8, len(result_np))):
             train_acc[i] += result_np[i]
 
         step_count += 1
@@ -2411,13 +2536,13 @@ def run_epoch(
         sys.stdout.flush()
 
     # ── Validate ──────────────────────────────────────────────────────────────
-    val_acc    = [0.0] * 8
+    val_acc    = [0.0] * 9   # total, seq, kd, mem, innov, zsat, rail, shape, mae
     val_count  = 0
 
     for step, (bx, by) in enumerate(dist_val_dataset):
         result = dist_val_step_fn(bx, by)
         result_np = [float(r) for r in result]
-        for i in range(min(8, len(result_np))):
+        for i in range(min(9, len(result_np))):
             val_acc[i] += result_np[i]
         val_count += 1
         if val_count >= val_steps:
@@ -2427,7 +2552,7 @@ def run_epoch(
         val_acc = [v / val_count for v in val_acc]
 
     val_total = val_acc[0]
-    val_mae   = val_acc[7] if len(val_acc) > 7 else 0.0
+    val_mae   = val_acc[8] if len(val_acc) > 8 else 0.0
 
     # ── LR scheduler step ─────────────────────────────────────────────────────
     if epoch_in_phase >= effective_warmup_epochs:
@@ -2435,7 +2560,7 @@ def run_epoch(
 
     current_lr = lr_scheduler.current_lr
 
-    # ── History ───────────────────────────────────────────────────────────────
+    # ── History (zsat=index5, shape=index7 — both honest now) ─────────────────
     history["total"].append(train_acc[0])
     history["seq"].append(train_acc[1])
     history["kd"].append(train_acc[2])
@@ -2443,6 +2568,7 @@ def run_epoch(
     history["innov"].append(train_acc[4])
     history["zsat"].append(train_acc[5])
     history["rail"].append(train_acc[6])
+    history["shape"].append(train_acc[7])
     history["val_total"].append(val_acc[0])
     history["val_seq"].append(val_acc[1])
     history["val_kd"].append(val_acc[2])
@@ -2450,17 +2576,20 @@ def run_epoch(
     history["val_innov"].append(val_acc[4])
     history["val_zsat"].append(val_acc[5])
     history["val_rail"].append(val_acc[6])
+    history["val_shape"].append(val_acc[7])
     history["val_mae"].append(val_mae)
     history["phase"].append(phase_tag)
 
-    # ── CSV append ────────────────────────────────────────────────────────────
+    # ── CSV append (added shape + val_shape columns) ──────────────────────────
     with open(csv_path, "a") as f:
         f.write(
             f"{epoch},{phase_tag},"
             f"{train_acc[0]:.6f},{train_acc[1]:.6f},{train_acc[2]:.6f},"
-            f"{train_acc[3]:.6f},{train_acc[4]:.6f},{train_acc[5]:.6f},{train_acc[6]:.6f},"
+            f"{train_acc[3]:.6f},{train_acc[4]:.6f},{train_acc[5]:.6f},"
+            f"{train_acc[6]:.6f},{train_acc[7]:.6f},"
             f"{val_acc[0]:.6f},{val_acc[1]:.6f},{val_acc[2]:.6f},"
-            f"{val_acc[3]:.6f},{val_acc[4]:.6f},{val_acc[5]:.6f},{val_acc[6]:.6f},"
+            f"{val_acc[3]:.6f},{val_acc[4]:.6f},{val_acc[5]:.6f},"
+            f"{val_acc[6]:.6f},{val_acc[7]:.6f},"
             f"{val_mae:.6f},{current_lr:.2e}\n"
         )
 
@@ -2470,7 +2599,7 @@ def run_epoch(
         f"[{phase_tag}] ep {epoch_in_phase:4d}/{total_epochs}  "
         f"loss={train_acc[0]:.5f}  val={val_total:.5f}  mae={val_mae:.5f}  "
         f"mem={train_acc[3]:.5f}  innov={train_acc[4]:.5f}  "
-        f"zsat={train_acc[5]:.5f}  rail={train_acc[6]:.5f}  "
+        f"zsat={train_acc[5]:.5f}  rail={train_acc[6]:.5f}  shape={train_acc[7]:.5f}  "
         f"lr={current_lr:.2e}  {elapsed:.1f}s"
     )
     sys.stdout.flush()
@@ -2491,6 +2620,7 @@ def run_epoch(
             early_stop = True
 
     return history, best_val, patience_ct, early_stop
+
 # ==============================================================================
 # cache_teacher_hidden:
 # Caches the decoder hidden sequence of the teacher model to a mmap file.
@@ -2901,6 +3031,68 @@ def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_
 
     sys.stdout.flush()
 
+def run_equivalence_checks(float_student, phase2_model, enc_cell_p2, dec_cell_p2,
+                           final_qkeras_student, enc_sample, seq_len, pf, stage):
+    """
+    Diagnostic equivalence checks (task-doc items 13 and 14).
+
+    stage == "P1->P2":
+      With Phase 2 quantizers DISABLED (all None), the split-gate cell must
+      reproduce the float Keras GRU. Compares float_student vs phase2_model on
+      the same batch. Mean abs diff should be ~1e-5 or smaller. A large diff
+      means the split-gate equations or the packed-weight transfer are wrong,
+      invalidating every later curriculum result.
+
+    stage == "P2C->P3":
+      Immediately after packing Phase 2 weights into the final QKeras student,
+      compares phase2_model vs final_qkeras_student on the same batch. A small
+      diff means Phase 3 polishes a faithful export; a large diff means Phase 3
+      is just recovering from an export mismatch (float/QDense, bias layout,
+      state-quantizer, or weight-layout bug).
+    """
+    n = min(256, enc_sample.shape[0])
+    xb = enc_sample[:n].astype(np.float32)
+    db = np.zeros((n, seq_len, 1), dtype=np.float32)
+
+    if stage == "P1->P2":
+        saved = []
+        for cell in (enc_cell_p2, dec_cell_p2):
+            saved.append((cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
+                          cell.quantizer_state, cell.quantizer_activation))
+            cell.quantizer_z = None
+            cell.quantizer_r = None
+            cell.quantizer_h = None
+            cell.quantizer_state = None
+            cell.quantizer_activation = None
+
+        f_out = float_student([xb, db], training=False)
+        f_pred = f_out.numpy() if hasattr(f_out, "numpy") else np.asarray(f_out)
+        p_out = phase2_model([xb, db], training=False)
+        p_pred = p_out[0].numpy() if isinstance(p_out, (list, tuple)) else p_out.numpy()
+        diff = float(np.abs(f_pred - p_pred).mean())
+
+        for cell, q in zip((enc_cell_p2, dec_cell_p2), saved):
+            cell.quantizer_z, cell.quantizer_r, cell.quantizer_h, \
+                cell.quantizer_state, cell.quantizer_activation = q
+
+        pf(f"[EQUIV P1->P2] mean |float - phase2(no-quant)| = {diff:.6e}  "
+           f"(should be < 1e-4; large => split-gate or transfer bug)")
+        sys.stdout.flush()
+        return diff
+
+    if stage == "P2C->P3":
+        p_out = phase2_model([xb, db], training=False)
+        p_pred = p_out[0].numpy() if isinstance(p_out, (list, tuple)) else p_out.numpy()
+        q_out = final_qkeras_student([xb, db], training=False)
+        q_pred = q_out.numpy() if hasattr(q_out, "numpy") else np.asarray(q_out)
+        diff = float(np.abs(p_pred - q_pred).mean())
+        pf(f"[EQUIV P2C->P3] mean |phase2 - qkeras| = {diff:.6e}  "
+           f"(small => faithful export; large => transfer cliff)")
+        sys.stdout.flush()
+        return diff
+
+    raise ValueError(f"Unknown equivalence stage: {stage!r}")
+
 # ==============================================================================
 # save_loss_curves_memoq:
 # Multi-panel PNG with all 7 loss components across all phases.
@@ -3287,6 +3479,26 @@ def parse_args():
 
     p.add_argument("--student-units", type=int, default=32)
 
+    # ── Quantizer scaling family (CONTROLLED-EXPERIMENT KNOB) ─────────────────
+    # "1.0"      -> vanilla-identical fixed +/-1 scale (use this for the paper).
+    # "auto_po2" -> learned per-tensor power-of-2 scale (raw-performance mode).
+    # This single flag sets the alpha for kernel/recurrent/bias/dense quantizers
+    # in BOTH the Phase 2 split-gate cell and the final QKeras student, so the
+    # two graphs can never disagree and create a P2C->P3 quantisation cliff.
+    p.add_argument("--quantizer-alpha", type=str, default="1.0",
+                   choices=["1.0", "auto_po2"],
+                   help="Weight quantizer scaling family for kernel/recurrent/"
+                        "bias/dense in BOTH Phase 2 and the final QKeras student. "
+                        "Use 1.0 for the vanilla-identical controlled experiment.")
+
+    # ── Output loss type (CONTROLLED-EXPERIMENT KNOB) ─────────────────────────
+    # "mse"     -> exact vanilla KD objective (plain MSE). Use for ladder rung A/B.
+    # "huber_cn"-> channel-normalised Huber (original MemoQ). Confounds vs vanilla.
+    p.add_argument("--output-loss", type=str, default="mse",
+                   choices=["mse", "huber_cn"],
+                   help="Base output KD loss. 'mse' reproduces vanilla exactly; "
+                        "'huber_cn' uses channel-normalised Huber.")
+
     p.add_argument(
         "--memoq-warmup-epochs", "--memoq-stage1-epochs",
         dest="memoq_warmup_epochs", type=int, default=40,
@@ -3299,23 +3511,65 @@ def parse_args():
         dest="memoq_stage3_epochs", type=int, default=170,
     )
 
-    p.add_argument("--memoq-lambda-mem",   type=float, default=0.03)
-    p.add_argument("--memoq-lambda-innov", type=float, default=0.005)
-    p.add_argument("--memoq-lambda-zsat",  type=float, default=0.002)
-    p.add_argument("--memoq-lambda-rail",  type=float, default=0.001)
-    p.add_argument("--memoq-lambda-shape", type=float, default=0.15,
-                   help="Weight on the amplitude-decoupled decay-shape loss "
-                        "(t0-normalised curve = exact tau surrogate). "
-                        "P2C uses half this value, P3 uses the full value.")
+    # ── Per-phase auxiliary loss weights (ALL ARGS — set 0.0 to disable) ──────
+    # Each phase has its own lambda for every auxiliary loss. The experimental
+    # ladder is run purely by setting these on the command line; no code edits.
+    #   ladder A/B (vanilla / control): leave every aux lambda at 0.0
+    #   ladder D: set memX > 0 ; ladder E: add innovX ; ladder F: add zsat/rail/shape
+    # P2A
+    p.add_argument("--memoq-lambda-mem-p2a",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p2a", type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p2a",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p2a",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p2a", type=float, default=0.0)
+    # P2B
+    p.add_argument("--memoq-lambda-mem-p2b",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p2b", type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p2b",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p2b",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p2b", type=float, default=0.0)
+    # P2C
+    p.add_argument("--memoq-lambda-mem-p2c",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p2c", type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p2c",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p2c",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p2c", type=float, default=0.0)
+    # P3
+    p.add_argument("--memoq-lambda-mem-p3",    type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p3",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p3",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p3",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p3",  type=float, default=0.0)
 
-    p.add_argument("--memoq-huber-delta",    type=float, default=0.1)
-    p.add_argument("--memoq-rho-z",          type=float, default=0.98)
-    p.add_argument("--memoq-rho-rail",       type=float, default=0.97)
-    p.add_argument("--memoq-mu-rail",        type=float, default=0.0)
+    # ── Gate-curriculum toggle (ARG) ──────────────────────────────────────────
+    # When False, Phase 2 quantises all gates simultaneously at P2A (no causal
+    # h->r->z curriculum) — this is ladder rung B (MemoQ-control). When True,
+    # gates harden one at a time (rung C onward).
+    p.add_argument("--memoq-gate-curriculum", type=lambda s: s.lower() in ("1", "true", "yes", "y"),
+                   default=True,
+                   help="True: causal h->r->z gate hardening (rung C+). "
+                        "False: all gates 4-bit from P2A (rung B control).")
+
+    # ── Innovation burn-in (ARG) ──────────────────────────────────────────────
     p.add_argument("--memoq-innov-burnin",   type=int,   default=5)
 
-    p.add_argument("--memoq-phase3-lr",        type=float, default=5e-6)
-    p.add_argument("--memoq-phase3-lr-factor", type=float, default=1.0)
+    # ── Loss-shape detail args ────────────────────────────────────────────────
+    p.add_argument("--memoq-huber-delta", type=float, default=0.1)
+    p.add_argument("--memoq-rho-z",       type=float, default=0.98)
+    p.add_argument("--memoq-rho-rail",    type=float, default=0.97)
+    p.add_argument("--memoq-mu-rail",     type=float, default=0.0)
+
+    # ── Per-phase LR multipliers (ARGS) ───────────────────────────────────────
+    # Phase LR = effective_lr * multiplier (Phase 3 additionally floored, see below).
+    p.add_argument("--memoq-lr-mult-p1",  type=float, default=1.0)
+    p.add_argument("--memoq-lr-mult-p2a", type=float, default=0.5)
+    p.add_argument("--memoq-lr-mult-p2b", type=float, default=0.3)
+    p.add_argument("--memoq-lr-mult-p2c", type=float, default=0.2)
+    p.add_argument("--memoq-lr-mult-p3",  type=float, default=0.1)
+
+    p.add_argument("--memoq-phase3-lr-floor", type=float, default=1e-5,
+                   help="Lower floor on the Phase 3 LR so the hard graph has "
+                        "enough gradient signal to recover from the transfer.")
 
     p.add_argument("--batch-size",        type=int,   default=1024)
     p.add_argument("--epochs",            type=int,   default=330)
@@ -3345,6 +3599,11 @@ def parse_args():
     args.memoq_stage1_epochs   = args.memoq_warmup_epochs
     args.memoq_finetune_epochs = args.memoq_stage3_epochs
 
+    # ── LR + patience scaling — FIXED DIRECTION (task-doc item 5) ─────────────
+    # Vanilla MULTIPLIES patience by the batch ratio. The old MemoQ DIVIDED it,
+    # so at batch 16384 / ref 1024 the scheduler dropped LR after ~1 epoch and
+    # crippled training. Now patience and warmup scale UP with batch size,
+    # exactly like vanilla.
     scale = float(args.batch_size) / float(args.ref_batch_size)
     if args.no_lr_scaling:
         args.effective_lr             = args.lr
@@ -3352,8 +3611,11 @@ def parse_args():
         args.effective_warmup_epochs  = args.warmup_epochs
     else:
         args.effective_lr             = args.lr * scale
-        args.effective_lr_patience    = max(1, int(round(args.lr_patience / scale)))
-        args.effective_warmup_epochs  = max(1, int(round(args.warmup_epochs * scale)))
+        args.effective_lr_patience    = max(1, int(round(args.lr_patience   * scale)))
+        args.effective_warmup_epochs  = max(0, int(round(args.warmup_epochs * scale)))
+
+    # Resolve the quantizer alpha into the literal value qkeras expects.
+    args.q_alpha = 1.0 if args.quantizer_alpha == "1.0" else "auto_po2"
 
     return args
 
@@ -3705,6 +3967,8 @@ def main():
             n_out         = args.n_out,
             student_units = args.student_units,
             input_dim     = 1,
+            q_alpha       = args.q_alpha,
+            bits_kernel   = args.bits_kernel,
         )
     # Attach the live teacher hidden model so make_dist_memoq_train can call it
     phase2_model._teacher_hidden_model = teacher_hidden_model
@@ -3721,6 +3985,7 @@ def main():
             bits_bias       = args.bits_bias,
             bits_activation = args.bits_activation,
             bits_state      = args.bits_state,
+            q_alpha         = args.q_alpha,
         )
     # Attach live teacher hidden model for Phase 3 loss computation
     final_qkeras_student._teacher_hidden_model = teacher_hidden_model
@@ -3803,6 +4068,7 @@ def main():
         pf                   = pf,
         teacher_hidden_model = teacher_hidden_model,
         evaluate_fn          = _eval_fn,
+        equiv_enc_sample    = enc_va,
     )
 
     # ── Transfer fidelity check ───────────────────────────────────────────────
