@@ -3922,7 +3922,7 @@ def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
 # evaluate_and_save — identical to vanilla_kd but uses final_qkeras_student.
 # ==============================================================================
 def evaluate_and_save(
-    final_qkeras_student,
+    model,
     enc_test,
     tgt_test,
     labels_test,
@@ -3937,10 +3937,20 @@ def evaluate_and_save(
 ):
     """
     Run inference on the test split, compute lifetime scatter metrics, and
-    save scatter PNGs.
+    save scatter PNGs in the SAME visual style as train_student_vanilla_kd.py
+    (hexbin, Blues/Greens/Oranges, log count colorbar, y=x line, RMSE/r/cov box).
+
+    `model` is whichever Keras model currently holds the trained weights for
+    this phase:
+        P1            -> float_student            (output: preds)
+        P2A/P2B/P2C   -> phase2_model             (output: [preds, hidden, zlogits])
+        P3 / final    -> final_qkeras_student      (output: preds)
+
+    The function auto-detects multi-output models and uses output 0 as the
+    prediction tensor, so all three model types route through one code path.
 
     phase_tag : str or None.  When provided (e.g. "P1", "P2A", "P2B", "P2C",
-                "P3") the PNGs are written as
+                "P3", "final") the PNGs are written as
                 test_scatter_tau1_<phase_tag>.png etc in addition to the
                 canonical names (which are always written / overwritten).
     """
@@ -3961,12 +3971,14 @@ def evaluate_and_save(
     preds_list = []
     for s in range(0, n_test, infer_batch):
         e = min(s + infer_batch, n_test)
-        batch_pred = final_qkeras_student.predict(
-            [enc_test[s:e], dec_test[s:e]],
-            batch_size=e - s,
-            verbose=0,
-        )
-        preds_list.append(batch_pred)
+        out = model([enc_test[s:e], dec_test[s:e]], training=False)
+        if isinstance(out, (list, tuple)):
+            batch_pred = out[0]
+        else:
+            batch_pred = out
+        if hasattr(batch_pred, "numpy"):
+            batch_pred = batch_pred.numpy()
+        preds_list.append(np.asarray(batch_pred, dtype=np.float32))
     preds = np.concatenate(preds_list, axis=0).astype(np.float32)
 
     # ── MAE on raw seq targets ─────────────────────────────────────────────
@@ -3977,67 +3989,44 @@ def evaluate_and_save(
     # ── Lifetime extraction ────────────────────────────────────────────────
     t_ns = np.arange(seq_len, dtype=np.float32) * float(gate_width_ns)
 
-    def extract_lifetimes(seq_arr, t_ns):
+    def extract_lifetimes(seq_arr, t_axis):
         """
         Extract tau1, tau2, fret_eff from a (N, T, 3) predicted sequence.
 
-        Channel layout (matches vanilla_kd):
-          ch0 = channel 0 (not used for tau/fret)
-          ch1 = FRET donor decay  -> tau1
-          ch2 = reference decay   -> tau2
+        Channel layout (matches vanilla_kd extract_lifetimes):
+          ch0 = full decay (unused for tau/fret)
+          ch1 = short decay  -> tau1
+          ch2 = long decay   -> tau2
 
-        Integration: trapezoidal sum over the time axis.
-        Amplitude guard: amp must be > 1e-6 AND > 5% of the channel peak.
-        Physical cap: tau clipped to [0, TAU_MAX_PHYS] after extraction.
+        Integration: trapezoidal rule over the physical time axis t_axis (ns),
+        identical to vanilla_kd (np.trapz(ch, t, axis=1)).
+        Amplitude = value at t=0 (first gate).
+        tau = integral / amplitude when amplitude > 1e-6 else 0.0.
+        fret = amp1 / (amp1 + amp2) when denom > 1e-6 else 0.5.
 
-        This exactly mirrors vanilla_kd's extraction logic plus the
-        relative-amplitude guard described in the MemoQ fix brief.
+        This mirrors vanilla_kd EXACTLY so student and teacher scatters are
+        directly comparable in the paper. No physical clipping, no relative
+        amplitude guard — vanilla does neither.
         """
-        ch1 = seq_arr[:, :, 1]   # (N, T)
-        ch2 = seq_arr[:, :, 2]   # (N, T)
+        ch1 = seq_arr[:, :, 1]
+        ch2 = seq_arr[:, :, 2]
 
-        # Integrate with trapezoidal rule (dt = gate_width_ns)
-        dt = float(gate_width_ns)
-        int1 = np.trapz(ch1, dx=dt, axis=1).astype(np.float32)   # (N,)
-        int2 = np.trapz(ch2, dx=dt, axis=1).astype(np.float32)
+        int1 = np.trapz(ch1, t_axis, axis=1)
+        int2 = np.trapz(ch2, t_axis, axis=1)
 
-        # Amplitude = value at t=0 (first gate)
-        amp1 = ch1[:, 0].astype(np.float32)
-        amp2 = ch2[:, 0].astype(np.float32)
+        amp1 = ch1[:, 0]
+        amp2 = ch2[:, 0]
 
-        # Relative guard: amp must be positive AND at least 5% of the channel peak.
-        # This kills the tiny-denominator explosion (e.g. amp=0.001 -> tau=10,000ns)
-        # without needing an absolute threshold that mis-fires on dim signals.
-        peak1 = np.maximum(ch1.max(axis=1), 1e-6).astype(np.float32)
-        peak2 = np.maximum(ch2.max(axis=1), 1e-6).astype(np.float32)
-        valid1 = amp1 > 0.05 * peak1
-        valid2 = amp2 > 0.05 * peak2
+        tau1 = np.where(amp1 > 1e-6, int1 / amp1, 0.0).astype(np.float32)
+        tau2 = np.where(amp2 > 1e-6, int2 / amp2, 0.0).astype(np.float32)
 
-        tau1_ns = np.where(valid1, int1 / np.where(valid1, amp1, 1.0), np.nan).astype(np.float32)
-        tau2_ns = np.where(valid2, int2 / np.where(valid2, amp2, 1.0), np.nan).astype(np.float32)
-
-        # Physical cap — any prediction above the label range is nonsense
-        tau1_ns = np.clip(tau1_ns, 0.0, TAU1_MAX_PHYS)
-        tau2_ns = np.clip(tau2_ns, 0.0, TAU2_MAX_PHYS)
-
-        # FRET efficiency from amplitudes
         denom = amp1 + amp2
-        valid_fret = denom > 1e-6
-        fret_eff = np.where(
-            valid_fret,
-            amp1 / np.where(valid_fret, denom, 1.0),
-            0.5,
-        ).astype(np.float32)
-        fret_eff = np.clip(fret_eff, 0.0, FRET_MAX_PHYS)
-
-        return tau1_ns, tau2_ns, fret_eff
+        fret  = np.where(denom > 1e-6, amp1 / denom, 0.5).astype(np.float32)
+        return tau1, tau2, fret
 
     tau1_pred, tau2_pred, fret_pred = extract_lifetimes(preds, t_ns)
 
-    # Ground truth = physical scalar labels, NOT lifetimes re-derived from the
-    # target SDF. extract(pred) vs extract(target) only checks SDF-reconstruction
-    # and shares the extraction's bias on both sides; extract(pred) vs the
-    # physical labels is the real accuracy measure (matches vanilla_kd).
+    # Ground truth = physical scalar labels.
     if labels_test is not None and labels_test.ndim == 2 and labels_test.shape[1] >= 3:
         tau1_gt = labels_test[:, 0].astype(np.float32)
         tau2_gt = labels_test[:, 1].astype(np.float32)
@@ -4046,109 +4035,121 @@ def evaluate_and_save(
         pf("[EVAL] WARNING: labels_test missing or !=3ch — falling back to target-derived GT")
         tau1_gt, tau2_gt, fret_gt = extract_lifetimes(tgt_test, t_ns)
 
-    # ── Hard-coded physical axes (identical to vanilla_kd) ────────────────
-    # Do NOT auto-scale from pred.max() — one outlier stretches the axis to
-    # 11,000 ns and squishes all real 0–3 ns data into an invisible sliver.
-    lifetime_axis_lim = [
-        (0.0, TAU1_MAX_PHYS),   # tau1, ns
-        (0.0, TAU2_MAX_PHYS),   # tau2, ns
-        (0.0, FRET_MAX_PHYS),   # fret
-    ]
-
-    # ── Pearson r — computed only on non-nan pairs ─────────────────────────
-    def safe_pearsonr(a, b):
-        mask = np.isfinite(a) & np.isfinite(b)
+    # ── Metrics: RMSE, Pearson r, 1-sigma coverage (vanilla compute_metrics) ──
+    def compute_metrics(gt, pred):
+        mask = np.isfinite(gt) & np.isfinite(pred)
         if mask.sum() < 5:
-            return float("nan")
-        return float(pearsonr(a[mask], b[mask])[0])
+            return float("nan"), float("nan"), float("nan")
+        gt_m   = gt[mask].astype(float)
+        pred_m = pred[mask].astype(float)
+        rmse = float(np.sqrt(np.mean((gt_m - pred_m) ** 2)))
+        r    = float(pearsonr(gt_m, pred_m)[0])
+        residuals = pred_m - gt_m
+        sigma = residuals.std()
+        cov   = float(np.mean(np.abs(residuals) <= sigma) * 100.0)
+        return rmse, r, cov
 
-    r_tau1 = safe_pearsonr(tau1_gt, tau1_pred)
-    r_tau2 = safe_pearsonr(tau2_gt, tau2_pred)
-    r_fret = safe_pearsonr(fret_gt, fret_pred)
+    rmse_tau1, r_tau1, cov_tau1 = compute_metrics(tau1_gt, tau1_pred)
+    rmse_tau2, r_tau2, cov_tau2 = compute_metrics(tau2_gt, tau2_pred)
+    rmse_fret, r_fret, cov_fret = compute_metrics(fret_gt, fret_pred)
 
-    pf(f"[EVAL] Pearson r  tau1={r_tau1:.4f}  tau2={r_tau2:.4f}  fret={r_fret:.4f}")
+    pf(f"[EVAL] tau1  RMSE={rmse_tau1:.4f}  r={r_tau1:.4f}  1σ-cov={cov_tau1:.1f}%")
+    pf(f"[EVAL] tau2  RMSE={rmse_tau2:.4f}  r={r_tau2:.4f}  1σ-cov={cov_tau2:.1f}%")
+    pf(f"[EVAL] fret  RMSE={rmse_fret:.4f}  r={r_fret:.4f}  1σ-cov={cov_fret:.1f}%")
     sys.stdout.flush()
 
-    # ── Scatter plots ─────────────────────────────────────────────────────
+    title_suffix = f"  [{phase_tag}]" if phase_tag else ""
+
+    # ── Scatter plots — vanilla style: hexbin, log bins, colored cmap, y=x ────
     panels = [
-        (tau1_gt, tau1_pred, "tau1 (ns)", lifetime_axis_lim[0], r_tau1, "test_scatter_tau1"),
-        (tau2_gt, tau2_pred, "tau2 (ns)", lifetime_axis_lim[1], r_tau2, "test_scatter_tau2"),
-        (fret_gt, fret_pred, "FRET eff",  lifetime_axis_lim[2], r_fret, "test_scatter_fret"),
+        (tau1_gt, tau1_pred, rmse_tau1, r_tau1, cov_tau1,
+         "τ₁ (ns)", "GT τ₁ (ns)", "Pred τ₁ (ns)",
+         (0.0, TAU1_MAX_PHYS), "Blues",   "test_scatter_tau1"),
+        (tau2_gt, tau2_pred, rmse_tau2, r_tau2, cov_tau2,
+         "τ₂ (ns)", "GT τ₂ (ns)", "Pred τ₂ (ns)",
+         (0.0, TAU2_MAX_PHYS), "Greens",  "test_scatter_tau2"),
+        (fret_gt, fret_pred, rmse_fret, r_fret, cov_fret,
+         "FRET (f)", "GT FRET (f)", "Pred FRET (f)",
+         (0.0, FRET_MAX_PHYS), "Oranges", "test_scatter_fret"),
     ]
 
-    for gt_c, pred_c, label, lims, r_val, base_name in panels:
+    for (gt_c, pred_c, rmse_v, r_v, cov_v,
+         title, xlabel, ylabel, lims, cmap, base_name) in panels:
         lo, hi = lims
-
-        fig, ax = plt.subplots(figsize=(5, 5))
-
-        # Use only finite points for plotting
         mask = np.isfinite(gt_c) & np.isfinite(pred_c)
         gt_plot   = gt_c[mask]
         pred_plot = pred_c[mask]
 
+        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
         if len(gt_plot) > 0:
-            ax.hexbin(
-                gt_plot,
-                pred_plot,
-                gridsize=80,
-                bins="log",
-                extent=(lo, hi, lo, hi),
-                mincnt=1,
-                cmap="viridis",
+            hb = ax.hexbin(
+                gt_plot, pred_plot,
+                gridsize=80, bins="log", cmap=cmap,
+                extent=(lo, hi, lo, hi), mincnt=1,
             )
-
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.0, label="ideal")
+            fig.colorbar(hb, ax=ax, pad=0.02).set_label("log₁₀(count)", fontsize=9)
+        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y = x")
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
-        ax.set_xlabel(f"Ground truth {label}")
-        ax.set_ylabel(f"Predicted {label}")
-        n_valid = int(mask.sum())
-        n_nan   = int((~mask).sum())
-        title_phase = f" [{phase_tag}]" if phase_tag else ""
-        ax.set_title(
-            f"{label}{title_phase}  r={r_val:.3f}  n={n_valid} (nan={n_nan})"
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel(ylabel, fontsize=11)
+        phase_title = f"{phase_tag}" if phase_tag else "memoq"
+        ax.set_title(f"{title}  {phase_title}", fontsize=10, fontweight="bold")
+        ax.set_aspect("equal")
+        ax.grid(True, alpha=0.2)
+        ax.text(
+            0.03, 0.97,
+            f"RMSE={rmse_v:.4f}\nr={r_v:.4f}\n1σ-cov={cov_v:.1f}%",
+            transform=ax.transAxes, fontsize=8.5,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
         )
-        ax.legend(fontsize=8)
-        fig.tight_layout()
+        ax.legend(loc="lower right", fontsize=9)
+        plt.tight_layout()
 
-        # Always write the canonical name (overwrite)
         canonical_path = os.path.join(job_dir, f"{base_name}.png")
-        fig.savefig(canonical_path, dpi=120)
+        plt.savefig(canonical_path, dpi=150, bbox_inches="tight")
         pf(f"[EVAL] Saved {canonical_path}")
 
-        # Also write a phase-tagged copy so each phase's scatter is preserved
         if phase_tag is not None:
             tagged_path = os.path.join(job_dir, f"{base_name}_{phase_tag}.png")
-            fig.savefig(tagged_path, dpi=120)
+            plt.savefig(tagged_path, dpi=150, bbox_inches="tight")
             pf(f"[EVAL] Saved {tagged_path}")
 
         plt.close(fig)
 
     sys.stdout.flush()
 
-    # ── Residuals plot ────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    for ax, gt_c, pred_c, label, lims in zip(
+    # ── Residuals plot — vanilla style (3-panel histogram, mu/sigma box) ──────
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for ax, gt_c, pred_c, label, color in zip(
         axes,
         [tau1_gt, tau2_gt, fret_gt],
         [tau1_pred, tau2_pred, fret_pred],
-        ["tau1 (ns)", "tau2 (ns)", "FRET eff"],
-        lifetime_axis_lim,
+        ["τ₁ (ns)", "τ₂ (ns)", "FRET (f)"],
+        ["steelblue", "seagreen", "darkorange"],
     ):
-        lo, hi = lims
         mask = np.isfinite(gt_c) & np.isfinite(pred_c)
         residuals = pred_c[mask] - gt_c[mask]
-        ax.hist(residuals, bins=100, color="steelblue", alpha=0.8)
-        ax.axvline(0, color="red", linestyle="--", linewidth=1.0)
-        ax.set_xlabel(f"Residual {label}")
-        ax.set_ylabel("Count")
-        title_phase = f" [{phase_tag}]" if phase_tag else ""
-        ax.set_title(f"Residuals {label}{title_phase}  n={int(mask.sum())}")
-    fig.tight_layout()
+        ax.hist(residuals, bins=100, color=color, alpha=0.75, edgecolor="none")
+        ax.axvline(0, color="red", linewidth=1.2, linestyle="--")
+        ax.set_xlabel(f"Residual {label}", fontsize=10)
+        ax.set_ylabel("Count", fontsize=10)
+        ax.set_title(f"Residuals {label}{title_suffix}", fontsize=10, fontweight="bold")
+        ax.grid(True, alpha=0.2)
+        ax.text(
+            0.97, 0.97,
+            f"μ={residuals.mean():.4f}\nσ={residuals.std():.4f}",
+            transform=ax.transAxes, fontsize=8, ha="right", va="top",
+            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+        )
+    phase_title = f"{phase_tag}" if phase_tag else "memoq"
+    fig.suptitle(f"Residuals  {phase_title}", fontsize=11, fontweight="bold")
+    plt.tight_layout()
     residuals_path = os.path.join(job_dir, "test_residuals.png")
-    fig.savefig(residuals_path, dpi=120)
+    plt.savefig(residuals_path, dpi=150, bbox_inches="tight")
     if phase_tag is not None:
-        fig.savefig(os.path.join(job_dir, f"test_residuals_{phase_tag}.png"), dpi=120)
+        plt.savefig(os.path.join(job_dir, f"test_residuals_{phase_tag}.png"), dpi=150, bbox_inches="tight")
     plt.close(fig)
     pf(f"[EVAL] Saved {residuals_path}")
     sys.stdout.flush()
@@ -4156,9 +4157,15 @@ def evaluate_and_save(
     # ── Metrics JSON ──────────────────────────────────────────────────────
     metrics = {
         "mae_seq":          mae_seq,
+        "rmse_tau1":        rmse_tau1,
+        "rmse_tau2":        rmse_tau2,
+        "rmse_fret":        rmse_fret,
         "r_tau1":           r_tau1,
         "r_tau2":           r_tau2,
         "r_fret":           r_fret,
+        "cov1sigma_tau1":   cov_tau1,
+        "cov1sigma_tau2":   cov_tau2,
+        "cov1sigma_fret":   cov_fret,
         "n_test":           n_test,
         "n_valid_tau1":     int(np.isfinite(tau1_pred).sum()),
         "n_valid_tau2":     int(np.isfinite(tau2_pred).sum()),
@@ -4667,35 +4674,44 @@ def main():
     pf("[MAIN] Starting MemoQ training loop...")
 
     def _eval_fn(phase_tag):
-        pf(f"[EVAL] _eval_fn called with phase_tag={phase_tag!r}")
-        sys.stdout.flush()
-        # Guard: final_qkeras_student has random weights during P1/P2A/P2B/P2C
-        # because transfer_splitgate_to_qkeras has not fired yet.
-        # Scatter plots on an untrained model produce pure noise (r~0) and are
-        # byte-identical across all P1-P2C phases. Only evaluate when the model
-        # actually has trained hard 4-bit weights. Read val_mae from the CSV
-        # for P1/P2 signal instead.
-        if phase_tag not in ("P3", "final"):
-            pf(
-                f"[EVAL] Skipping scatter plot for phase={phase_tag!r} — "
-                f"final_qkeras_student not yet trained. Read val_mae from training_history.csv."
-            )
+            pf(f"[EVAL] _eval_fn called with phase_tag={phase_tag!r}")
             sys.stdout.flush()
-            return
-        evaluate_and_save(
-            final_qkeras_student = final_qkeras_student,
-            enc_test             = enc_te,
-            tgt_test             = tgt_te,
-            labels_test          = labels_test,
-            gate_width_ns        = args.gate_width_ns,
-            n_out                = args.n_out,
-            seq_len              = args.seq_len,
-            infer_batch          = args.infer_batch,
-            job_dir              = job_dir,
-            args                 = args,
-            pf                   = pf,
-            phase_tag            = phase_tag,
-        )
+
+            # Route each phase to the model that actually holds its trained weights:
+            #   P1            -> float_student     (real float predictions)
+            #   P2A/P2B/P2C   -> phase2_model      (real split-gate predictions)
+            #   P3 / final    -> final_qkeras_student (real hard 4-bit predictions)
+            # This is why P1/P2 scatters were previously blank: the old code
+            # evaluated final_qkeras_student, which holds random weights until the
+            # split-gate->QKeras transfer fires at the start of P3. Evaluating the
+            # correct per-phase model produces real, non-noise scatters for every
+            # phase, all in the vanilla hexbin style.
+            if phase_tag == "P1":
+                model_for_eval = float_student
+            elif phase_tag in ("P2A", "P2B", "P2C"):
+                model_for_eval = phase2_model
+            elif phase_tag in ("P3", "final"):
+                model_for_eval = final_qkeras_student
+            else:
+                pf(f"[EVAL] Unknown phase_tag={phase_tag!r} — skipping evaluation.")
+                sys.stdout.flush()
+                return
+
+            evaluate_and_save(
+                model         = model_for_eval,
+                enc_test      = enc_te,
+                tgt_test      = tgt_te,
+                labels_test   = labels_test,
+                gate_width_ns = args.gate_width_ns,
+                n_out         = args.n_out,
+                seq_len       = args.seq_len,
+                infer_batch   = args.infer_batch,
+                job_dir       = job_dir,
+                args          = args,
+                pf            = pf,
+                phase_tag     = phase_tag,
+            )
+
 
     history, best_val = training_loop_memoq(
         strategy             = strategy,
@@ -4753,18 +4769,18 @@ def main():
     # ── Test evaluation ───────────────────────────────────────────────────────
     # enc_te, tgt_te, labels_test already materialised above before training loop.
     evaluate_and_save(
-        final_qkeras_student = final_qkeras_student,
-        enc_test             = enc_te,
-        tgt_test             = tgt_te,
-        labels_test          = labels_test,
-        gate_width_ns        = args.gate_width_ns,
-        n_out                = args.n_out,
-        seq_len              = args.seq_len,
-        infer_batch          = args.infer_batch,
-        job_dir              = job_dir,
-        args                 = args,
-        pf                   = pf,
-        phase_tag            = "final",
+        model         = final_qkeras_student,
+        enc_test      = enc_te,
+        tgt_test      = tgt_te,
+        labels_test   = labels_test,
+        gate_width_ns = args.gate_width_ns,
+        n_out         = args.n_out,
+        seq_len       = args.seq_len,
+        infer_batch   = args.infer_batch,
+        job_dir       = job_dir,
+        args          = args,
+        pf            = pf,
+        phase_tag     = "final",
     )
 
     pf(f"[MAIN] best_val={best_val:.6f}")
