@@ -330,7 +330,7 @@ python "${SCRIPT_DIR}/train_student_memoq.py" \
     --min-delta                     1e-5                     \
     --temperature                   4.0                      \
     --alpha                         0.7                      \
-    --output-loss                   huber_cn                 \
+    --output-loss                   mse                      \
     --quantizer-alpha               1.0                      \
     --memoq-gate-curriculum         true                     \
     --memoq-warmup-epochs           40                       \
