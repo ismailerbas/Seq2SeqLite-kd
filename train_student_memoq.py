@@ -392,23 +392,25 @@ def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta, ou
         )
     return step
 
-
 def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     """
     Assign quantizers to MemoQGRUCell gate variables based on the curriculum
     stage AND the controlled-experiment quantizer family (args.q_alpha).
 
-    Now also assigns:
-      - separate recurrent-kernel quantizers per gate using args.bits_recurrent
-        (Fix 7), so the CLI recurrent-bit setting is truthful even if it differs
-        from bits_kernel.
-      - a bias quantizer using args.bits_bias (Fix 6), hardening biases in the
-        same stage their gate hardens, matching the final QGRU bias_quantizer.
+    Stage order (curriculum=True):
+      P2A : h kernel + recurrent + bias only
+      P2B : h + r kernel + recurrent + bias
+      P2C : h + r + z kernel + recurrent  (biases still float)
+      P2D : h + r + z kernel + recurrent + ALL biases
+      P2E : h + r + z kernel + recurrent + ALL biases + activation quantizer
+      P2F : all of above + state quantizer (via soft blend beta=0 -> 1)
+      P3  : identical to P2F (hard, beta=1.0 enforced externally)
 
-    A gate's recurrent and bias quantizers turn on at the SAME stage as that
-    gate's input kernel, so P2A hardens h (kernel+recurrent+bias), P2B adds r,
-    P2C adds z. When --memoq-gate-curriculum False, all of them turn on at P2A.
-    State stays at alpha=1.0 (bounded [-1, 1] hidden state).
+    curriculum=False collapses P2A/P2B/P2C/P2D/P2E/P2F all into P2A
+    (all quantizers on immediately, same as before for the control run).
+
+    State blend beta is NOT set here — it is set by the training loop
+    per epoch during P2F to implement the annealing schedule.
     """
     q4k  = quantized_bits(args.bits_kernel,    0, 1, alpha=args.q_alpha)
     q4r  = quantized_bits(args.bits_recurrent, 0, 1, alpha=args.q_alpha)
@@ -418,45 +420,103 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
 
     curriculum = args.memoq_gate_curriculum
 
-    # Decide which gates are hardened at this stage.
-    if stage == "P2A":
-        gates_on = {"h"} if curriculum else {"h", "r", "z"}
+    if not curriculum:
+        # Control run: everything on at P2A.
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = q4k
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = q4r
+        q_bias = q4b
+        q_a    = q4a
+        q_s    = q4s
+    elif stage == "P2A":
+        q_h    = q4k
+        q_r    = None
+        q_z    = None
+        rq_h   = q4r
+        rq_r   = None
+        rq_z   = None
+        q_bias = None
+        q_a    = None
+        q_s    = None
     elif stage == "P2B":
-        gates_on = {"h", "r"} if curriculum else {"h", "r", "z"}
-    elif stage in ("P2C", "P3"):
-        gates_on = {"h", "r", "z"}
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = None
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = None
+        q_bias = None
+        q_a    = None
+        q_s    = None
+    elif stage == "P2C":
+        # z kernels + recurrent only. Biases, activation, state still float.
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = q4k
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = q4r
+        q_bias = None
+        q_a    = None
+        q_s    = None
+    elif stage == "P2D":
+        # All kernels + ALL biases. Activation and state still float.
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = q4k
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = q4r
+        q_bias = q4b
+        q_a    = None
+        q_s    = None
+    elif stage == "P2E":
+        # All kernels + biases + activation. State still float.
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = q4k
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = q4r
+        q_bias = q4b
+        q_a    = q4a
+        q_s    = None
+    elif stage in ("P2F", "P3"):
+        # All quantizers on. Beta controls the soft blend in P2F.
+        q_h    = q4k
+        q_r    = q4k
+        q_z    = q4k
+        rq_h   = q4r
+        rq_r   = q4r
+        rq_z   = q4r
+        q_bias = q4b
+        q_a    = q4a
+        q_s    = q4s
     else:
-        raise ValueError(f"Unknown stage: {stage!r}. Expected one of P2A, P2B, P2C, P3.")
-
-    # Per-gate input + recurrent kernel quantizers.
-    q_h  = q4k if "h" in gates_on else None
-    q_r  = q4k if "r" in gates_on else None
-    q_z  = q4k if "z" in gates_on else None
-    rq_h = q4r if "h" in gates_on else None
-    rq_r = q4r if "r" in gates_on else None
-    rq_z = q4r if "z" in gates_on else None
-
-    # State + activation + bias turn on once ALL gates are hardened (P2C/P3),
-    # OR immediately at P2A when curriculum is disabled (all gates at once).
-    all_gates = gates_on == {"h", "r", "z"}
-    q_s    = q4s if all_gates else None
-    q_a    = q4a if all_gates else None
-    q_bias = q4b if all_gates else None
+        raise ValueError(
+            f"Unknown stage: {stage!r}. "
+            f"Expected one of P2A, P2B, P2C, P2D, P2E, P2F, P3."
+        )
 
     for cell in [enc_cell, dec_cell]:
-        cell.quantizer_h            = q_h
-        cell.quantizer_r            = q_r
-        cell.quantizer_z            = q_z
-        cell.quantizer_recurrent_h  = rq_h
-        cell.quantizer_recurrent_r  = rq_r
-        cell.quantizer_recurrent_z  = rq_z
-        cell.quantizer_state        = q_s
-        cell.quantizer_activation   = q_a
-        cell.quantizer_bias         = q_bias
+        cell.quantizer_h           = q_h
+        cell.quantizer_r           = q_r
+        cell.quantizer_z           = q_z
+        cell.quantizer_recurrent_h = rq_h
+        cell.quantizer_recurrent_r = rq_r
+        cell.quantizer_recurrent_z = rq_z
+        cell.quantizer_state       = q_s
+        cell.quantizer_activation  = q_a
+        cell.quantizer_bias        = q_bias
+
 
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
+
 def training_loop_memoq(
     strategy,
     float_student,
@@ -481,23 +541,29 @@ def training_loop_memoq(
     p2a_ckpt        = os.path.join(job_dir, "stage2a_best.weights.h5")
     p2b_ckpt        = os.path.join(job_dir, "stage2b_best.weights.h5")
     p2c_ckpt        = os.path.join(job_dir, "stage2c_best.weights.h5")
+    p2d_ckpt        = os.path.join(job_dir, "stage2d_best.weights.h5")
+    p2e_ckpt        = os.path.join(job_dir, "stage2e_best.weights.h5")
+    p2f_ckpt        = os.path.join(job_dir, "stage2f_best.weights.h5")
     p3_ckpt         = os.path.join(job_dir, "student_best.weights.h5")
     resume_path     = os.path.join(job_dir, "resume_state.json")
     completion_path = os.path.join(job_dir, "training_complete.flag")
 
     history = {
-            "total":     [], "seq":       [], "kd":        [],
-            "mem":       [], "innov":     [], "zsat":      [], "rail":      [], "shape": [],
-            "val_total": [], "val_seq":   [], "val_kd":    [],
-            "val_mem":   [], "val_innov": [], "val_zsat":  [], "val_rail":  [], "val_shape": [],
-            "val_mae":   [], "phase":     [],
-        }
+        "total":     [], "seq":       [], "kd":        [],
+        "mem":       [], "innov":     [], "zsat":      [], "rail":      [], "shape": [],
+        "val_total": [], "val_seq":   [], "val_kd":    [],
+        "val_mem":   [], "val_innov": [], "val_zsat":  [], "val_rail":  [], "val_shape": [],
+        "val_mae":   [], "phase":     [],
+    }
 
     total_planned = (
         args.memoq_warmup_epochs
         + args.memoq_stage2a_epochs
         + args.memoq_stage2b_epochs
         + args.memoq_stage2c_epochs
+        + args.memoq_stage2d_epochs
+        + args.memoq_stage2e_epochs
+        + args.memoq_stage2f_epochs
         + args.memoq_stage3_epochs
     )
     global_epoch = 0
@@ -507,23 +573,26 @@ def training_loop_memoq(
     resume_epoch_in_stage = 0
     best_vals = {
         "P1": float("inf"), "P2A": float("inf"), "P2B": float("inf"),
-        "P2C": float("inf"), "P3": float("inf"),
+        "P2C": float("inf"), "P2D": float("inf"), "P2E": float("inf"),
+        "P2F": float("inf"), "P3": float("inf"),
     }
-    patience_cts = {"P1": 0, "P2A": 0, "P2B": 0, "P2C": 0, "P3": 0}
+    patience_cts = {
+        "P1": 0, "P2A": 0, "P2B": 0, "P2C": 0,
+        "P2D": 0, "P2E": 0, "P2F": 0, "P3": 0,
+    }
 
-    stage_order_list = ["P1", "P2A", "P2B", "P2C", "P3"]
+    stage_order_list = ["P1", "P2A", "P2B", "P2C", "P2D", "P2E", "P2F", "P3"]
     max_epochs_per_stage = {
         "P1":  args.memoq_warmup_epochs,
         "P2A": args.memoq_stage2a_epochs,
         "P2B": args.memoq_stage2b_epochs,
         "P2C": args.memoq_stage2c_epochs,
+        "P2D": args.memoq_stage2d_epochs,
+        "P2E": args.memoq_stage2e_epochs,
+        "P2F": args.memoq_stage2f_epochs,
         "P3":  args.memoq_stage3_epochs,
     }
 
-    # ── Check completion sentinel before loading resume state ─────────────────
-    # If training_complete.flag exists, all phases are done. Load the final
-    # weights and return immediately so the caller can do evaluation/PNG
-    # generation without SLURM resubmitting into a training loop.
     if args.resume and os.path.exists(completion_path):
         pf(f"[RESUME] Training already complete — found {completion_path}")
         pf("[RESUME] Skipping all training phases. Loading final weights for evaluation.")
@@ -537,7 +606,7 @@ def training_loop_memoq(
                 with open(resume_path) as _rf:
                     _rs = json.load(_rf)
                 _bv = _rs.get("best_vals", {})
-                for _k in ["P3", "P2C", "P2B", "P2A", "P1"]:
+                for _k in ["P3", "P2F", "P2E", "P2D", "P2C", "P2B", "P2A", "P1"]:
                     if _k in _bv:
                         _best_final = float(_bv[_k])
                         break
@@ -559,47 +628,47 @@ def training_loop_memoq(
                     history[key] = list(rs["history"][key])
         global_epoch = len(history["phase"])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
-        stage_idx = stage_order_list.index(resume_stage)
-        # Always restore P1 float weights first (needed for the P1->P2 transfer
-        # if we somehow resume at the P2A boundary before transfer).
+
         if os.path.exists(p1_ckpt):
             float_student.load_weights(p1_ckpt)
             pf("[RESUME] Loaded P1 weights for float_student")
 
-        # Load the checkpoint of the stage we are ACTUALLY resuming into, not the
-        # previous stage. Resuming into P2B must load stage2b_best, not stage2a.
-        # Loading the previous stage's weights while continuing from the current
-        # stage's saved epoch number silently trains on wrong weights.
-        if resume_stage == "P2A" and os.path.exists(p2a_ckpt):
-            phase2_model.load_weights(p2a_ckpt)
-            pf(f"[RESUME] Loaded P2A weights for phase2_model from {p2a_ckpt}")
-        elif resume_stage == "P2B" and os.path.exists(p2b_ckpt):
-            phase2_model.load_weights(p2b_ckpt)
-            pf(f"[RESUME] Loaded P2B weights for phase2_model from {p2b_ckpt}")
-        elif resume_stage == "P2C" and os.path.exists(p2c_ckpt):
-            phase2_model.load_weights(p2c_ckpt)
-            pf(f"[RESUME] Loaded P2C weights for phase2_model from {p2c_ckpt}")
-        elif resume_stage in ("P2B", "P2C") and not os.path.exists(
-            p2b_ckpt if resume_stage == "P2B" else p2c_ckpt
-        ):
-            # The current stage has no checkpoint yet (interrupted before its
-            # first save). Fall back to the most recent EARLIER stage checkpoint
-            # and restart THIS stage from epoch 0 to avoid wrong-weight training.
-            fallback = p2a_ckpt if resume_stage == "P2B" else p2b_ckpt
-            if os.path.exists(fallback):
-                phase2_model.load_weights(fallback)
-                pf(f"[RESUME] {resume_stage} checkpoint missing — loaded earlier "
-                   f"{fallback} and restarting {resume_stage} from epoch 0")
-                resume_epoch_in_stage = 0
+        # Load the checkpoint for the stage we are actually resuming into.
+        _p2_stage_ckpts = {
+            "P2A": p2a_ckpt,
+            "P2B": p2b_ckpt,
+            "P2C": p2c_ckpt,
+            "P2D": p2d_ckpt,
+            "P2E": p2e_ckpt,
+            "P2F": p2f_ckpt,
+        }
+        _p2_fallback_order = ["P2A", "P2B", "P2C", "P2D", "P2E", "P2F"]
+
+        if resume_stage in _p2_stage_ckpts:
+            target_ckpt = _p2_stage_ckpts[resume_stage]
+            if os.path.exists(target_ckpt):
+                phase2_model.load_weights(target_ckpt)
+                pf(f"[RESUME] Loaded {resume_stage} weights for phase2_model from {target_ckpt}")
+            else:
+                # No checkpoint yet for this stage — fall back to the most recent
+                # earlier stage and restart this stage from epoch 0.
+                resume_idx_in_p2 = _p2_fallback_order.index(resume_stage)
+                fallback_ckpt = None
+                for earlier in reversed(_p2_fallback_order[:resume_idx_in_p2]):
+                    cand = _p2_stage_ckpts[earlier]
+                    if os.path.exists(cand):
+                        fallback_ckpt = cand
+                        break
+                if fallback_ckpt is not None:
+                    phase2_model.load_weights(fallback_ckpt)
+                    pf(f"[RESUME] {resume_stage} checkpoint missing — loaded {fallback_ckpt} and restarting {resume_stage} from epoch 0")
+                    resume_epoch_in_stage = 0
 
         if resume_stage == "P3" and os.path.exists(p3_ckpt):
             final_qkeras_student.load_weights(p3_ckpt)
             pf("[RESUME] Loaded P3 weights for final_qkeras_student")
         sys.stdout.flush()
 
-    # ── CSV path + header — runs for BOTH fresh and resumed jobs ──────────────
-    # This MUST live outside the resume `if` block above, otherwise a fresh run
-    # never assigns csv_path and Phase 1 crashes with UnboundLocalError.
     csv_path = os.path.join(job_dir, "training_history.csv")
     if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
         with open(csv_path, "w") as f:
@@ -723,12 +792,9 @@ def training_loop_memoq(
                 final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P1->P2",
             )
 
-
-
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2A — Candidate gate (h) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
-
     if should_run("P2A"):
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2A — Candidate gate h 4-bit ({args.memoq_stage2a_epochs} epochs)")
@@ -737,12 +803,6 @@ def training_loop_memoq(
         set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2A")
         pf("=" * 60)
         sys.stdout.flush()
-
-        # NOTE: no manual quantizer override here. set_phase2_quantizers() is the
-        # single source of truth and already used args.q_alpha + the curriculum
-        # toggle. A manual auto_po2 override would (a) break the controlled
-        # vanilla-identical experiment and (b) force z/r back to float even when
-        # --memoq-gate-curriculum False asked for all gates quantized.
 
         lr_p2a = args.effective_lr * args.memoq_lr_mult_p2a
         opt_p2a = keras.optimizers.Adam(learning_rate=lr_p2a)
@@ -844,17 +904,13 @@ def training_loop_memoq(
     # PHASE 2B — Reset gate (r) 4-bit quantization
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2B"):
-        if should_run("P2B"):
-            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2B")
-            pf("=" * 60)
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2B")
         pf("=" * 60)
         pf(f"MEMOQ PHASE 2B — Reset gate r 4-bit ({args.memoq_stage2b_epochs} epochs)")
         pf("  Quantising W_r, U_r. z gate float. h gate already 4-bit.")
         pf("=" * 60)
         sys.stdout.flush()
 
-        # set_phase2_quantizers("P2B") already assigned r-gate quantizers using
-        # args.q_alpha. No manual auto_po2 override (controlled-experiment fix).
         lr_p2b = args.effective_lr * args.memoq_lr_mult_p2b
         opt_p2b = keras.optimizers.Adam(learning_rate=lr_p2b)
         sched_p2b = ReduceLROnPlateau(
@@ -896,7 +952,6 @@ def training_loop_memoq(
         )
 
         for ep_in_phase in range(ep2b_start, args.memoq_stage2b_epochs):
-
             history, best_vals["P2B"], patience_cts["P2B"], early_stop = run_epoch(
                 phase_tag="P2B",
                 epoch=global_epoch,
@@ -939,20 +994,16 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2B")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 2C — Update gate (z) 4-bit quantization
+    # PHASE 2C — Update gate (z) kernel + recurrent 4-bit. Biases still float.
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2C"):
-        if should_run("P2C"):
-            set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2C")
-            pf("=" * 60)
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2C")
         pf("=" * 60)
-        pf(f"MEMOQ PHASE 2C — Update gate z 4-bit ({args.memoq_stage2c_epochs} epochs)")
-        pf("  All gates now 4-bit. Activating L_zsat.")
+        pf(f"MEMOQ PHASE 2C — Update gate z kernel+recurrent 4-bit ({args.memoq_stage2c_epochs} epochs)")
+        pf("  All gate kernels now 4-bit. Biases, activation, state still float.")
         pf("=" * 60)
         sys.stdout.flush()
 
-        # set_phase2_quantizers("P2C") already assigned z-gate quantizers using
-        # args.q_alpha. No manual auto_po2 override (controlled-experiment fix).
         lr_p2c = args.effective_lr * args.memoq_lr_mult_p2c
         opt_p2c = keras.optimizers.Adam(learning_rate=lr_p2c)
         sched_p2c = ReduceLROnPlateau(
@@ -993,9 +1044,7 @@ def training_loop_memoq(
             output_loss=args.output_loss,
         )
 
-
         for ep_in_phase in range(ep2c_start, args.memoq_stage2c_epochs):
-
             history, best_vals["P2C"], patience_cts["P2C"], early_stop = run_epoch(
                 phase_tag="P2C",
                 epoch=global_epoch,
@@ -1038,11 +1087,312 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2C")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Export Phase 2 split-gate weights into final hard QKeras student.
-    # CRITICAL: only do this transfer when actually entering Phase 3 fresh.
-    # On resume into Phase 3 the QKeras student already has P3 checkpoint
-    # weights loaded above — re-running the transfer would overwrite P3
-    # progress with P2C weights and restart the quantisation cliff from scratch.
+    # PHASE 2D — All biases 4-bit. Activation and state still float.
+    # ══════════════════════════════════════════════════════════════════════════
+    if should_run("P2D"):
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2D")
+        pf("=" * 60)
+        pf(f"MEMOQ PHASE 2D — All biases 4-bit ({args.memoq_stage2d_epochs} epochs)")
+        pf("  All kernels + biases 4-bit. Activation and state still float.")
+        pf("=" * 60)
+        sys.stdout.flush()
+
+        lr_p2d = args.effective_lr * args.memoq_lr_mult_p2d
+        opt_p2d = keras.optimizers.Adam(learning_rate=lr_p2d)
+        sched_p2d = ReduceLROnPlateau(
+            opt_p2d, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
+        )
+        sched_p2d.reset(lr_p2d)
+
+        ep2d_start = start_ep("P2D")
+
+        dist_train_p2d = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2d,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2d, args.memoq_lambda_innov_p2d,
+            args.memoq_lambda_zsat_p2d, args.memoq_lambda_rail_p2d,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2d > 0.0), use_innov=(args.memoq_lambda_innov_p2d > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2d > 0.0), use_rail=(args.memoq_lambda_rail_p2d > 0.0),
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2d,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+        dist_val_p2d = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2d, args.memoq_lambda_innov_p2d,
+            args.memoq_lambda_zsat_p2d, args.memoq_lambda_rail_p2d,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2d > 0.0), use_innov=(args.memoq_lambda_innov_p2d > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2d > 0.0), use_rail=(args.memoq_lambda_rail_p2d > 0.0),
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2d,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+
+        for ep_in_phase in range(ep2d_start, args.memoq_stage2d_epochs):
+            history, best_vals["P2D"], patience_cts["P2D"], early_stop = run_epoch(
+                phase_tag="P2D",
+                epoch=global_epoch,
+                total_epochs=total_planned,
+                dist_train_dataset=dist_train_dataset,
+                dist_val_dataset=dist_val_dataset,
+                train_steps=train_steps,
+                val_steps=val_steps,
+                dist_train_step_fn=dist_train_p2d,
+                dist_val_step_fn=dist_val_p2d,
+                lr_scheduler=sched_p2d,
+                effective_warmup_epochs=0,
+                effective_lr=lr_p2d,
+                history=history,
+                best_val=best_vals["P2D"],
+                patience_ct=patience_cts["P2D"],
+                patience_max=args.patience,
+                min_delta=args.min_delta,
+                best_ckpt_path=p2d_ckpt,
+                model_to_save=phase2_model,
+                csv_path=csv_path,
+                log_interval=args.log_interval,
+                nan_warn_threshold=nan_warn_threshold,
+                pf=pf,
+                epoch_in_phase=ep_in_phase,
+            )
+            global_epoch += 1
+            save_resume("P2D", ep_in_phase + 1)
+            if early_stop:
+                break
+
+        if os.path.exists(p2d_ckpt):
+            phase2_model.load_weights(p2d_ckpt)
+            pf(f"[P2D] Loaded best weights from {p2d_ckpt}")
+            sys.stdout.flush()
+
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2D...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2D")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 2E — Activation quantizer (quantized_tanh). State still float.
+    # ══════════════════════════════════════════════════════════════════════════
+    if should_run("P2E"):
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2E")
+        pf("=" * 60)
+        pf(f"MEMOQ PHASE 2E — Activation quantizer 4-bit ({args.memoq_stage2e_epochs} epochs)")
+        pf("  All kernels + biases + activation 4-bit. State still float.")
+        pf("=" * 60)
+        sys.stdout.flush()
+
+        lr_p2e = args.effective_lr * args.memoq_lr_mult_p2e
+        opt_p2e = keras.optimizers.Adam(learning_rate=lr_p2e)
+        sched_p2e = ReduceLROnPlateau(
+            opt_p2e, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
+        )
+        sched_p2e.reset(lr_p2e)
+
+        ep2e_start = start_ep("P2E")
+
+        dist_train_p2e = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2e,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2e, args.memoq_lambda_innov_p2e,
+            args.memoq_lambda_zsat_p2e, args.memoq_lambda_rail_p2e,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2e > 0.0), use_innov=(args.memoq_lambda_innov_p2e > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2e > 0.0), use_rail=(args.memoq_lambda_rail_p2e > 0.0),
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2e,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+        dist_val_p2e = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2e, args.memoq_lambda_innov_p2e,
+            args.memoq_lambda_zsat_p2e, args.memoq_lambda_rail_p2e,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2e > 0.0), use_innov=(args.memoq_lambda_innov_p2e > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2e > 0.0), use_rail=(args.memoq_lambda_rail_p2e > 0.0),
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2e,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+
+        for ep_in_phase in range(ep2e_start, args.memoq_stage2e_epochs):
+            history, best_vals["P2E"], patience_cts["P2E"], early_stop = run_epoch(
+                phase_tag="P2E",
+                epoch=global_epoch,
+                total_epochs=total_planned,
+                dist_train_dataset=dist_train_dataset,
+                dist_val_dataset=dist_val_dataset,
+                train_steps=train_steps,
+                val_steps=val_steps,
+                dist_train_step_fn=dist_train_p2e,
+                dist_val_step_fn=dist_val_p2e,
+                lr_scheduler=sched_p2e,
+                effective_warmup_epochs=0,
+                effective_lr=lr_p2e,
+                history=history,
+                best_val=best_vals["P2E"],
+                patience_ct=patience_cts["P2E"],
+                patience_max=args.patience,
+                min_delta=args.min_delta,
+                best_ckpt_path=p2e_ckpt,
+                model_to_save=phase2_model,
+                csv_path=csv_path,
+                log_interval=args.log_interval,
+                nan_warn_threshold=nan_warn_threshold,
+                pf=pf,
+                epoch_in_phase=ep_in_phase,
+            )
+            global_epoch += 1
+            save_resume("P2E", ep_in_phase + 1)
+            if early_stop:
+                break
+
+        if os.path.exists(p2e_ckpt):
+            phase2_model.load_weights(p2e_ckpt)
+            pf(f"[P2E] Loaded best weights from {p2e_ckpt}")
+            sys.stdout.flush()
+
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2E...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2E")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # PHASE 2F — State quantizer with soft blend annealing beta 0 -> 1.
+    # This is the single highest-leverage stage. The state quantizer is
+    # introduced with beta=0 (fully float) and ramped linearly to beta=1
+    # (fully quantized) over args.memoq_state_anneal_epochs epochs. After
+    # annealing, training continues at beta=1 for the remaining epochs.
+    # L_innov and L_zsat are active here to prevent innovation collapse.
+    # ══════════════════════════════════════════════════════════════════════════
+    if should_run("P2F"):
+        set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2F")
+        # Start with beta=0 (float state) and ramp up.
+        for cell in [enc_cell_p2, dec_cell_p2]:
+            cell.state_blend_beta = 0.0
+        pf("=" * 60)
+        pf(f"MEMOQ PHASE 2F — State quantizer soft-blend annealing ({args.memoq_stage2f_epochs} epochs)")
+        pf(f"  anneal_epochs={args.memoq_state_anneal_epochs}  beta 0->1 then hard.")
+        pf(f"  innov={args.memoq_lambda_innov_p2f}  mem={args.memoq_lambda_mem_p2f}  "
+           f"zsat={args.memoq_lambda_zsat_p2f}  rail={args.memoq_lambda_rail_p2f}")
+        pf("=" * 60)
+        sys.stdout.flush()
+
+        lr_p2f = args.effective_lr * args.memoq_lr_mult_p2f
+        opt_p2f = keras.optimizers.Adam(learning_rate=lr_p2f)
+        sched_p2f = ReduceLROnPlateau(
+            opt_p2f, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
+        )
+        sched_p2f.reset(lr_p2f)
+
+        ep2f_start = start_ep("P2F")
+
+        dist_train_p2f = make_dist_memoq_train(
+            strategy, phase2_model, opt_p2f,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2f, args.memoq_lambda_innov_p2f,
+            args.memoq_lambda_zsat_p2f, args.memoq_lambda_rail_p2f,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2f > 0.0), use_innov=(args.memoq_lambda_innov_p2f > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2f > 0.0), use_rail=(args.memoq_lambda_rail_p2f > 0.0),
+            has_z_logit=True, clipnorm=1.0,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2f,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+        dist_val_p2f = make_dist_memoq_val(
+            strategy, phase2_model,
+            args.alpha, channel_scales, args.memoq_huber_delta,
+            args.memoq_lambda_mem_p2f, args.memoq_lambda_innov_p2f,
+            args.memoq_lambda_zsat_p2f, args.memoq_lambda_rail_p2f,
+            epsilon_innov, args.seq_len,
+            args.memoq_rho_rail, args.memoq_mu_rail,
+            use_mem=(args.memoq_lambda_mem_p2f > 0.0), use_innov=(args.memoq_lambda_innov_p2f > 0.0),
+            use_zsat=(args.memoq_lambda_zsat_p2f > 0.0), use_rail=(args.memoq_lambda_rail_p2f > 0.0),
+            has_z_logit=True,
+            teacher_hidden_model=teacher_hidden_model,
+            lambda_s=args.memoq_lambda_shape_p2f,
+            rho_z=args.memoq_rho_z,
+            output_loss=args.output_loss,
+        )
+
+        anneal_epochs = max(1, args.memoq_state_anneal_epochs)
+
+        for ep_in_phase in range(ep2f_start, args.memoq_stage2f_epochs):
+            # Compute and set soft-blend beta for this epoch.
+            if ep_in_phase < anneal_epochs:
+                beta = float(ep_in_phase + 1) / float(anneal_epochs)
+            else:
+                beta = 1.0
+            for cell in [enc_cell_p2, dec_cell_p2]:
+                cell.state_blend_beta = beta
+            pf(f"  [P2F] ep {ep_in_phase}  state_blend_beta={beta:.4f}")
+            sys.stdout.flush()
+
+            history, best_vals["P2F"], patience_cts["P2F"], early_stop = run_epoch(
+                phase_tag="P2F",
+                epoch=global_epoch,
+                total_epochs=total_planned,
+                dist_train_dataset=dist_train_dataset,
+                dist_val_dataset=dist_val_dataset,
+                train_steps=train_steps,
+                val_steps=val_steps,
+                dist_train_step_fn=dist_train_p2f,
+                dist_val_step_fn=dist_val_p2f,
+                lr_scheduler=sched_p2f,
+                effective_warmup_epochs=0,
+                effective_lr=lr_p2f,
+                history=history,
+                best_val=best_vals["P2F"],
+                patience_ct=patience_cts["P2F"],
+                patience_max=args.patience,
+                min_delta=args.min_delta,
+                best_ckpt_path=p2f_ckpt,
+                model_to_save=phase2_model,
+                csv_path=csv_path,
+                log_interval=args.log_interval,
+                nan_warn_threshold=nan_warn_threshold,
+                pf=pf,
+                epoch_in_phase=ep_in_phase,
+            )
+            global_epoch += 1
+            save_resume("P2F", ep_in_phase + 1)
+            if early_stop:
+                break
+
+        # Ensure beta=1 after P2F regardless of early stop.
+        for cell in [enc_cell_p2, dec_cell_p2]:
+            cell.state_blend_beta = 1.0
+
+        if os.path.exists(p2f_ckpt):
+            phase2_model.load_weights(p2f_ckpt)
+            pf(f"[P2F] Loaded best weights from {p2f_ckpt}")
+            sys.stdout.flush()
+
+        if evaluate_fn is not None:
+            pf("[EVAL] Running per-phase scatter evaluation after P2F...")
+            sys.stdout.flush()
+            evaluate_fn(phase_tag="P2F")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Export Phase 2F split-gate weights into final hard QKeras student.
     # ══════════════════════════════════════════════════════════════════════════
     entering_p3_fresh = should_run("P3") and not (
         args.resume
@@ -1058,7 +1408,7 @@ def training_loop_memoq(
         if equiv_enc_sample is not None:
             run_equivalence_checks(
                 float_student, phase2_model, enc_cell_p2, dec_cell_p2,
-                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P2C->P3",
+                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P2F->P3",
             )
     else:
         pf("[EXPORT] Skipping transfer_splitgate_to_qkeras — resuming Phase 3 from checkpoint, weights already loaded.")
@@ -1076,9 +1426,7 @@ def training_loop_memoq(
            f"shape={args.memoq_lambda_shape_p3}")
         pf("=" * 60)
         sys.stdout.flush()
-        
-        # Phase 3 LR = effective_lr * mult, floored so the hard graph can
-        # actually recover from the P2C->P3 transfer (task-doc item 8).
+
         lr_p3 = max(
             args.effective_lr * args.memoq_lr_mult_p3,
             args.memoq_phase3_lr_floor,
@@ -1116,7 +1464,6 @@ def training_loop_memoq(
         )
 
         for ep_in_phase in range(ep3_start, args.memoq_stage3_epochs):
-
             history, best_vals["P3"], patience_cts["P3"], early_stop = run_epoch(
                 phase_tag="P3",
                 epoch=global_epoch,
@@ -1162,9 +1509,15 @@ def training_loop_memoq(
 
     return history, best_vals.get(
         "P3", best_vals.get(
-            "P2C", best_vals.get(
-                "P2B", best_vals.get(
-                    "P2A", best_vals.get("P1", float("inf"))
+            "P2F", best_vals.get(
+                "P2E", best_vals.get(
+                    "P2D", best_vals.get(
+                        "P2C", best_vals.get(
+                            "P2B", best_vals.get(
+                                "P2A", best_vals.get("P1", float("inf"))
+                            )
+                        )
+                    )
                 )
             )
         )
@@ -1417,6 +1770,10 @@ class MemoQGRUCell(keras.layers.Layer):
             #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
             self.state_size = [units, units]
             self.output_size = units
+            # Soft-blend beta for state quantizer annealing in P2F.
+            # 0.0 = fully float state, 1.0 = fully quantized state.
+            # Schedulable from outside by setting cell.state_blend_beta = value.
+            self._state_blend_beta = 1.0
 
 
     def build(self, input_shape):
@@ -1447,73 +1804,70 @@ class MemoQGRUCell(keras.layers.Layer):
         return q(w)
 
     def call(self, inputs, states, training=None):
-                h_prev = states[0]   # (B, units)
-                # states[1] is z_logit_prev -- carried but not used in the forward pass
+        h_prev = states[0]   # (B, units)
+        # states[1] is z_logit_prev -- carried but not used in the forward pass
 
-                # state_quantizer: quantize the incoming recurrent state (quantized_bits),
-                # matching QKeras QGRU state_quantizer applied to h_tm1 at the step input.
-                if self._quantizer_state is not None:
-                    h_prev_q = self._quantizer_state(h_prev)
-                else:
-                    h_prev_q = h_prev
+        # Soft-blend state quantizer: h_prev_q = beta * q_s(h_prev) + (1-beta) * h_prev
+        # When state_blend_beta == 1.0 this is identical to the hard switch.
+        # When state_blend_beta == 0.0 the state quantizer is fully off.
+        # Ramp beta from 0 -> 1 over the P2F stage to avoid the 16-level cliff.
+        if self._quantizer_state is not None:
+            h_prev_q_hard = self._quantizer_state(h_prev)
+            beta = tf.cast(self._state_blend_beta, tf.float32)
+            h_prev_q = beta * h_prev_q_hard + (1.0 - beta) * h_prev
+        else:
+            h_prev_q = h_prev
 
-                # Input kernels.
-                W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
-                W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
-                W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
+        # Input kernels.
+        W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
+        W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
+        W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
 
-                # Recurrent kernels — use the dedicated recurrent quantizer when set,
-                # otherwise fall back to the per-gate input-kernel quantizer so the
-                # 4/4/4/4/4 case is unchanged.
-                rq_z = self._quantizer_recurrent_z if self._quantizer_recurrent_z is not None else self._quantizer_z
-                rq_r = self._quantizer_recurrent_r if self._quantizer_recurrent_r is not None else self._quantizer_r
-                rq_h = self._quantizer_recurrent_h if self._quantizer_recurrent_h is not None else self._quantizer_h
-                U_z = self._apply_quantizer(rq_z, self.U_z)
-                U_r = self._apply_quantizer(rq_r, self.U_r)
-                U_h = self._apply_quantizer(rq_h, self.U_h)
+        # Recurrent kernels — use the dedicated recurrent quantizer when set,
+        # otherwise fall back to the per-gate input-kernel quantizer so the
+        # 4/4/4/4/4 case is unchanged.
+        rq_z = self._quantizer_recurrent_z if self._quantizer_recurrent_z is not None else self._quantizer_z
+        rq_r = self._quantizer_recurrent_r if self._quantizer_recurrent_r is not None else self._quantizer_r
+        rq_h = self._quantizer_recurrent_h if self._quantizer_recurrent_h is not None else self._quantizer_h
+        U_z = self._apply_quantizer(rq_z, self.U_z)
+        U_r = self._apply_quantizer(rq_r, self.U_r)
+        U_h = self._apply_quantizer(rq_h, self.U_h)
 
-                # Biases — quantized when a bias quantizer is set (Fix 6).
-                b_z_inp = self._apply_quantizer(self._quantizer_bias, self.b_z_inp)
-                b_r_inp = self._apply_quantizer(self._quantizer_bias, self.b_r_inp)
-                b_h_inp = self._apply_quantizer(self._quantizer_bias, self.b_h_inp)
-                b_z_rec = self._apply_quantizer(self._quantizer_bias, self.b_z_rec)
-                b_r_rec = self._apply_quantizer(self._quantizer_bias, self.b_r_rec)
-                b_h_rec = self._apply_quantizer(self._quantizer_bias, self.b_h_rec)
+        # Biases — quantized when a bias quantizer is set (Fix 6).
+        b_z_inp = self._apply_quantizer(self._quantizer_bias, self.b_z_inp)
+        b_r_inp = self._apply_quantizer(self._quantizer_bias, self.b_r_inp)
+        b_h_inp = self._apply_quantizer(self._quantizer_bias, self.b_h_inp)
+        b_z_rec = self._apply_quantizer(self._quantizer_bias, self.b_z_rec)
+        b_r_rec = self._apply_quantizer(self._quantizer_bias, self.b_r_rec)
+        b_h_rec = self._apply_quantizer(self._quantizer_bias, self.b_h_rec)
 
-                z_logit = (
-                    tf.matmul(inputs, W_z) + b_z_inp
-                    + tf.matmul(h_prev_q, U_z) + b_z_rec
-                )
-                r_logit = (
-                    tf.matmul(inputs, W_r) + b_r_inp
-                    + tf.matmul(h_prev_q, U_r) + b_r_rec
-                )
+        z_logit = (
+            tf.matmul(inputs, W_z) + b_z_inp
+            + tf.matmul(h_prev_q, U_z) + b_z_rec
+        )
+        r_logit = (
+            tf.matmul(inputs, W_r) + b_r_inp
+            + tf.matmul(h_prev_q, U_r) + b_r_rec
+        )
 
-                z = tf.sigmoid(z_logit)
-                r = tf.sigmoid(r_logit)
+        z = tf.sigmoid(z_logit)
+        r = tf.sigmoid(r_logit)
 
-                # Candidate pre-activation (reset_after=True form).
-                cand_preact = (
-                    tf.matmul(inputs, W_h) + b_h_inp
-                    + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
-                )
+        # Candidate pre-activation (reset_after=True form).
+        cand_preact = (
+            tf.matmul(inputs, W_h) + b_h_inp
+            + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
+        )
 
-                # Candidate activation. When quantizer_activation is set it IS
-                # quantized_tanh, which computes tanh(x) then snaps to the 4-bit grid --
-                # exactly what QKeras QGRU does via activation=quantized_tanh.
-                # P2A/P2B (quantizer_activation None): plain tanh.
-                if self._quantizer_activation is not None:
-                    h_candidate = self._quantizer_activation(cand_preact)
-                else:
-                    h_candidate = tf.tanh(cand_preact)
+        # Candidate activation.
+        if self._quantizer_activation is not None:
+            h_candidate = self._quantizer_activation(cand_preact)
+        else:
+            h_candidate = tf.tanh(cand_preact)
 
-                # Final state: convex combination. Do NOT re-quantize here -- the next
-                # step's state_quantizer regrids h_t. QKeras never applies the cell
-                # activation to the combined state.
-                h_t = z * h_prev_q + (1.0 - z) * h_candidate
+        h_t = z * h_prev_q + (1.0 - z) * h_candidate
 
-                return h_t, [h_t, z_logit]
-
+        return h_t, [h_t, z_logit]
 
     def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
         if batch_size is None and inputs is not None:
@@ -1588,6 +1942,14 @@ class MemoQGRUCell(keras.layers.Layer):
     @property
     def quantizer_bias(self):
         return self._quantizer_bias
+
+    @property
+    def state_blend_beta(self):
+        return self._state_blend_beta
+
+    @state_blend_beta.setter
+    def state_blend_beta(self, v):
+        self._state_blend_beta = float(v)
 
     @quantizer_bias.setter
     def quantizer_bias(self, q):
@@ -3656,6 +4018,35 @@ def parse_args():
     p.add_argument("--memoq-stage2a-epochs", type=int, default=30)
     p.add_argument("--memoq-stage2b-epochs", type=int, default=30)
     p.add_argument("--memoq-stage2c-epochs", type=int, default=30)
+    p.add_argument("--memoq-stage2d-epochs",    type=int,   default=10,
+                        help="P2D: all biases 4-bit stage epochs")
+    p.add_argument("--memoq-stage2e-epochs",    type=int,   default=10,
+                        help="P2E: activation quantizer stage epochs")
+    p.add_argument("--memoq-stage2f-epochs",    type=int,   default=30,
+                        help="P2F: state quantizer soft-blend stage epochs")
+    p.add_argument("--memoq-state-anneal-epochs", type=int, default=15,
+                        help="Number of P2F epochs over which beta ramps 0->1")
+    p.add_argument("--memoq-lr-mult-p2d",       type=float, default=0.3,
+                        help="LR multiplier for P2D stage")
+    p.add_argument("--memoq-lr-mult-p2e",       type=float, default=0.3,
+                        help="LR multiplier for P2E stage")
+    p.add_argument("--memoq-lr-mult-p2f",       type=float, default=0.3,
+                        help="LR multiplier for P2F state annealing stage")
+    p.add_argument("--memoq-lambda-mem-p2d",    type=float, default=0.0)
+    p.add_argument("--memoq-lambda-mem-p2e",    type=float, default=0.0)
+    p.add_argument("--memoq-lambda-mem-p2f",    type=float, default=0.1)
+    p.add_argument("--memoq-lambda-innov-p2d",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p2e",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-innov-p2f",  type=float, default=0.05)
+    p.add_argument("--memoq-lambda-zsat-p2d",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p2e",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-zsat-p2f",   type=float, default=0.01)
+    p.add_argument("--memoq-lambda-rail-p2d",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p2e",   type=float, default=0.0)
+    p.add_argument("--memoq-lambda-rail-p2f",   type=float, default=0.01)
+    p.add_argument("--memoq-lambda-shape-p2d",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p2e",  type=float, default=0.0)
+    p.add_argument("--memoq-lambda-shape-p2f",  type=float, default=0.0)
     p.add_argument(
         "--memoq-finetune-epochs", "--memoq-stage3-epochs",
         dest="memoq_stage3_epochs", type=int, default=170,
