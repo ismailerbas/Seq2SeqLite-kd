@@ -30,6 +30,13 @@
 #   `wait $PYTHON_PID`. This makes the SIGUSR1 trap fire IMMEDIATELY when
 #   the signal arrives instead of being deferred until Python exits.
 #
+# Stage order: P1 -> P2A -> P2B -> P2C -> P2D -> P2E -> P2F -> P3
+#   P2C: z kernels + recurrent only (biases still float)
+#   P2D: all biases 4-bit
+#   P2E: activation quantizer 4-bit
+#   P2F: state quantizer with soft-blend beta annealing 0->1
+#   P3 : hard QKeras polish
+#
 # Usage:
 #   sbatch --job-name=memoq_full_gru32_bs1024 \
 #          studentmemoq \
@@ -156,7 +163,7 @@ SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REF_BATCH_SIZE=1024
 EFFECTIVE_LR=$(python -c "print(f'{1e-4 * ${BATCH_SIZE} / ${REF_BATCH_SIZE}:.0e}')" 2>/dev/null || echo "1e-4")
 
-JOB_TAG="memoq_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_gru${STUDENT_UNITS}_dense${N_OUT}_effbs${BATCH_SIZE}_microbs${BATCH_SIZE}_lr${EFFECTIVE_LR}_p1-40_2a30_2b30_2c30_p3-170"
+JOB_TAG="memoq_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_gru${STUDENT_UNITS}_dense${N_OUT}_effbs${BATCH_SIZE}_microbs${BATCH_SIZE}_lr${EFFECTIVE_LR}_p1-40_2a30_2b30_2c10_2d10_2e10_2f30_p3-170"
 
 
 
@@ -248,7 +255,7 @@ if [ "${RESUME_FLAG}" = "--resume" ]; then
     echo "  Resume state : ${RESUME_STATE}"
 
     FOUND_CKPT=""
-    for CKPT_NAME in "student_best.weights.h5" "stage2c_best.weights.h5" "stage2b_best.weights.h5" "stage2a_best.weights.h5" "phase1_best.weights.h5"; do
+    for CKPT_NAME in "student_best.weights.h5" "stage2f_best.weights.h5" "stage2e_best.weights.h5" "stage2d_best.weights.h5" "stage2c_best.weights.h5" "stage2b_best.weights.h5" "stage2a_best.weights.h5" "phase1_best.weights.h5"; do
         if [ -f "${JOB_RESULTS_DIR}/${CKPT_NAME}" ]; then
             FOUND_CKPT="${JOB_RESULTS_DIR}/${CKPT_NAME}"
             echo "  Found checkpoint : ${FOUND_CKPT}"
@@ -258,7 +265,7 @@ if [ "${RESUME_FLAG}" = "--resume" ]; then
 
     if [ -z "${FOUND_CKPT}" ]; then
         echo "  No checkpoint found in ${JOB_RESULTS_DIR}."
-        echo "  Checked: student_best.weights.h5, stage2c_best.weights.h5, stage2b_best.weights.h5, stage2a_best.weights.h5, phase1_best.weights.h5"
+        echo "  Checked: student_best.weights.h5, stage2f_best.weights.h5, stage2e_best.weights.h5, stage2d_best.weights.h5, stage2c_best.weights.h5, stage2b_best.weights.h5, stage2a_best.weights.h5, phase1_best.weights.h5"
         echo "  No prior checkpoint -- train_student_memoq.py will start from Phase 1 (--resume is a no-op for a fresh directory)."
     fi
 
@@ -302,8 +309,11 @@ echo "============================================================"
 
 # ============================================================================
 # Launch Python in BACKGROUND -- critical for SIGUSR1 trap to fire immediately.
-# Full-model run (ladder F): gate curriculum ON, huber_cn output loss,
+# Full-model run (ladder F): gate curriculum ON, mse output loss,
 # all per-phase auxiliary lambdas set for mem / innov / zsat / rail / shape.
+# Stage order: P1(40) -> P2A(30) -> P2B(30) -> P2C(10) -> P2D(10) -> P2E(10)
+#              -> P2F(30, state anneal 15ep) -> P3(170)
+# Total planned epochs: 40+30+30+10+10+10+30+170 = 330
 # ============================================================================
 python "${SCRIPT_DIR}/train_student_memoq.py" \
     --data-dir                      "${DATA_PATH}"           \
@@ -336,12 +346,19 @@ python "${SCRIPT_DIR}/train_student_memoq.py" \
     --memoq-warmup-epochs           40                       \
     --memoq-stage2a-epochs          30                       \
     --memoq-stage2b-epochs          30                       \
-    --memoq-stage2c-epochs          30                       \
+    --memoq-stage2c-epochs          10                       \
+    --memoq-stage2d-epochs          10                       \
+    --memoq-stage2e-epochs          10                       \
+    --memoq-stage2f-epochs          30                       \
+    --memoq-state-anneal-epochs     15                       \
     --memoq-finetune-epochs         170                      \
     --memoq-lr-mult-p1              1.0                      \
     --memoq-lr-mult-p2a             0.5                      \
     --memoq-lr-mult-p2b             0.5                      \
     --memoq-lr-mult-p2c             0.5                      \
+    --memoq-lr-mult-p2d             0.3                      \
+    --memoq-lr-mult-p2e             0.3                      \
+    --memoq-lr-mult-p2f             0.3                      \
     --memoq-lr-mult-p3              0.1                      \
     --memoq-phase3-lr-floor         5e-6                     \
     --memoq-huber-delta             0.1                      \
@@ -352,22 +369,37 @@ python "${SCRIPT_DIR}/train_student_memoq.py" \
     --memoq-lambda-mem-p2a          0.03                     \
     --memoq-lambda-mem-p2b          0.03                     \
     --memoq-lambda-mem-p2c          0.03                     \
+    --memoq-lambda-mem-p2d          0.0                      \
+    --memoq-lambda-mem-p2e          0.0                      \
+    --memoq-lambda-mem-p2f          0.1                      \
     --memoq-lambda-mem-p3           0.03                     \
     --memoq-lambda-innov-p2a        0.005                    \
     --memoq-lambda-innov-p2b        0.005                    \
     --memoq-lambda-innov-p2c        0.005                    \
+    --memoq-lambda-innov-p2d        0.0                      \
+    --memoq-lambda-innov-p2e        0.0                      \
+    --memoq-lambda-innov-p2f        0.05                     \
     --memoq-lambda-innov-p3         0.005                    \
     --memoq-lambda-zsat-p2a         0.002                    \
     --memoq-lambda-zsat-p2b         0.002                    \
     --memoq-lambda-zsat-p2c         0.002                    \
+    --memoq-lambda-zsat-p2d         0.0                      \
+    --memoq-lambda-zsat-p2e         0.0                      \
+    --memoq-lambda-zsat-p2f         0.01                     \
     --memoq-lambda-zsat-p3          0.002                    \
     --memoq-lambda-rail-p2a         0.001                    \
     --memoq-lambda-rail-p2b         0.001                    \
     --memoq-lambda-rail-p2c         0.001                    \
+    --memoq-lambda-rail-p2d         0.0                      \
+    --memoq-lambda-rail-p2e         0.0                      \
+    --memoq-lambda-rail-p2f         0.01                     \
     --memoq-lambda-rail-p3          0.001                    \
     --memoq-lambda-shape-p2a        0.0                      \
     --memoq-lambda-shape-p2b        0.0                      \
-    --memoq-lambda-shape-p2c        0.01                     \
+    --memoq-lambda-shape-p2c        0.0                      \
+    --memoq-lambda-shape-p2d        0.0                      \
+    --memoq-lambda-shape-p2e        0.0                      \
+    --memoq-lambda-shape-p2f        0.0                      \
     --memoq-lambda-shape-p3         0.01                     \
     --log-interval                  10                       \
     --infer-batch                   8192                     \
@@ -407,8 +439,8 @@ fi
 # ============================================================================
 # STEP 6 - Auto-resubmission block
 #
-# MemoQ total epoch count = warmup + 2A + 2B + 2C + finetune
-# = 40 + 30 + 30 + 30 + 170 = 300 (matches TOTAL_EPOCHS below).
+# MemoQ total epoch count = warmup + 2A + 2B + 2C + 2D + 2E + 2F + finetune
+# = 40 + 30 + 30 + 10 + 10 + 10 + 30 + 170 = 330 (matches TOTAL_EPOCHS below).
 # ============================================================================
 RESUME_STATE_FILE="${SAVE_DIR}/results/${JOB_TAG}/resume_state.json"
 COMPLETION_FLAG="${SAVE_DIR}/results/${JOB_TAG}/training_complete.flag"
