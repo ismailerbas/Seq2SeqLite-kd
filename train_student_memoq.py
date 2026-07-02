@@ -2352,7 +2352,6 @@ def build_final_hidden_model(final_qkeras_student):
         name="memoq_final_hidden_model",
     )
 
-
 def make_dist_memoq_train_final(
     strategy,
     final_qkeras_student,
@@ -2391,12 +2390,28 @@ def make_dist_memoq_train_final(
         dec_b   = batch_x["dec_input"]
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
+
+        # Always produce a tensor for teacher_hid_b so AutoGraph never sees None
+        # at the end of any branch inside the @tf.function trace.
         if use_teacher_hidden and teacher_hidden_model is not None:
             teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
+            teacher_hid_available = True
         elif use_teacher_hidden:
-            teacher_hid_b = batch_x.get("teacher_hidden", None)
+            _thid = batch_x.get("teacher_hidden", None)
+            if _thid is not None:
+                teacher_hid_b = _thid
+                teacher_hid_available = True
+            else:
+                teacher_hid_b = tf.zeros(
+                    (tf.shape(enc_b)[0], seq_len_int, 1), dtype=tf.float32
+                )
+                teacher_hid_available = False
         else:
-            teacher_hid_b = None
+            teacher_hid_b = tf.zeros(
+                (tf.shape(enc_b)[0], seq_len_int, 1), dtype=tf.float32
+            )
+            teacher_hid_available = False
+
         with tf.GradientTape() as tape:
             seq_out, dec_h_seq = final_hidden_model([enc_b, dec_b], training=True)
 
@@ -2404,13 +2419,13 @@ def make_dist_memoq_train_final(
             l_kd  = output_loss_fn(tpred_b, seq_out, channel_scales, huber_delta, output_loss)
             total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-            if lambda_m_f > 0.0 and teacher_hid_b is not None:
+            if teacher_hid_available and lambda_m_f > 0.0:
                 l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
                 total = total + lambda_m_f * l_m
             else:
                 l_m = tf.constant(0.0, dtype=tf.float32)
 
-            if lambda_i_f > 0.0 and teacher_hid_b is not None:
+            if teacher_hid_available and lambda_i_f > 0.0:
                 l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
                 total = total + lambda_i_f * l_i
             else:
@@ -2422,9 +2437,6 @@ def make_dist_memoq_train_final(
             else:
                 l_r = tf.constant(0.0, dtype=tf.float32)
 
-            # Phase 3 has no z_logit output, so zsat is applied as a hidden-state
-            # rail-magnitude proxy (|h| > 0.90). This is reported in slot 5 so the
-            # zsat column is honest about what Phase 3 actually optimises.
             if lambda_z_f > 0.0:
                 excess_z = tf.nn.relu(tf.abs(dec_h_seq) - 0.90)
                 l_z = tf.reduce_mean(tf.square(excess_z))
@@ -2450,8 +2462,6 @@ def make_dist_memoq_train_final(
             tf.reduce_any(tf.math.is_nan(g)) | tf.reduce_any(tf.math.is_inf(g))
             for g in grads
         ]))
-        # Skip the update on a bad batch: zero every gradient so apply_gradients
-        # is a no-op instead of writing NaN/Inf into the weights.
         grads = [tf.where(nan_in_grads, tf.zeros_like(g), g) for g in grads]
         grads, _ = tf.clip_by_global_norm(grads, clipnorm_f)
         optimizer.apply_gradients(zip(grads, final_qkeras_student.trainable_variables))
@@ -2498,6 +2508,7 @@ def make_dist_memoq_val_final(
     lambda_s_f   = tf.cast(lambda_s,      tf.float32)
     eps_innov_f  = tf.cast(epsilon_innov, tf.float32)
     seq_len_int  = int(seq_len)
+    use_teacher_hidden = (float(lambda_m) > 0.0) or (float(lambda_i) > 0.0)
 
     def val_step_per_replica(batch_x, batch_y):
         enc_b   = batch_x["enc_input"]
@@ -2505,13 +2516,23 @@ def make_dist_memoq_val_final(
         tpred_b = batch_x["tpred"]
         tgt_b   = batch_y
 
-        # Skip the teacher-hidden forward pass when neither mem nor innov is on.
-        if (lambda_m_f > 0.0 or lambda_i_f > 0.0) and teacher_hidden_model is not None:
+        # Always assign a tensor to teacher_hid_b before the conditional block
+        # so AutoGraph never sees None at the end of any branch inside
+        # the @tf.function trace. This is the fix for the crash:
+        #   ValueError: 'teacher_hid_b' is None at the end of the main branch.
+        teacher_hid_b = tf.zeros(
+            (tf.shape(enc_b)[0], seq_len_int, 1), dtype=tf.float32
+        )
+        teacher_hid_available = False
+
+        if use_teacher_hidden and teacher_hidden_model is not None:
             teacher_hid_b = teacher_hidden_model([enc_b, dec_b], training=False)
-        elif (lambda_m_f > 0.0 or lambda_i_f > 0.0):
-            teacher_hid_b = batch_x.get("teacher_hidden", None)
-        else:
-            teacher_hid_b = None
+            teacher_hid_available = True
+        elif use_teacher_hidden:
+            _thid = batch_x.get("teacher_hidden", None)
+            if _thid is not None:
+                teacher_hid_b = _thid
+                teacher_hid_available = True
 
         seq_out, dec_h_seq = final_hidden_model_val([enc_b, dec_b], training=False)
 
@@ -2519,13 +2540,13 @@ def make_dist_memoq_val_final(
         l_kd  = output_loss_fn(tpred_b, seq_out, channel_scales, huber_delta, output_loss)
         total = (1.0 - alpha_f) * l_seq + alpha_f * l_kd
 
-        if lambda_m_f > 0.0 and teacher_hid_b is not None:
+        if teacher_hid_available and lambda_m_f > 0.0:
             l_m = loss_mem(dec_h_seq, teacher_hid_b, seq_len_int)
             total = total + lambda_m_f * l_m
         else:
             l_m = tf.constant(0.0, dtype=tf.float32)
 
-        if lambda_i_f > 0.0 and teacher_hid_b is not None:
+        if teacher_hid_available and lambda_i_f > 0.0:
             l_i = loss_innov(dec_h_seq, teacher_hid_b, eps_innov_f)
             total = total + lambda_i_f * l_i
         else:
@@ -2567,6 +2588,7 @@ def make_dist_memoq_val_final(
         )
 
     return dist_val_step
+
 
 # ==============================================================================
 # run_epoch for MemoQ — extended to handle 8-output step functions.
