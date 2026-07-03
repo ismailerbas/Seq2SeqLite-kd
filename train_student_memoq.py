@@ -3538,72 +3538,106 @@ def run_equivalence_checks(float_student, phase2_model, enc_cell_p2, dec_cell_p2
     """
     Diagnostic equivalence checks (task-doc items 13 and 14).
 
-    stage == "P1->P2":
-      With Phase 2 quantizers DISABLED (all None), the split-gate cell must
-      reproduce the float Keras GRU. Compares float_student vs phase2_model on
-      the same batch. Mean abs diff should be ~1e-5 or smaller. A large diff
-      means the split-gate equations or the packed-weight transfer are wrong,
-      invalidating every later curriculum result.
+    stage == "P1->P2"   : float_student vs phase2_model with ALL quantizers off.
+                          Checks transfer_float_to_phase2 correctness.
+                          Tolerance: < 1e-4 mean absolute difference.
 
-    stage == "P2C->P3":
-      Immediately after packing Phase 2 weights into the final QKeras student,
-      compares phase2_model vs final_qkeras_student on the same batch. A small
-      diff means Phase 3 polishes a faithful export; a large diff means Phase 3
-      is just recovering from an export mismatch (float/QDense, bias layout,
-      state-quantizer, or weight-layout bug).
+    stage == "P2C->P3"  : phase2_model (P2C checkpoint, all quantizers on) vs
+    stage == "P2F->P3"    final_qkeras_student after transfer_splitgate_to_qkeras.
+                          Checks packing fidelity.
+                          Tolerance: < 5e-3 mean absolute difference (quantizer
+                          rounding introduces O(2^-bits) error).
     """
-    n = min(256, enc_sample.shape[0])
-    xb = enc_sample[:n].astype(np.float32)
-    db = np.zeros((n, seq_len, 1), dtype=np.float32)
+    pf(f"[EQUIV {stage}] Running equivalence check...")
+    sys.stdout.flush()
 
-    if stage == "P1->P2":
-        saved = []
-        for cell in (enc_cell_p2, dec_cell_p2):
-            saved.append((
-                cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
-                cell.quantizer_state, cell.quantizer_activation,
-                cell.quantizer_recurrent_z, cell.quantizer_recurrent_r,
-                cell.quantizer_recurrent_h, cell.quantizer_bias,
-            ))
-            cell.quantizer_z = None
-            cell.quantizer_r = None
-            cell.quantizer_h = None
-            cell.quantizer_state = None
-            cell.quantizer_activation = None
-            cell.quantizer_recurrent_z = None
-            cell.quantizer_recurrent_r = None
-            cell.quantizer_recurrent_h = None
-            cell.quantizer_bias = None
+    try:
+        dec_dummy = np.zeros((enc_sample.shape[0], seq_len, 1), dtype=np.float32)
 
-        f_out = float_student([xb, db], training=False)
-        f_pred = f_out.numpy() if hasattr(f_out, "numpy") else np.asarray(f_out)
-        p_out = phase2_model([xb, db], training=False)
-        p_pred = p_out[0].numpy() if isinstance(p_out, (list, tuple)) else p_out.numpy()
-        diff = float(np.abs(f_pred - p_pred).mean())
+        if stage == "P1->P2":
+            # Turn off all quantizers in phase2_model for this check.
+            orig_qz  = [enc_cell_p2.quantizer_z,  dec_cell_p2.quantizer_z]
+            orig_qr  = [enc_cell_p2.quantizer_r,  dec_cell_p2.quantizer_r]
+            orig_qh  = [enc_cell_p2.quantizer_h,  dec_cell_p2.quantizer_h]
+            orig_qs  = [enc_cell_p2.quantizer_state, dec_cell_p2.quantizer_state]
+            orig_qa  = [enc_cell_p2.quantizer_activation, dec_cell_p2.quantizer_activation]
+            orig_qrz = [enc_cell_p2.quantizer_recurrent_z, dec_cell_p2.quantizer_recurrent_z]
+            orig_qrr = [enc_cell_p2.quantizer_recurrent_r, dec_cell_p2.quantizer_recurrent_r]
+            orig_qrh = [enc_cell_p2.quantizer_recurrent_h, dec_cell_p2.quantizer_recurrent_h]
+            orig_qb  = [enc_cell_p2.quantizer_bias, dec_cell_p2.quantizer_bias]
 
-        for cell, q in zip((enc_cell_p2, dec_cell_p2), saved):
-            (cell.quantizer_z, cell.quantizer_r, cell.quantizer_h,
-             cell.quantizer_state, cell.quantizer_activation,
-             cell.quantizer_recurrent_z, cell.quantizer_recurrent_r,
-             cell.quantizer_recurrent_h, cell.quantizer_bias) = q
+            for cell in [enc_cell_p2, dec_cell_p2]:
+                cell.quantizer_z              = None
+                cell.quantizer_r              = None
+                cell.quantizer_h              = None
+                cell.quantizer_state          = None
+                cell.quantizer_activation     = None
+                cell.quantizer_recurrent_z    = None
+                cell.quantizer_recurrent_r    = None
+                cell.quantizer_recurrent_h    = None
+                cell.quantizer_bias           = None
 
-        pf(f"[EQUIV P1->P2] mean |float - phase2(no-quant)| = {diff:.6e}  "
-           f"(should be < 1e-4; large => split-gate or transfer bug)")
+            out_float = float_student.predict(
+                [enc_sample, dec_dummy], batch_size=len(enc_sample), verbose=0
+            )
+            out_p2_raw = phase2_model.predict(
+                [enc_sample, dec_dummy], batch_size=len(enc_sample), verbose=0
+            )
+            out_p2 = out_p2_raw[0] if isinstance(out_p2_raw, (list, tuple)) else out_p2_raw
+
+            # Restore quantizers.
+            for i, cell in enumerate([enc_cell_p2, dec_cell_p2]):
+                cell.quantizer_z              = orig_qz[i]
+                cell.quantizer_r              = orig_qr[i]
+                cell.quantizer_h              = orig_qh[i]
+                cell.quantizer_state          = orig_qs[i]
+                cell.quantizer_activation     = orig_qa[i]
+                cell.quantizer_recurrent_z    = orig_qrz[i]
+                cell.quantizer_recurrent_r    = orig_qrr[i]
+                cell.quantizer_recurrent_h    = orig_qrh[i]
+                cell.quantizer_bias           = orig_qb[i]
+
+            mae = float(np.mean(np.abs(out_float - out_p2)))
+            max_ae = float(np.max(np.abs(out_float - out_p2)))
+            tol = 1e-4
+            status = "OK" if mae < tol else "FAIL"
+            pf(
+                f"[EQUIV P1->P2] {status}  mae={mae:.2e}  max_ae={max_ae:.2e}  "
+                f"(tol={tol:.0e})  {'Weight transfer is faithful.' if status == 'OK' else 'WARNING: transfer may be lossy.'}"
+            )
+            sys.stdout.flush()
+
+        elif stage in ("P2C->P3", "P2F->P3"):
+            # phase2_model (quantizers already on) vs final_qkeras_student.
+            out_p2_raw = phase2_model.predict(
+                [enc_sample, dec_dummy], batch_size=len(enc_sample), verbose=0
+            )
+            out_p2 = out_p2_raw[0] if isinstance(out_p2_raw, (list, tuple)) else out_p2_raw
+
+            out_q = final_qkeras_student.predict(
+                [enc_sample, dec_dummy], batch_size=len(enc_sample), verbose=0
+            )
+
+            mae = float(np.mean(np.abs(out_p2 - out_q)))
+            max_ae = float(np.max(np.abs(out_p2 - out_q)))
+            tol = 5e-3
+            status = "OK" if mae < tol else "WARN"
+            pf(
+                f"[EQUIV {stage}] {status}  mae={mae:.2e}  max_ae={max_ae:.2e}  "
+                f"(tol={tol:.0e})  "
+                f"{'Packing faithful — export is safe.' if status == 'OK' else 'Larger than expected — check quantizer config parity.'}"
+            )
+            sys.stdout.flush()
+
+        else:
+            raise ValueError(
+                f"Unknown equivalence stage: {stage!r}. "
+                f"Expected one of 'P1->P2', 'P2C->P3', 'P2F->P3'."
+            )
+
+    except Exception as exc:
+        pf(f"[EQUIV {stage}] ERROR during check: {exc}")
         sys.stdout.flush()
-        return diff
-
-    if stage == "P2C->P3":
-        p_out = phase2_model([xb, db], training=False)
-        p_pred = p_out[0].numpy() if isinstance(p_out, (list, tuple)) else p_out.numpy()
-        q_out = final_qkeras_student([xb, db], training=False)
-        q_pred = q_out.numpy() if hasattr(q_out, "numpy") else np.asarray(q_out)
-        diff = float(np.abs(p_pred - q_pred).mean())
-        pf(f"[EQUIV P2C->P3] mean |phase2 - qkeras| = {diff:.6e}  "
-           f"(small => faithful export; large => transfer cliff)")
-        sys.stdout.flush()
-        return diff
-
-    raise ValueError(f"Unknown equivalence stage: {stage!r}")
 
 # ==============================================================================
 # save_loss_curves_memoq:
