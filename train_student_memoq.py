@@ -409,6 +409,11 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     curriculum=False collapses P2A/P2B/P2C/P2D/P2E/P2F all into P2A
     (all quantizers on immediately, same as before for the control run).
 
+    LSB noise is injected onto h_prev during P2A-P2E to prevent the float
+    state from becoming a compensation sink for kernel quantization errors.
+    The noise std is fixed at 1/(2^bits_state - 1) — never annealed.
+    It is disabled in P2F/P3 because the hard state quantizer takes over.
+
     State blend beta is NOT set here — it is set by the training loop
     per epoch during P2F to implement the annealing schedule.
     """
@@ -418,10 +423,11 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     q4s  = quantized_bits(args.bits_state,     0, 1, alpha=1.0)
     q4a  = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
+    lsb_noise_std = 1.0 / (2 ** args.bits_state - 1)
+
     curriculum = args.memoq_gate_curriculum
 
     if not curriculum:
-        # Control run: everything on at P2A.
         q_h    = q4k
         q_r    = q4k
         q_z    = q4k
@@ -431,6 +437,7 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = q4b
         q_a    = q4a
         q_s    = q4s
+        noise  = 0.0
     elif stage == "P2A":
         q_h    = q4k
         q_r    = None
@@ -441,6 +448,7 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = None
         q_a    = None
         q_s    = None
+        noise  = lsb_noise_std
     elif stage == "P2B":
         q_h    = q4k
         q_r    = q4k
@@ -451,8 +459,8 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = None
         q_a    = None
         q_s    = None
+        noise  = lsb_noise_std
     elif stage == "P2C":
-        # z kernels + recurrent only. Biases, activation, state still float.
         q_h    = q4k
         q_r    = q4k
         q_z    = q4k
@@ -462,8 +470,8 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = None
         q_a    = None
         q_s    = None
+        noise  = lsb_noise_std
     elif stage == "P2D":
-        # All kernels + ALL biases. Activation and state still float.
         q_h    = q4k
         q_r    = q4k
         q_z    = q4k
@@ -473,8 +481,8 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = q4b
         q_a    = None
         q_s    = None
+        noise  = lsb_noise_std
     elif stage == "P2E":
-        # All kernels + biases + activation. State still float.
         q_h    = q4k
         q_r    = q4k
         q_z    = q4k
@@ -484,8 +492,8 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = q4b
         q_a    = q4a
         q_s    = None
+        noise  = lsb_noise_std
     elif stage in ("P2F", "P3"):
-        # All quantizers on. Beta controls the soft blend in P2F.
         q_h    = q4k
         q_r    = q4k
         q_z    = q4k
@@ -495,6 +503,7 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         q_bias = q4b
         q_a    = q4a
         q_s    = q4s
+        noise  = 0.0
     else:
         raise ValueError(
             f"Unknown stage: {stage!r}. "
@@ -511,7 +520,7 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         cell.quantizer_state       = q_s
         cell.quantizer_activation  = q_a
         cell.quantizer_bias        = q_bias
-
+        cell.state_lsb_noise_std   = noise
 
 # ==============================================================================
 # Main MemoQ training loop
@@ -1757,24 +1766,19 @@ class MemoQGRUCell(keras.layers.Layer):
             self._quantizer_h = quantizer_h
             self._quantizer_state = quantizer_state
             self._quantizer_activation = quantizer_activation
-            # Separate recurrent-kernel quantizers (Fix 7). When None, the input
-            # kernel quantizer for the same gate is reused, preserving old behaviour
-            # for the 4/4/4/4/4 case.
             self._quantizer_recurrent_z = quantizer_recurrent_z
             self._quantizer_recurrent_r = quantizer_recurrent_r
             self._quantizer_recurrent_h = quantizer_recurrent_h
-            # Bias quantizer (Fix 6). When None, biases stay float.
             self._quantizer_bias = quantizer_bias
-            # state_size must be a list so Keras RNN allocates two state tensors:
-            #   states[0] = h_prev (B, units)
-            #   states[1] = z_logit_prev (B, units)  -- carried for extraction only
             self.state_size = [units, units]
             self.output_size = units
-            # Soft-blend beta for state quantizer annealing in P2F.
-            # 0.0 = fully float state, 1.0 = fully quantized state.
-            # Schedulable from outside by setting cell.state_blend_beta = value.
             self._state_blend_beta = 1.0
-
+            # LSB noise std injected onto h_prev during training only.
+            # Set to 1/(2^bits - 1) for the target bit-width from P2A onward.
+            # This blocks the float state from becoming a compensation sink for
+            # kernel quantization errors during P2A-P2C. Fixed constant — not
+            # annealed. Zero means disabled (default, used in P1 and inference).
+            self._state_lsb_noise_std = 0.0
 
     def build(self, input_shape):
         d = self.input_dim
@@ -1805,12 +1809,25 @@ class MemoQGRUCell(keras.layers.Layer):
 
     def call(self, inputs, states, training=None):
         h_prev = states[0]   # (B, units)
-        # states[1] is z_logit_prev -- carried but not used in the forward pass
+
+        # LSB noise injection: active only during training and only when
+        # _state_lsb_noise_std > 0. The noise is applied to h_prev BEFORE
+        # the quantizer blend so the gates learn to tolerate sub-LSB
+        # uncertainty in the state throughout P2A-P2C. This prevents the
+        # float state from absorbing kernel quantization errors. The noise
+        # std is a fixed constant equal to 1/(2^bits - 1) for the target
+        # quantizer. It is never annealed — it stays constant the entire
+        # time it is active so the floor of precision tolerance is stable.
+        if self._state_lsb_noise_std > 0.0:
+            noise_std = tf.cast(self._state_lsb_noise_std, tf.float32)
+            noise = tf.random.normal(tf.shape(h_prev), stddev=noise_std, dtype=tf.float32)
+            h_prev = h_prev + tf.cond(
+                tf.cast(training, tf.bool) if training is not None else tf.constant(False),
+                lambda: noise,
+                lambda: tf.zeros_like(noise),
+            )
 
         # Soft-blend state quantizer: h_prev_q = beta * q_s(h_prev) + (1-beta) * h_prev
-        # When state_blend_beta == 1.0 this is identical to the hard switch.
-        # When state_blend_beta == 0.0 the state quantizer is fully off.
-        # Ramp beta from 0 -> 1 over the P2F stage to avoid the 16-level cliff.
         if self._quantizer_state is not None:
             h_prev_q_hard = self._quantizer_state(h_prev)
             beta = tf.cast(self._state_blend_beta, tf.float32)
@@ -1823,9 +1840,7 @@ class MemoQGRUCell(keras.layers.Layer):
         W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
         W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
 
-        # Recurrent kernels — use the dedicated recurrent quantizer when set,
-        # otherwise fall back to the per-gate input-kernel quantizer so the
-        # 4/4/4/4/4 case is unchanged.
+        # Recurrent kernels.
         rq_z = self._quantizer_recurrent_z if self._quantizer_recurrent_z is not None else self._quantizer_z
         rq_r = self._quantizer_recurrent_r if self._quantizer_recurrent_r is not None else self._quantizer_r
         rq_h = self._quantizer_recurrent_h if self._quantizer_recurrent_h is not None else self._quantizer_h
@@ -1833,7 +1848,7 @@ class MemoQGRUCell(keras.layers.Layer):
         U_r = self._apply_quantizer(rq_r, self.U_r)
         U_h = self._apply_quantizer(rq_h, self.U_h)
 
-        # Biases — quantized when a bias quantizer is set (Fix 6).
+        # Biases.
         b_z_inp = self._apply_quantizer(self._quantizer_bias, self.b_z_inp)
         b_r_inp = self._apply_quantizer(self._quantizer_bias, self.b_r_inp)
         b_h_inp = self._apply_quantizer(self._quantizer_bias, self.b_h_inp)
@@ -1853,13 +1868,11 @@ class MemoQGRUCell(keras.layers.Layer):
         z = tf.sigmoid(z_logit)
         r = tf.sigmoid(r_logit)
 
-        # Candidate pre-activation (reset_after=True form).
         cand_preact = (
             tf.matmul(inputs, W_h) + b_h_inp
             + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
         )
 
-        # Candidate activation.
         if self._quantizer_activation is not None:
             h_candidate = self._quantizer_activation(cand_preact)
         else:
@@ -1915,6 +1928,10 @@ class MemoQGRUCell(keras.layers.Layer):
     def quantizer_activation(self):
         return self._quantizer_activation
 
+    @quantizer_activation.setter
+    def quantizer_activation(self, q):
+        self._quantizer_activation = q
+
     @property
     def quantizer_recurrent_z(self):
         return self._quantizer_recurrent_z
@@ -1943,6 +1960,10 @@ class MemoQGRUCell(keras.layers.Layer):
     def quantizer_bias(self):
         return self._quantizer_bias
 
+    @quantizer_bias.setter
+    def quantizer_bias(self, q):
+        self._quantizer_bias = q
+
     @property
     def state_blend_beta(self):
         return self._state_blend_beta
@@ -1951,14 +1972,14 @@ class MemoQGRUCell(keras.layers.Layer):
     def state_blend_beta(self, v):
         self._state_blend_beta = float(v)
 
-    @quantizer_bias.setter
-    def quantizer_bias(self, q):
-        self._quantizer_bias = q
+    @property
+    def state_lsb_noise_std(self):
+        return self._state_lsb_noise_std
 
+    @state_lsb_noise_std.setter
+    def state_lsb_noise_std(self, v):
+        self._state_lsb_noise_std = float(v)
 
-    @quantizer_activation.setter
-    def quantizer_activation(self, q):
-        self._quantizer_activation = q
 # ==============================================================================
 # build_phase2_model:
 # Constructs the training-time phase2 model using MemoQGRUCell instances.
