@@ -4569,7 +4569,7 @@ def main():
             # phase, all in the vanilla hexbin style.
             if phase_tag == "P1":
                 model_for_eval = float_student
-            elif phase_tag in ("P2A", "P2B", "P2C"):
+            elif phase_tag in ("P2A", "P2B", "P2C", "P2D", "P2E", "P2F"):
                 model_for_eval = phase2_model
             elif phase_tag in ("P3", "final"):
                 model_for_eval = final_qkeras_student
