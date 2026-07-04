@@ -407,19 +407,34 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
       P2C : h + r + z kernel + recurrent  (biases still float)
       P2D : h + r + z kernel + recurrent + ALL biases
       P2E : h + r + z kernel + recurrent + ALL biases + activation quantizer
-      P2F : all of above + state quantizer (via soft blend beta=0 -> 1)
-      P3  : identical to P2F (hard, beta=1.0 enforced externally)
+             activation_blend_beta and act_dither_delta are set to their
+             STARTING values (beta=0, dither=DELTA_A*0.5) here so the training
+             loop can begin the cosine anneal from epoch 0 of P2E.
+      P2F : all of above + state quantizer.
+             Both activation_blend_beta and state_blend_beta are reset to 0.0
+             here so the merged anneal in the training loop starts from 0 for
+             BOTH quantizers simultaneously (Fix 2 — joint anneal).
+             state_dither_delta is set to DELTA_S*0.5 at anneal start.
+      P3  : identical quantizer assignment to P2F. beta and dither are
+             enforced to 1.0 / 0.0 externally by the training loop hard tail.
 
     curriculum=False collapses P2A/P2B/P2C/P2D/P2E/P2F all into P2A
-    (all quantizers on immediately, same as before for the control run).
+    (all quantizers on immediately — control run).
 
-    LSB noise is injected onto h_prev during P2A-P2E to prevent the float
-    state from becoming a compensation sink for kernel quantization errors.
-    The noise std is fixed at 1/(2^bits_state - 1) — never annealed.
-    It is disabled in P2F/P3 because the hard state quantizer takes over.
+    Fix 1: LSB noise (old Gaussian) is REPLACED with subtractive uniform dither.
+    DELTA_S = DELTA_A = 0.125 for 4-bit. Half-width = 0.0625.
+    The Gaussian std 1/(2^bits-1) = 0.0667 was 1.85x the physical rounding std
+    and was unbounded. The new dither is bounded in [-DELTA, DELTA] (triangular
+    sum), correct scale, and is applied subtractively inside call() so it
+    linearises the dead-zone without biasing the expected value.
 
-    State blend beta is NOT set here — it is set by the training loop
-    per epoch during P2F to implement the annealing schedule.
+    Fix 2: activation_blend_beta mirrors state_blend_beta. Both are set here
+    to their starting values. The training loop ramps both together with a
+    single cosine schedule in the merged P2E+P2F anneal.
+
+    Dither is tapered to 0.0 over the last 10% of the anneal window by the
+    training loop. This function sets the INITIAL value at anneal start.
+    In P3 / hard tail both deltas are set to 0.0 (exact inference).
     """
     q4k  = quantized_bits(args.bits_kernel,    0, 1, alpha=args.q_alpha)
     q4r  = quantized_bits(args.bits_recurrent, 0, 1, alpha=args.q_alpha)
@@ -427,87 +442,126 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
     q4s  = quantized_bits(args.bits_state,     0, 1, alpha=1.0)
     q4a  = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
-    lsb_noise_std = 1.0 / (2 ** args.bits_state - 1)
+    # Fix 1: correct physical half-LSB for 4-bit uniform quantizer.
+    # Replaces the old 1/(2^bits_state - 1) = 0.0667 Gaussian std.
+    DELTA_S = 2.0 ** (-(args.bits_state - 1))       # 0.125 for 4-bit
+    DELTA_A = 2.0 ** (-(args.bits_activation - 1))  # 0.125 for 4-bit
+    dither_half_s = DELTA_S * 0.5                   # 0.0625
+    dither_half_a = DELTA_A * 0.5                   # 0.0625
 
     curriculum = args.memoq_gate_curriculum
 
     if not curriculum:
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = q4k
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = q4r
-        q_bias = q4b
-        q_a    = q4a
-        q_s    = q4s
-        noise  = 0.0
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = q4k
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = q4r
+        q_bias       = q4b
+        q_a          = q4a
+        q_s          = q4s
+        # No anneal in non-curriculum control run: hard quantizers immediately.
+        # Set betas to 1.0 and dithers to 0.0 so call() is the hard path.
+        act_beta     = 1.0
+        state_beta   = 1.0
+        act_dither   = 0.0
+        state_dither = 0.0
     elif stage == "P2A":
-        q_h    = q4k
-        q_r    = None
-        q_z    = None
-        rq_h   = q4r
-        rq_r   = None
-        rq_z   = None
-        q_bias = None
-        q_a    = None
-        q_s    = None
-        noise  = lsb_noise_std
+        q_h          = q4k
+        q_r          = None
+        q_z          = None
+        rq_h         = q4r
+        rq_r         = None
+        rq_z         = None
+        q_bias       = None
+        q_a          = None
+        q_s          = None
+        act_beta     = 1.0
+        state_beta   = 1.0
+        act_dither   = 0.0
+        # Fix 1: correct bounded uniform dither on state during P2A.
+        # Old code: state_lsb_noise_std = 1/(2^bits-1) = 0.0667 Gaussian.
+        # New code: subtractive uniform half-width = DELTA_S * 0.5 = 0.0625.
+        state_dither = dither_half_s
     elif stage == "P2B":
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = None
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = None
-        q_bias = None
-        q_a    = None
-        q_s    = None
-        noise  = lsb_noise_std
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = None
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = None
+        q_bias       = None
+        q_a          = None
+        q_s          = None
+        act_beta     = 1.0
+        state_beta   = 1.0
+        act_dither   = 0.0
+        state_dither = dither_half_s
     elif stage == "P2C":
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = q4k
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = q4r
-        q_bias = None
-        q_a    = None
-        q_s    = None
-        noise  = lsb_noise_std
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = q4k
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = q4r
+        q_bias       = None
+        q_a          = None
+        q_s          = None
+        act_beta     = 1.0
+        state_beta   = 1.0
+        act_dither   = 0.0
+        state_dither = dither_half_s
     elif stage == "P2D":
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = q4k
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = q4r
-        q_bias = q4b
-        q_a    = None
-        q_s    = None
-        noise  = lsb_noise_std
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = q4k
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = q4r
+        q_bias       = q4b
+        q_a          = None
+        q_s          = None
+        act_beta     = 1.0
+        state_beta   = 1.0
+        act_dither   = 0.0
+        state_dither = dither_half_s
     elif stage == "P2E":
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = q4k
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = q4r
-        q_bias = q4b
-        q_a    = q4a
-        q_s    = None
-        noise  = lsb_noise_std
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = q4k
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = q4r
+        q_bias       = q4b
+        q_a          = q4a
+        q_s          = None
+        # Fix 0+2: activation quantizer is introduced with beta=0 (fully float)
+        # and dither active. The training loop ramps beta 0->1 with cosine
+        # schedule over memoq_state_anneal_epochs epochs. State still float.
+        act_beta     = 0.0
+        state_beta   = 1.0
+        act_dither   = dither_half_a
+        state_dither = dither_half_s
     elif stage in ("P2F", "P3"):
-        q_h    = q4k
-        q_r    = q4k
-        q_z    = q4k
-        rq_h   = q4r
-        rq_r   = q4r
-        rq_z   = q4r
-        q_bias = q4b
-        q_a    = q4a
-        q_s    = q4s
-        noise  = 0.0
+        q_h          = q4k
+        q_r          = q4k
+        q_z          = q4k
+        rq_h         = q4r
+        rq_r         = q4r
+        rq_z         = q4r
+        q_bias       = q4b
+        q_a          = q4a
+        q_s          = q4s
+        # Fix 2: merged joint anneal. Both activation_blend_beta AND
+        # state_blend_beta start at 0.0 here. The training loop drives
+        # both to 1.0 together with a single cosine schedule.
+        # Both dithers are active at the start; the loop tapers them to 0.0
+        # before the hard tail. In P3 the loop enforces beta=1, dither=0.
+        act_beta     = 0.0
+        state_beta   = 0.0
+        act_dither   = dither_half_a
+        state_dither = dither_half_s
     else:
         raise ValueError(
             f"Unknown stage: {stage!r}. "
@@ -515,17 +569,22 @@ def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
         )
 
     for cell in [enc_cell, dec_cell]:
-        cell.quantizer_h           = q_h
-        cell.quantizer_r           = q_r
-        cell.quantizer_z           = q_z
-        cell.quantizer_recurrent_h = rq_h
-        cell.quantizer_recurrent_r = rq_r
-        cell.quantizer_recurrent_z = rq_z
-        cell.quantizer_state       = q_s
-        cell.quantizer_activation  = q_a
-        cell.quantizer_bias        = q_bias
-        cell.state_lsb_noise_std   = noise
-
+        cell.quantizer_h              = q_h
+        cell.quantizer_r              = q_r
+        cell.quantizer_z              = q_z
+        cell.quantizer_recurrent_h    = rq_h
+        cell.quantizer_recurrent_r    = rq_r
+        cell.quantizer_recurrent_z    = rq_z
+        cell.quantizer_state          = q_s
+        cell.quantizer_activation     = q_a
+        cell.quantizer_bias           = q_bias
+        cell.activation_blend_beta    = act_beta
+        cell.state_blend_beta         = state_beta
+        cell.act_dither_delta         = act_dither
+        cell.state_dither_delta       = state_dither
+        # Legacy field kept for external code that still writes it. No-op
+        # inside call() — the new dither fields are what call() reads.
+        cell.state_lsb_noise_std      = 0.0
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
@@ -1193,13 +1252,18 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2D")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 2E — Activation quantizer (quantized_tanh). State still float.
+    # PHASE 2E — Activation quantizer (quantized_tanh) with soft-blend anneal.
+    # Fix 0+2: activation_blend_beta is ramped 0->1 with a cosine schedule
+    # over memoq_state_anneal_epochs epochs (reusing that arg for both anneal
+    # windows). act_dither_delta is tapered to 0 over the last 10% of the
+    # anneal, then 0 for the hard tail. state still float in this stage.
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2E"):
         set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2E")
         pf("=" * 60)
-        pf(f"MEMOQ PHASE 2E — Activation quantizer 4-bit ({args.memoq_stage2e_epochs} epochs)")
-        pf("  All kernels + biases + activation 4-bit. State still float.")
+        pf(f"MEMOQ PHASE 2E — Activation quantizer soft-blend anneal ({args.memoq_stage2e_epochs} epochs)")
+        pf(f"  anneal_epochs={args.memoq_state_anneal_epochs}  activation_blend_beta 0->1 cosine then hard.")
+        pf("  All kernels + biases 4-bit. Activation annealed. State still float.")
         pf("=" * 60)
         sys.stdout.flush()
 
@@ -1243,7 +1307,35 @@ def training_loop_memoq(
             output_loss=args.output_loss,
         )
 
+        anneal_epochs_2e = max(1, args.memoq_state_anneal_epochs)
+        # DELTA_A for 4-bit activation quantizer half-LSB
+        _DELTA_A_HALF = 2.0 ** (-(args.bits_activation - 1)) * 0.5
+
         for ep_in_phase in range(ep2e_start, args.memoq_stage2e_epochs):
+            # Cosine anneal: beta = 0.5*(1 - cos(pi * frac))
+            if ep_in_phase < anneal_epochs_2e:
+                frac = float(ep_in_phase + 1) / float(anneal_epochs_2e)
+                beta_a = 0.5 * (1.0 - math.cos(math.pi * frac))
+            else:
+                beta_a = 1.0
+            # Dither taper: full dither for first 90% of anneal, linear taper
+            # to 0.0 over the last 10% of the anneal window. Hard tail = 0.0.
+            if ep_in_phase < anneal_epochs_2e:
+                taper_start = 0.9
+                frac_raw = float(ep_in_phase + 1) / float(anneal_epochs_2e)
+                if frac_raw < taper_start:
+                    act_dither = _DELTA_A_HALF
+                else:
+                    taper_frac = (frac_raw - taper_start) / (1.0 - taper_start)
+                    act_dither = _DELTA_A_HALF * max(0.0, 1.0 - taper_frac)
+            else:
+                act_dither = 0.0
+            for cell in [enc_cell_p2, dec_cell_p2]:
+                cell.activation_blend_beta = beta_a
+                cell.act_dither_delta      = act_dither
+            pf(f"  [P2E] ep {ep_in_phase}  activation_blend_beta={beta_a:.4f}  act_dither_delta={act_dither:.5f}")
+            sys.stdout.flush()
+
             history, best_vals["P2E"], patience_cts["P2E"], early_stop = run_epoch(
                 phase_tag="P2E",
                 epoch=global_epoch,
@@ -1275,6 +1367,11 @@ def training_loop_memoq(
             if early_stop:
                 break
 
+        # Hard tail: force beta=1, dither=0 after P2E regardless of early stop.
+        for cell in [enc_cell_p2, dec_cell_p2]:
+            cell.activation_blend_beta = 1.0
+            cell.act_dither_delta      = 0.0
+
         if os.path.exists(p2e_ckpt):
             phase2_model.load_weights(p2e_ckpt)
             pf(f"[P2E] Loaded best weights from {p2e_ckpt}")
@@ -1286,21 +1383,19 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2E")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 2F — State quantizer with soft blend annealing beta 0 -> 1.
-    # This is the single highest-leverage stage. The state quantizer is
-    # introduced with beta=0 (fully float) and ramped linearly to beta=1
-    # (fully quantized) over args.memoq_state_anneal_epochs epochs. After
-    # annealing, training continues at beta=1 for the remaining epochs.
-    # L_innov and L_zsat are active here to prevent innovation collapse.
+    # PHASE 2F — Joint activation + state quantizer soft-blend anneal (Fix 2).
+    # Both activation_blend_beta and state_blend_beta are set to 0.0 at entry
+    # by set_phase2_quantizers("P2F") and ramped jointly with a single cosine
+    # schedule over memoq_state_anneal_epochs epochs. Both dithers are active
+    # during the anneal and tapered to 0 before the hard tail.
+    # This eliminates the double-shock where P2E adapted weights to a float
+    # state and P2F then invalidated that by suddenly quantizing the state.
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2F"):
         set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2F")
-        # Start with beta=0 (float state) and ramp up.
-        for cell in [enc_cell_p2, dec_cell_p2]:
-            cell.state_blend_beta = 0.0
         pf("=" * 60)
-        pf(f"MEMOQ PHASE 2F — State quantizer soft-blend annealing ({args.memoq_stage2f_epochs} epochs)")
-        pf(f"  anneal_epochs={args.memoq_state_anneal_epochs}  beta 0->1 then hard.")
+        pf(f"MEMOQ PHASE 2F — Joint activation+state soft-blend anneal ({args.memoq_stage2f_epochs} epochs)")
+        pf(f"  anneal_epochs={args.memoq_state_anneal_epochs}  both betas 0->1 cosine jointly then hard.")
         pf(f"  innov={args.memoq_lambda_innov_p2f}  mem={args.memoq_lambda_mem_p2f}  "
            f"zsat={args.memoq_lambda_zsat_p2f}  rail={args.memoq_lambda_rail_p2f}")
         pf("=" * 60)
@@ -1346,17 +1441,41 @@ def training_loop_memoq(
             output_loss=args.output_loss,
         )
 
-        anneal_epochs = max(1, args.memoq_state_anneal_epochs)
+        anneal_epochs_2f = max(1, args.memoq_state_anneal_epochs)
+        _DELTA_A_HALF_2F = 2.0 ** (-(args.bits_activation - 1)) * 0.5
+        _DELTA_S_HALF_2F = 2.0 ** (-(args.bits_state - 1)) * 0.5
 
         for ep_in_phase in range(ep2f_start, args.memoq_stage2f_epochs):
-            # Compute and set soft-blend beta for this epoch.
-            if ep_in_phase < anneal_epochs:
-                beta = float(ep_in_phase + 1) / float(anneal_epochs)
+            # Cosine anneal for both betas jointly.
+            if ep_in_phase < anneal_epochs_2f:
+                frac = float(ep_in_phase + 1) / float(anneal_epochs_2f)
+                beta = 0.5 * (1.0 - math.cos(math.pi * frac))
             else:
                 beta = 1.0
+            # Dither taper: full for first 90% of anneal window, linear taper
+            # to 0.0 over the last 10%. Hard tail = 0.0 for both.
+            if ep_in_phase < anneal_epochs_2f:
+                taper_start = 0.9
+                frac_raw = float(ep_in_phase + 1) / float(anneal_epochs_2f)
+                if frac_raw < taper_start:
+                    act_dither   = _DELTA_A_HALF_2F
+                    state_dither = _DELTA_S_HALF_2F
+                else:
+                    taper_frac   = (frac_raw - taper_start) / (1.0 - taper_start)
+                    act_dither   = _DELTA_A_HALF_2F * max(0.0, 1.0 - taper_frac)
+                    state_dither = _DELTA_S_HALF_2F * max(0.0, 1.0 - taper_frac)
+            else:
+                act_dither   = 0.0
+                state_dither = 0.0
             for cell in [enc_cell_p2, dec_cell_p2]:
-                cell.state_blend_beta = beta
-            pf(f"  [P2F] ep {ep_in_phase}  state_blend_beta={beta:.4f}")
+                cell.activation_blend_beta = beta
+                cell.state_blend_beta      = beta
+                cell.act_dither_delta      = act_dither
+                cell.state_dither_delta    = state_dither
+            pf(
+                f"  [P2F] ep {ep_in_phase}  beta={beta:.4f}  "
+                f"act_dither={act_dither:.5f}  state_dither={state_dither:.5f}"
+            )
             sys.stdout.flush()
 
             history, best_vals["P2F"], patience_cts["P2F"], early_stop = run_epoch(
@@ -1390,9 +1509,12 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        # Ensure beta=1 after P2F regardless of early stop.
+        # Hard tail: force both betas=1, both dithers=0 after P2F.
         for cell in [enc_cell_p2, dec_cell_p2]:
-            cell.state_blend_beta = 1.0
+            cell.activation_blend_beta = 1.0
+            cell.state_blend_beta      = 1.0
+            cell.act_dither_delta      = 0.0
+            cell.state_dither_delta    = 0.0
 
         if os.path.exists(p2f_ckpt):
             phase2_model.load_weights(p2f_ckpt)
@@ -1777,11 +1899,19 @@ class MemoQGRUCell(keras.layers.Layer):
             self.state_size = [units, units]
             self.output_size = units
             self._state_blend_beta = 1.0
-            # LSB noise std injected onto h_prev during training only.
-            # Set to 1/(2^bits - 1) for the target bit-width from P2A onward.
-            # This blocks the float state from becoming a compensation sink for
-            # kernel quantization errors during P2A-P2C. Fixed constant — not
-            # annealed. Zero means disabled (default, used in P1 and inference).
+            # Fix 0: activation blend beta — mirrors state_blend_beta exactly.
+            # Set 0.0 at the start of the merged P2E+P2F anneal, ramped to 1.0.
+            # At beta=1.0 the hard quantizer path is used, identical to inference.
+            self._activation_blend_beta = 1.0
+            # Fix 1: replace the mis-sized Gaussian LSB noise with correct
+            # subtractive uniform dither half-widths. These are set to
+            # DELTA/2 = 0.0625 during the anneal window and 0.0 in hard tail.
+            # The old _state_lsb_noise_std Gaussian is REMOVED from call().
+            self._act_dither_delta = 0.0
+            self._state_dither_delta = 0.0
+            # Legacy field kept so set_phase2_quantizers assignment does not
+            # raise AttributeError on old code paths. Value is never read
+            # inside call() — the new dither fields replace it.
             self._state_lsb_noise_std = 0.0
 
     def build(self, input_shape):
@@ -1814,28 +1944,34 @@ class MemoQGRUCell(keras.layers.Layer):
     def call(self, inputs, states, training=None):
         h_prev = states[0]   # (B, units)
 
-        # LSB noise injection: active only during training and only when
-        # _state_lsb_noise_std > 0. The noise is applied to h_prev BEFORE
-        # the quantizer blend so the gates learn to tolerate sub-LSB
-        # uncertainty in the state throughout P2A-P2C. This prevents the
-        # float state from absorbing kernel quantization errors. The noise
-        # std is a fixed constant equal to 1/(2^bits - 1) for the target
-        # quantizer. It is never annealed — it stays constant the entire
-        # time it is active so the floor of precision tolerance is stable.
-        if self._state_lsb_noise_std > 0.0:
-            noise_std = tf.cast(self._state_lsb_noise_std, tf.float32)
-            noise = tf.random.normal(tf.shape(h_prev), stddev=noise_std, dtype=tf.float32)
+        is_training = tf.cast(training, tf.bool) if training is not None else tf.constant(False)
+
+        # Fix 1 — Subtractive uniform dither on state, replaces the old
+        # Gaussian _state_lsb_noise_std injection.
+        # Active only during training when _state_dither_delta > 0.
+        # Subtractive triangular dither: sum of two independent Uniform(-d/2, d/2)
+        # gives triangular distribution on (-d, d). E[Q(h+dither)-dither] = h,
+        # so the dead-zone is linearised during training without biasing the
+        # expected value. At beta=1, dither=0 the inference path is exact.
+        if self._state_dither_delta > 0.0:
+            sd = tf.cast(self._state_dither_delta, tf.float32)
+            u1_s = tf.random.uniform(tf.shape(h_prev), -sd, sd, dtype=tf.float32)
+            u2_s = tf.random.uniform(tf.shape(h_prev), -sd, sd, dtype=tf.float32)
+            tri_s = u1_s + u2_s
             h_prev = h_prev + tf.cond(
-                tf.cast(training, tf.bool) if training is not None else tf.constant(False),
-                lambda: noise,
-                lambda: tf.zeros_like(noise),
+                is_training,
+                lambda: tri_s,
+                lambda: tf.zeros_like(tri_s),
             )
 
-        # Soft-blend state quantizer: h_prev_q = beta * q_s(h_prev) + (1-beta) * h_prev
+        # Fix 0+1 — Soft-blend state quantizer with subtractive dither.
+        # h_prev_q = beta * Q_s(h_prev + dither) - dither_correction + (1-beta) * h_prev
+        # The dither is already added to h_prev above, and subtracted back after
+        # rounding by the STE path, so the net effect is subtractive dither.
         if self._quantizer_state is not None:
             h_prev_q_hard = self._quantizer_state(h_prev)
-            beta = tf.cast(self._state_blend_beta, tf.float32)
-            h_prev_q = beta * h_prev_q_hard + (1.0 - beta) * h_prev
+            beta_s = tf.cast(self._state_blend_beta, tf.float32)
+            h_prev_q = beta_s * h_prev_q_hard + (1.0 - beta_s) * h_prev
         else:
             h_prev_q = h_prev
 
@@ -1877,8 +2013,42 @@ class MemoQGRUCell(keras.layers.Layer):
             + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
         )
 
+        # Fix 0 — Soft-blend activation quantizer with subtractive triangular dither.
+        # When _quantizer_activation is None: plain tanh, no change.
+        # When beta_a == 1.0 and act_dither_delta == 0.0 (hard tail / inference):
+        #   h_candidate = quantizer_activation(cand_preact) — exact inference op.
+        # During anneal (0 < beta_a < 1, act_dither_delta > 0):
+        #   1. Compute float tanh.
+        #   2. Apply triangular subtractive dither in tanh-output (grid) domain.
+        #   3. STE-round the dithered value to the 4-bit grid, then subtract
+        #      the dither back, so E[output] = tanh (linearises the rounding).
+        #   4. Blend: beta_a * dithered_quantized + (1-beta_a) * tanh.
+        # This destroys the inter-unit error correlation that causes the tau1 bands.
         if self._quantizer_activation is not None:
-            h_candidate = self._quantizer_activation(cand_preact)
+            tanh_f = tf.tanh(cand_preact)
+            beta_a = tf.cast(self._activation_blend_beta, tf.float32)
+            if self._act_dither_delta > 0.0:
+                ad = tf.cast(self._act_dither_delta, tf.float32)
+                g  = tf.cast(0.125, tf.float32)   # Delta_a for 4-bit symmetric tanh
+                u1_a = tf.random.uniform(tf.shape(tanh_f), -ad, ad, dtype=tf.float32)
+                u2_a = tf.random.uniform(tf.shape(tanh_f), -ad, ad, dtype=tf.float32)
+                tri_a = u1_a + u2_a   # triangular dither on (-2*ad, 2*ad)
+                dithered = tanh_f + tri_a
+                # STE round: forward = round-to-grid, backward = identity.
+                # Clip to quantizer output range [-1, 1-g] to match quantized_tanh.
+                rounded = tf.stop_gradient(
+                    tf.clip_by_value(tf.round(dithered / g) * g, -1.0, 1.0 - g) - dithered
+                ) + dithered
+                # Subtractive: remove the dither so E[output - tri_a] = tanh.
+                q_dith = rounded - tri_a
+                q_dith = tf.cond(
+                    is_training,
+                    lambda: q_dith,
+                    lambda: self._quantizer_activation(cand_preact),
+                )
+            else:
+                q_dith = self._quantizer_activation(cand_preact)
+            h_candidate = beta_a * q_dith + (1.0 - beta_a) * tanh_f
         else:
             h_candidate = tf.tanh(cand_preact)
 
@@ -1975,6 +2145,30 @@ class MemoQGRUCell(keras.layers.Layer):
     @state_blend_beta.setter
     def state_blend_beta(self, v):
         self._state_blend_beta = float(v)
+
+    @property
+    def activation_blend_beta(self):
+        return self._activation_blend_beta
+
+    @activation_blend_beta.setter
+    def activation_blend_beta(self, v):
+        self._activation_blend_beta = float(v)
+
+    @property
+    def act_dither_delta(self):
+        return self._act_dither_delta
+
+    @act_dither_delta.setter
+    def act_dither_delta(self, v):
+        self._act_dither_delta = float(v)
+
+    @property
+    def state_dither_delta(self):
+        return self._state_dither_delta
+
+    @state_dither_delta.setter
+    def state_dither_delta(self, v):
+        self._state_dither_delta = float(v)
 
     @property
     def state_lsb_noise_std(self):
