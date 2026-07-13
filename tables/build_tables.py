@@ -16,6 +16,16 @@ Prints four LaTeX tables to stdout and saves them to:
 
 Only vanilla_kd_* directories are processed for Tables 3 and 4.
 
+A run is classified as UNIFORM when ALL four bit fields are equal:
+  bits_bias == bits_kernel == bits_recurrent == bits_activation
+
+A run is classified as HYBRID when ANY of the four bit fields differ from
+the others.  This captures:
+  - kernel vs recurrent mismatch  (e.g. b4k4r8a4 → bk=4, br=8)
+  - bias vs kernel mismatch       (e.g. b4k8r8a8 → bb=4, bk=8)
+  - activation vs others mismatch (e.g. b8k8r8a4 → ba=4, bk=8)
+  - any multi-field mix
+
 Usage:
     python tables/build_tables.py --results-dir /scratch/nmi/results
 
@@ -102,6 +112,76 @@ def extract_ch0_metrics(sdf_metrics):
     r2   = ch.get("r2_score")
     l2   = ch.get("l2_norm")
     return rmse, r2, l2
+
+
+# ==============================================================================
+# Parameter count helpers
+#
+# The student model architecture (from build_student in eval_student_vanilla_sdf.py
+# and train_student_vanilla_kd.py) is:
+#
+#   Encoder QGRU (sencgru):  input_dim=1, units=U
+#     kernel  : (1, 3*U)  → 3*U  params
+#     recurrent: (U, 3*U) → 3*U² params
+#     bias    : (3*U,)    → 3*U  params
+#     subtotal: 3*U² + 6*U
+#
+#   Decoder QGRU (sdecgru):  input_dim=1, units=U  (identical shape)
+#     subtotal: 3*U² + 6*U
+#
+#   QDense (sdec_dense): (U → n_out=3) with bias
+#     kernel: U*3 = 3*U  params
+#     bias  : 3          params
+#     subtotal: 3*U + 3
+#
+#   Total = 2*(3*U² + 6*U) + 3*U + 3
+#         = 6*U² + 12*U + 3*U + 3
+#         = 6*U² + 15*U + 3
+#
+# Verified against paper Table 3:
+#   U=8   → 6*64   + 15*8   + 3 = 384   + 120  + 3 = 507
+#   U=16  → 6*256  + 15*16  + 3 = 1536  + 240  + 3 = 1779
+#   U=32  → 6*1024 + 15*32  + 3 = 6144  + 480  + 3 = 6627
+#   U=45  → 6*2025 + 15*45  + 3 = 12150 + 675  + 3 = 12828
+#   U=64  → 6*4096 + 15*64  + 3 = 24576 + 960  + 3 = 25539
+#   U=128 → 6*16384+ 15*128 + 3 = 98304 + 1920 + 3 = 100227
+# ==============================================================================
+
+def compute_student_params(student_units, n_out=3):
+    """
+    Compute the total trainable parameter count for the vanilla KD student model.
+
+    Architecture: Encoder QGRU (input=1, units=U) + Decoder QGRU (input=1, units=U)
+                  + QDense (U → n_out) with bias.
+
+    Formula: 6*U² + 15*U + 3   (for n_out=3, which is fixed in all paper runs)
+
+    For arbitrary n_out the formula is:
+        2*(3*U² + 6*U) + (U*n_out + n_out)
+      = 6*U² + 12*U + U*n_out + n_out
+
+    Parameters
+    ----------
+    student_units : int
+        Number of GRU units (U).
+    n_out : int
+        Number of output channels. Fixed at 3 in all paper experiments.
+
+    Returns
+    -------
+    int
+        Total trainable parameter count.
+    """
+    u = student_units
+    return 6 * u * u + 12 * u + u * n_out + n_out
+
+
+def fmt_params(n_params):
+    """
+    Format an integer parameter count with thousands separators for LaTeX.
+    e.g. 100227 → "100,227"
+    """
+    return f"{n_params:,}"
 
 
 # ==============================================================================
@@ -467,39 +547,54 @@ def build_table2(results_dir):
 # Must contain student_best.weights.h5, student_args.json,
 # and test_sdf_metrics.json.
 #
-# Key parsing from the directory name (format produced by train_student_vanilla_kd.py):
+# Directory name format produced by train_student_vanilla_kd.py:
 #
 #   vanilla_kd_T{temp}_a{alpha}_b{bb}k{bk}r{br}a{ba}_gru{units}x1_dense3_...
+#
+#   Fields in the b{bb}k{bk}r{br}a{ba} segment:
+#     bb = bits_bias
+#     bk = bits_kernel
+#     br = bits_recurrent
+#     ba = bits_activation
 #
 #   alpha  : parsed from a{float} field between _T..._ and _b...
 #            a0.0 → KD weight = 0 → WITHOUT KD (no_kd)
 #            a0.7 (or any non-zero) → WITH KD
 #
-#   bits_kernel     : parsed from k{bk} in the b{bb}k{bk}r{br}a{ba} segment.
-#   bits_recurrent  : parsed from r{br} in the b{bb}k{bk}r{br}a{ba} segment.
-#
-#   is_hybrid : True when bits_kernel != bits_recurrent
-#               False when bits_kernel == bits_recurrent (uniform quantization)
-#
-#   bits (for uniform rows only): bits_kernel == bits_recurrent
-#
 #   units  : parsed from gru{N}x1 in the directory name.
 #
-# Table 3: uniform quantization rows (bits_kernel == bits_recurrent)
-# Table 4: hybrid quantization rows  (bits_kernel != bits_recurrent)
+# UNIFORM vs HYBRID classification:
+#   A run is UNIFORM when ALL FOUR bit fields are equal:
+#     bits_bias == bits_kernel == bits_recurrent == bits_activation
+#
+#   A run is HYBRID when ANY of the four bit fields differs from the others.
+#   This correctly captures:
+#     - kernel vs recurrent mismatch  (e.g. b4k4r8a4 → bk=4, br=8)
+#     - bias vs kernel mismatch       (e.g. b4k8r8a8 → bb=4, bk=8, br=8, ba=8)
+#     - activation vs others mismatch (e.g. b8k8r8a4 → bb=8, bk=8, br=8, ba=4)
+#     - any multi-field mix
+#
+#   The previous implementation only checked bk != br, which incorrectly
+#   classified b4k8r8a8 and b8k8r8a4 runs as uniform. This is now fixed.
+#
+# Table 3: uniform quantization rows (all four bit fields equal)
+# Table 4: hybrid quantization rows  (any bit field differs)
+#
+# Params column: computed via compute_student_params(student_units, n_out=3)
+#   Formula: 6*U² + 15*U + 3  (derived from the exact model architecture)
 #
 # When multiple directories map to the same key, keep the one with the lowest RMSE.
 #
 # Table 3 columns:
-#   Seq2SeqLite Models | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+#   Seq2SeqLite Models | Type | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 #
 # Table 4 columns:
-#   Seq2SeqLite Models | Kernel bits | Recurrent bits | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+#   Seq2SeqLite Models | Bias bits | Kernel bits | Recurrent bits | Activation bits | Type | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 #
 # Row groups in Table 3: sorted by bits ascending, then within each group sorted
 # by units ascending, no-KD before with-KD.
 #
-# Row groups in Table 4: sorted by (bits_kernel, bits_recurrent) ascending,
+# Row groups in Table 4: sorted by (bb, bk, br, ba) ascending,
 # then units ascending, no-KD before with-KD.
 #
 # Bolding: best per metric across the ENTIRE respective table.
@@ -507,19 +602,25 @@ def build_table2(results_dir):
 
 def parse_student_run_info_from_dirname(dirname):
     """
-    Parse (student_units, bits_kernel, bits_recurrent, has_kd) from a vanilla_kd
-    directory name.
+    Parse (student_units, bits_bias, bits_kernel, bits_recurrent, bits_activation,
+           has_kd, is_hybrid) from a vanilla_kd directory name.
 
     Directory name format:
       vanilla_kd_T{temp}_a{alpha}_b{bb}k{bk}r{br}a{ba}_gru{units}x1_dense3_...
 
-    Returns (student_units, bits_kernel, bits_recurrent, has_kd) or raises
-    ValueError on parse failure.
+    Returns (student_units, bits_bias, bits_kernel, bits_recurrent,
+             bits_activation, has_kd, is_hybrid) or raises ValueError on
+    parse failure.
 
     student_units   : int  — parsed from gru{N}x1
+    bits_bias       : int  — parsed from b{bb} in b{bb}k{bk}r{br}a{ba}
     bits_kernel     : int  — parsed from k{bk} in b{bb}k{bk}r{br}a{ba}
     bits_recurrent  : int  — parsed from r{br} in b{bb}k{bk}r{br}a{ba}
+    bits_activation : int  — parsed from a{ba} in b{bb}k{bk}r{br}a{ba}
     has_kd          : bool — True if alpha > 0 (a{float} where float != 0.0)
+    is_hybrid       : bool — True when ANY of the four bit fields differ from
+                             the others (bb != bk OR bk != br OR br != ba).
+                             False only when bb == bk == br == ba (fully uniform).
     """
     # Parse alpha (determines KD on/off) — matches _a{float}_b pattern
     alpha_match = _re.search(r"_a([\d.]+)_b", dirname)
@@ -528,12 +629,14 @@ def parse_student_run_info_from_dirname(dirname):
     alpha = float(alpha_match.group(1))
     has_kd = alpha != 0.0
 
-    # Parse bits_kernel and bits_recurrent from b{bb}k{bk}r{br}a{ba}
-    bkr_match = _re.search(r"_b\d+k(\d+)r(\d+)a\d+_", dirname)
+    # Parse all four bit fields from b{bb}k{bk}r{br}a{ba}
+    bkr_match = _re.search(r"_b(\d+)k(\d+)r(\d+)a(\d+)_", dirname)
     if not bkr_match:
-        raise ValueError(f"Cannot parse bits_kernel/bits_recurrent from dirname: {dirname}")
-    bits_kernel    = int(bkr_match.group(1))
-    bits_recurrent = int(bkr_match.group(2))
+        raise ValueError(f"Cannot parse bit fields from dirname: {dirname}")
+    bits_bias       = int(bkr_match.group(1))
+    bits_kernel     = int(bkr_match.group(2))
+    bits_recurrent  = int(bkr_match.group(3))
+    bits_activation = int(bkr_match.group(4))
 
     # Parse student units from gru{N}x1
     gru_match = _re.search(r"_gru(\d+)x1_", dirname)
@@ -541,7 +644,13 @@ def parse_student_run_info_from_dirname(dirname):
         raise ValueError(f"Cannot parse student units from dirname: {dirname}")
     student_units = int(gru_match.group(1))
 
-    return student_units, bits_kernel, bits_recurrent, has_kd
+    # HYBRID: ANY of the four fields differs from the others.
+    # UNIFORM: ALL four fields are equal.
+    is_hybrid = not (
+        bits_bias == bits_kernel == bits_recurrent == bits_activation
+    )
+
+    return student_units, bits_bias, bits_kernel, bits_recurrent, bits_activation, has_kd, is_hybrid
 
 
 def find_student_run_dirs(results_dir):
@@ -573,8 +682,8 @@ def build_table3_and_table4(results_dir):
     """
     Discover all vanilla_kd student run directories, load their
     test_sdf_metrics.json, and split rows into:
-      - uniform quantization rows (bits_kernel == bits_recurrent) → Table 3
-      - hybrid quantization rows  (bits_kernel != bits_recurrent) → Table 4
+      - uniform quantization rows (all four bit fields equal) → Table 3
+      - hybrid quantization rows  (any bit field differs)     → Table 4
 
     When multiple directories map to the same key, keep the one with the lowest RMSE.
 
@@ -583,7 +692,8 @@ def build_table3_and_table4(results_dir):
     Uniform dict:
         {
             "units":   int   — e.g. 32
-            "bits":    int   — 4, 6, or 8  (== bits_kernel == bits_recurrent)
+            "bits":    int   — 4, 6, or 8  (== bb == bk == br == ba)
+            "params":  int   — compute_student_params(units, n_out=3)
             "has_kd":  bool
             "label":   str   — e.g. "32 w/KD" or "32"
             "rmse":    float
@@ -594,8 +704,11 @@ def build_table3_and_table4(results_dir):
     Hybrid dict:
         {
             "units":          int
+            "bits_bias":      int
             "bits_kernel":    int
             "bits_recurrent": int
+            "bits_activation":int
+            "params":         int   — compute_student_params(units, n_out=3)
             "has_kd":         bool
             "label":          str   — e.g. "32 w/KD" or "32"
             "rmse":           float
@@ -603,8 +716,9 @@ def build_table3_and_table4(results_dir):
             "l2":             float
         }
 
-    Uniform rows: bits ascending → units ascending → no-KD before with-KD.
-    Hybrid rows:  (bits_kernel, bits_recurrent) ascending → units ascending → no-KD before with-KD.
+    Uniform rows: bits ascending → units ascending → no-KD (False) before with-KD (True).
+    Hybrid rows:  (bits_bias, bits_kernel, bits_recurrent, bits_activation) ascending
+                  → units ascending → no-KD before with-KD.
     """
     run_dirs = find_student_run_dirs(results_dir)
     print(f"\n[Tables 3 & 4] Found {len(run_dirs)} vanilla_kd student run director(y/ies):", flush=True)
@@ -622,7 +736,15 @@ def build_table3_and_table4(results_dir):
             continue
 
         try:
-            student_units, bits_kernel, bits_recurrent, has_kd = parse_student_run_info_from_dirname(dirname)
+            (
+                student_units,
+                bits_bias,
+                bits_kernel,
+                bits_recurrent,
+                bits_activation,
+                has_kd,
+                is_hybrid,
+            ) = parse_student_run_info_from_dirname(dirname)
         except ValueError as exc:
             print(
                 f"  [WARN] Cannot parse run info for {run_dir}: {exc} — skipping.",
@@ -635,13 +757,12 @@ def build_table3_and_table4(results_dir):
             print(f"  [WARN] Incomplete metrics in {json_path} — skipping.", flush=True)
             continue
 
-        is_hybrid = (bits_kernel != bits_recurrent)
+        n_params  = compute_student_params(student_units, n_out=3)
         kd_suffix = " w/KD" if has_kd else ""
         label     = f"{student_units}{kd_suffix}"
 
         if is_hybrid:
-            key = (student_units, bits_kernel, bits_recurrent, has_kd)
-            kd_tag = "w/KD" if has_kd else "no KD"
+            key    = (student_units, bits_bias, bits_kernel, bits_recurrent, bits_activation, has_kd)
             if key in hybrid_by_key:
                 existing_rmse = hybrid_by_key[key]["rmse"]
                 if rmse < existing_rmse:
@@ -658,23 +779,26 @@ def build_table3_and_table4(results_dir):
                     )
                 continue
             hybrid_by_key[key] = {
-                "units":          student_units,
-                "bits_kernel":    bits_kernel,
-                "bits_recurrent": bits_recurrent,
-                "has_kd":         has_kd,
-                "label":          label,
-                "rmse":           rmse,
-                "r2":             r2,
-                "l2":             l2,
+                "units":           student_units,
+                "bits_bias":       bits_bias,
+                "bits_kernel":     bits_kernel,
+                "bits_recurrent":  bits_recurrent,
+                "bits_activation": bits_activation,
+                "params":          n_params,
+                "has_kd":          has_kd,
+                "label":           label,
+                "rmse":            rmse,
+                "r2":              r2,
+                "l2":              l2,
             }
             print(
-                f"  [HYBRID {label} k{bits_kernel}r{bits_recurrent}]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+                f"  [HYBRID {label} bb={bits_bias} bk={bits_kernel} br={bits_recurrent} ba={bits_activation}"
+                f" params={n_params:,}]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
                 flush=True,
             )
         else:
-            bits = bits_kernel  # == bits_recurrent
+            bits = bits_kernel  # == bb == br == ba (all equal for uniform)
             key  = (student_units, bits, has_kd)
-            kd_tag = "w/KD" if has_kd else "no KD"
             if key in uniform_by_key:
                 existing_rmse = uniform_by_key[key]["rmse"]
                 if rmse < existing_rmse:
@@ -693,6 +817,7 @@ def build_table3_and_table4(results_dir):
             uniform_by_key[key] = {
                 "units":  student_units,
                 "bits":   bits,
+                "params": n_params,
                 "has_kd": has_kd,
                 "label":  label,
                 "rmse":   rmse,
@@ -700,7 +825,8 @@ def build_table3_and_table4(results_dir):
                 "l2":     l2,
             }
             print(
-                f"  [UNIFORM {label} {bits}-bit]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+                f"  [UNIFORM {label} {bits}-bit params={n_params:,}]"
+                f"  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
                 flush=True,
             )
 
@@ -710,10 +836,11 @@ def build_table3_and_table4(results_dir):
         key=lambda r: (r["bits"], r["units"], r["has_kd"]),
     )
 
-    # Sort hybrid: (bits_kernel, bits_recurrent) ascending, then units ascending, then no-KD before with-KD
+    # Sort hybrid: (bits_bias, bits_kernel, bits_recurrent, bits_activation) ascending,
+    # then units ascending, then no-KD before with-KD
     rows_hybrid = sorted(
         hybrid_by_key.values(),
-        key=lambda r: (r["bits_kernel"], r["bits_recurrent"], r["units"], r["has_kd"]),
+        key=lambda r: (r["bits_bias"], r["bits_kernel"], r["bits_recurrent"], r["bits_activation"], r["units"], r["has_kd"]),
     )
 
     return rows_uniform, rows_hybrid
@@ -839,7 +966,7 @@ def render_table2_latex(rows):
     rows_8  = [r for r in rows if r["bits"] == 8]
 
     for i, row in enumerate(rows_16):
-        type_cell = "16-bit" if i == 0 else ""
+        type_cell   = "16-bit" if i == 0 else ""
         is_baseline = row.get("is_baseline", False)
         bold_rmse = (not is_baseline and row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
@@ -855,7 +982,7 @@ def render_table2_latex(rows):
         lines.append(r"    \midrule")
 
     for i, row in enumerate(rows_8):
-        type_cell = "8-bit" if i == 0 else ""
+        type_cell   = "8-bit" if i == 0 else ""
         is_baseline = row.get("is_baseline", False)
         bold_rmse = (not is_baseline and row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
@@ -878,7 +1005,7 @@ def render_table3_latex(rows):
     Render Table 3 (uniform quantization) as a LaTeX tabular.
 
     Column layout (matching the paper):
-      Seq2SeqLite Models | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+      Seq2SeqLite Models | Type | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 
     Rows are grouped by bit-width (ascending), within each group ordered by
     units ascending with no-KD before with-KD.
@@ -886,7 +1013,12 @@ def render_table3_latex(rows):
     The first row in each bit-width group gets the bit-width label in the
     Type column; subsequent rows in the same group get an empty Type cell.
 
-    Best value per metric across the ENTIRE Table 3 is bolded.
+    The Params column shows the total trainable parameter count with thousands
+    separators. Params are identical for no-KD and w/KD rows of the same unit
+    count (architecture is the same; KD only affects the loss during training).
+
+    Best value per metric (RMSE, R², L2) across the ENTIRE Table 3 is bolded.
+    Params are never bolded (they are architecture properties, not performance metrics).
     """
     best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=False)
 
@@ -898,10 +1030,10 @@ def render_table3_latex(rows):
         r"(with and without knowledge distillation (KD)) on experimental data.}"
     )
     lines.append(r"  \label{tab:student_kd}")
-    lines.append(r"  \begin{tabular}{llccc}")
+    lines.append(r"  \begin{tabular}{llcccc}")
     lines.append(r"    \toprule")
     lines.append(
-        r"    Seq2SeqLite Models & Type & RMSE $\downarrow$ & "
+        r"    Seq2SeqLite Models & Type & Params & RMSE $\downarrow$ & "
         r"R\textsuperscript{2} Score $\uparrow$ & L2 norm $\downarrow$ \\"
     )
     lines.append(r"    \midrule")
@@ -923,12 +1055,13 @@ def render_table3_latex(rows):
             lines.append(r"    \midrule")
         first_group = False
         for i, row in enumerate(group):
-            type_cell = f"{b}-bit" if i == 0 else ""
+            type_cell   = f"{b}-bit" if i == 0 else ""
+            params_cell = fmt_params(row["params"])
             bold_rmse = (row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
             bold_r2   = (row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
             bold_l2   = (row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
             lines.append(
-                f"    {row['label']} & {type_cell} & "
+                f"    {row['label']} & {type_cell} & {params_cell} & "
                 f"{fmt(row['rmse'], bold=bold_rmse)} & "
                 f"{fmt(row['r2'],   bold=bold_r2)} & "
                 f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
@@ -945,15 +1078,21 @@ def render_table4_latex(rows):
     Render Table 4 (hybrid quantization) as a LaTeX tabular.
 
     Column layout:
-      Seq2SeqLite Models | Kernel bits | Recurrent bits | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+      Seq2SeqLite Models | Bias bits | Kernel bits | Recurrent bits | Activation bits | Type | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 
-    Rows are grouped by (bits_kernel, bits_recurrent) pair (ascending), within
-    each group ordered by units ascending with no-KD before with-KD.
+    Rows are grouped by (bits_bias, bits_kernel, bits_recurrent, bits_activation)
+    tuple (ascending), within each group ordered by units ascending with
+    no-KD before with-KD.
 
-    The first row in each (bits_kernel, bits_recurrent) group shows those values
-    in their columns; subsequent rows in the same group get empty cells for those columns.
+    The first row in each bit-tuple group shows the four bit values in their
+    columns; subsequent rows in the same group get empty cells for those columns.
 
-    Best value per metric across the ENTIRE Table 4 is bolded.
+    The Params column shows the total trainable parameter count with thousands
+    separators. Params are identical for no-KD and w/KD rows of the same unit
+    count (architecture is the same; KD only affects the loss during training).
+
+    Best value per metric (RMSE, R², L2) across the ENTIRE Table 4 is bolded.
+    Params are never bolded.
     """
     best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=False)
 
@@ -962,44 +1101,48 @@ def render_table4_latex(rows):
     lines.append(r"  \centering")
     lines.append(
         r"  \caption{Performance metrics for Seq2SeqLite hybrid quantized models "
-        r"(mixed kernel/recurrent bit-widths, with and without knowledge distillation (KD)) "
-        r"on experimental data.}"
+        r"(mixed bit-widths across bias, kernel, recurrent, and activation, "
+        r"with and without knowledge distillation (KD)) on experimental data.}"
     )
     lines.append(r"  \label{tab:student_kd_hybrid}")
-    lines.append(r"  \begin{tabular}{llllccc}")
+    lines.append(r"  \begin{tabular}{lllllllccc}")
     lines.append(r"    \toprule")
     lines.append(
-        r"    Seq2SeqLite Models & Kernel bits & Recurrent bits & Type & RMSE $\downarrow$ & "
+        r"    Seq2SeqLite Models & Bias bits & Kernel bits & Recurrent bits & Activation bits & Type & Params & RMSE $\downarrow$ & "
         r"R\textsuperscript{2} Score $\uparrow$ & L2 norm $\downarrow$ \\"
     )
     lines.append(r"    \midrule")
 
-    # Group rows by (bits_kernel, bits_recurrent), maintaining sorted order
-    pair_seen   = []
-    pair_groups = {}
+    # Group rows by (bits_bias, bits_kernel, bits_recurrent, bits_activation),
+    # maintaining sorted order
+    tuple_seen   = []
+    tuple_groups = {}
     for row in rows:
-        pair = (row["bits_kernel"], row["bits_recurrent"])
-        if pair not in pair_groups:
-            pair_groups[pair] = []
-            pair_seen.append(pair)
-        pair_groups[pair].append(row)
+        t = (row["bits_bias"], row["bits_kernel"], row["bits_recurrent"], row["bits_activation"])
+        if t not in tuple_groups:
+            tuple_groups[t] = []
+            tuple_seen.append(t)
+        tuple_groups[t].append(row)
 
     first_group = True
-    for pair in pair_seen:
-        group = pair_groups[pair]
+    for t in tuple_seen:
+        group = tuple_groups[t]
         if not first_group:
             lines.append(r"    \midrule")
         first_group = False
-        bk, br = pair
+        bb, bk, br, ba = t
         for i, row in enumerate(group):
-            kernel_cell    = str(bk) if i == 0 else ""
-            recurrent_cell = str(br) if i == 0 else ""
-            type_cell      = f"{bk}/{br}-bit" if i == 0 else ""
+            bias_cell       = str(bb) if i == 0 else ""
+            kernel_cell     = str(bk) if i == 0 else ""
+            recurrent_cell  = str(br) if i == 0 else ""
+            activation_cell = str(ba) if i == 0 else ""
+            type_cell       = f"{bb}/{bk}/{br}/{ba}-bit" if i == 0 else ""
+            params_cell     = fmt_params(row["params"])
             bold_rmse = (row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
             bold_r2   = (row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
             bold_l2   = (row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
             lines.append(
-                f"    {row['label']} & {kernel_cell} & {recurrent_cell} & {type_cell} & "
+                f"    {row['label']} & {bias_cell} & {kernel_cell} & {recurrent_cell} & {activation_cell} & {type_cell} & {params_cell} & "
                 f"{fmt(row['rmse'], bold=bold_rmse)} & "
                 f"{fmt(row['r2'],   bold=bold_r2)} & "
                 f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
