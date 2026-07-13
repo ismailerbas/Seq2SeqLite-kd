@@ -1527,23 +1527,49 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2F")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # Export Phase 2F split-gate weights into final hard QKeras student.
+    # Export last Phase 2 split-gate weights into final hard QKeras student.
+    # Supports ablation runs where P2E and/or P2F are skipped (epochs=0).
+    # Determines the last completed Phase 2 stage dynamically so the transfer
+    # label and loaded checkpoint are always correct regardless of which stages
+    # ran. If P2F ran -> use p2f_ckpt. Elif P2E ran -> use p2e_ckpt. Elif P2D
+    # ran -> use p2d_ckpt. Falls back through P2C, P2B, P2A in order.
     # ══════════════════════════════════════════════════════════════════════════
+    def _last_completed_p2_ckpt_label():
+        candidates = [
+            ("P2F", p2f_ckpt, args.memoq_stage2f_epochs),
+            ("P2E", p2e_ckpt, args.memoq_stage2e_epochs),
+            ("P2D", p2d_ckpt, args.memoq_stage2d_epochs),
+            ("P2C", p2c_ckpt, args.memoq_stage2c_epochs),
+            ("P2B", p2b_ckpt, args.memoq_stage2b_epochs),
+            ("P2A", p2a_ckpt, args.memoq_stage2a_epochs),
+        ]
+        for label, ckpt, epochs in candidates:
+            if epochs > 0 and os.path.exists(ckpt):
+                return label, ckpt
+        return None, None
+
     entering_p3_fresh = should_run("P3") and not (
         args.resume
         and resume_stage == "P3"
         and os.path.exists(p3_ckpt)
     )
     if entering_p3_fresh:
+        last_p2_label, last_p2_ckpt = _last_completed_p2_ckpt_label()
         pf("=" * 60)
-        pf("[EXPORT] Packing split gate weights into standard QKeras QGRU format...")
+        pf(f"[EXPORT] Last completed Phase 2 stage: {last_p2_label} — packing split gate weights into standard QKeras QGRU format...")
         pf("=" * 60)
         sys.stdout.flush()
+        if last_p2_ckpt is not None and not os.path.exists(last_p2_ckpt):
+            pf(f"[EXPORT] WARNING: expected checkpoint {last_p2_ckpt} not found — proceeding with current in-memory weights.")
+        elif last_p2_ckpt is not None:
+            phase2_model.load_weights(last_p2_ckpt)
+            pf(f"[EXPORT] Loaded {last_p2_label} weights from {last_p2_ckpt} for export to QKeras.")
         transfer_splitgate_to_qkeras(enc_cell_p2, dec_cell_p2, phase2_model, final_qkeras_student, pf)
+        export_label = f"{last_p2_label}->P3" if last_p2_label else "P2?->P3"
         if equiv_enc_sample is not None:
             run_equivalence_checks(
                 float_student, phase2_model, enc_cell_p2, dec_cell_p2,
-                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, "P2F->P3",
+                final_qkeras_student, equiv_enc_sample, args.seq_len, pf, export_label,
             )
     else:
         pf("[EXPORT] Skipping transfer_splitgate_to_qkeras — resuming Phase 3 from checkpoint, weights already loaded.")
