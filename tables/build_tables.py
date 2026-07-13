@@ -5,12 +5,16 @@ tables/build_tables.py
 Reads test_sdf_metrics.json files produced by:
   - eval/eval_teacher_sdf.py          → Table 1 (Teacher ablation)
   - eval/eval_ptq_sdf.py              → Table 2 (PTQ 16-bit and 8-bit)
-  - eval/eval_student_vanilla_sdf.py  → Table 3 (Seq2SeqLite KD)
+  - eval/eval_student_vanilla_sdf.py  → Table 3 (Seq2SeqLite KD, uniform quantization)
+                                      → Table 4 (Seq2SeqLite KD, hybrid quantization)
 
-Prints three LaTeX tables to stdout and saves them to:
+Prints four LaTeX tables to stdout and saves them to:
   tables/table1_teacher.tex
   tables/table2_ptq.tex
   tables/table3_student.tex
+  tables/table4_student_hybrid.tex
+
+Only vanilla_kd_* directories are processed for Tables 3 and 4.
 
 Usage:
     python tables/build_tables.py --results-dir /scratch/nmi/results
@@ -18,7 +22,7 @@ Usage:
 Arguments:
     --results-dir   Root directory containing teacher training runs,
                     the ptq/ subdirectory, and vanilla_kd* subdirectories.
-                    All three table sources are discovered from this root.
+                    All four table sources are discovered from this root.
     --out-dir       Directory to write .tex files into.
                     Defaults to the same directory as this script (tables/).
 """
@@ -37,7 +41,7 @@ import sys
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Build Tables 1, 2, 3 from test_sdf_metrics.json files.",
+        description="Build Tables 1, 2, 3, 4 from test_sdf_metrics.json files.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument(
@@ -53,7 +57,7 @@ def parse_args():
         "--out-dir",
         type=str,
         default=os.path.dirname(os.path.abspath(__file__)),
-        help="Directory to write table1_teacher.tex, table2_ptq.tex, table3_student.tex into.",
+        help="Directory to write table1_teacher.tex, table2_ptq.tex, table3_student.tex, table4_student_hybrid.tex into.",
     )
     return p.parse_args()
 
@@ -85,7 +89,7 @@ def extract_ch0_metrics(sdf_metrics):
 
     The paper tables show one row per model with three metrics.
     ch0_full is the composite (full SDF) channel used as the representative
-    scalar metric in Tables 1, 2, and 3.
+    scalar metric in Tables 1, 2, 3, and 4.
     """
     ch = sdf_metrics.get("ch0_full")
     if ch is None:
@@ -456,56 +460,68 @@ def build_table2(results_dir):
 
 
 # ==============================================================================
-# Table 3: Seq2SeqLite (student) with/without KD
+# Tables 3 & 4: Seq2SeqLite (student) with/without KD
 #
-# Relevant folders: any directory under --results-dir/results/ (or directly
-# under --results-dir) whose basename starts with "vanilla_kd" and that contains
-# student_best.weights.h5, student_args.json, and test_sdf_metrics.json.
+# Relevant folders: any directory under --results-dir whose basename starts
+# with "vanilla_kd" (ONLY vanilla_kd — no other prefixes processed).
+# Must contain student_best.weights.h5, student_args.json,
+# and test_sdf_metrics.json.
 #
 # Key parsing from the directory name (format produced by train_student_vanilla_kd.py):
 #
 #   vanilla_kd_T{temp}_a{alpha}_b{bb}k{bk}r{br}a{ba}_gru{units}x1_dense3_...
 #
-#   alpha  : parsed from a{float} field.
+#   alpha  : parsed from a{float} field between _T..._ and _b...
 #            a0.0 → KD weight = 0 → WITHOUT KD (no_kd)
 #            a0.7 (or any non-zero) → WITH KD
 #
-#   bits   : effective bit-width = max(bits_kernel, bits_recurrent)
-#            parsed from k{bk}r{br} in the b...k...r...a... segment.
-#            e.g. b4k4r4a4 → bk=4 br=4 → 4-bit
-#                 b8k8r8a8 → bk=8 br=8 → 8-bit
-#                 b6k6r6a6 → bk=6 br=6 → 6-bit
-#                 b4k4r8a8 → bk=4 br=8 → 8-bit (max)
-#                 b4k8r8a8 → bk=8 br=8 → 8-bit
+#   bits_kernel     : parsed from k{bk} in the b{bb}k{bk}r{br}a{ba} segment.
+#   bits_recurrent  : parsed from r{br} in the b{bb}k{bk}r{br}a{ba} segment.
+#
+#   is_hybrid : True when bits_kernel != bits_recurrent
+#               False when bits_kernel == bits_recurrent (uniform quantization)
+#
+#   bits (for uniform rows only): bits_kernel == bits_recurrent
 #
 #   units  : parsed from gru{N}x1 in the directory name.
 #
-# When multiple directories map to the same (units, bits, has_kd) key, keep the
-# one with the lowest RMSE (best performer for that configuration).
+# Table 3: uniform quantization rows (bits_kernel == bits_recurrent)
+# Table 4: hybrid quantization rows  (bits_kernel != bits_recurrent)
 #
-# Table columns:
+# When multiple directories map to the same key, keep the one with the lowest RMSE.
+#
+# Table 3 columns:
 #   Seq2SeqLite Models | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
 #
-# Row groups: sorted by bits ascending, then within each group sorted by units
-# ascending, no-KD before with-KD.
+# Table 4 columns:
+#   Seq2SeqLite Models | Kernel bits | Recurrent bits | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
 #
-# Bolding: best per metric across the ENTIRE Table 3.
+# Row groups in Table 3: sorted by bits ascending, then within each group sorted
+# by units ascending, no-KD before with-KD.
+#
+# Row groups in Table 4: sorted by (bits_kernel, bits_recurrent) ascending,
+# then units ascending, no-KD before with-KD.
+#
+# Bolding: best per metric across the ENTIRE respective table.
 # ==============================================================================
 
 def parse_student_run_info_from_dirname(dirname):
     """
-    Parse (student_units, bits, has_kd) from a vanilla_kd directory name.
+    Parse (student_units, bits_kernel, bits_recurrent, has_kd) from a vanilla_kd
+    directory name.
 
     Directory name format:
       vanilla_kd_T{temp}_a{alpha}_b{bb}k{bk}r{br}a{ba}_gru{units}x1_dense3_...
 
-    Returns (student_units, bits, has_kd) or raises ValueError on parse failure.
+    Returns (student_units, bits_kernel, bits_recurrent, has_kd) or raises
+    ValueError on parse failure.
 
-    student_units : int — parsed from gru{N}x1
-    bits          : int — max(bits_kernel, bits_recurrent) parsed from k{bk}r{br}
-    has_kd        : bool — True if alpha > 0 (a{float} where float != 0.0)
+    student_units   : int  — parsed from gru{N}x1
+    bits_kernel     : int  — parsed from k{bk} in b{bb}k{bk}r{br}a{ba}
+    bits_recurrent  : int  — parsed from r{br} in b{bb}k{bk}r{br}a{ba}
+    has_kd          : bool — True if alpha > 0 (a{float} where float != 0.0)
     """
-    # Parse alpha (determines KD on/off)
+    # Parse alpha (determines KD on/off) — matches _a{float}_b pattern
     alpha_match = _re.search(r"_a([\d.]+)_b", dirname)
     if not alpha_match:
         raise ValueError(f"Cannot parse alpha from dirname: {dirname}")
@@ -516,9 +532,8 @@ def parse_student_run_info_from_dirname(dirname):
     bkr_match = _re.search(r"_b\d+k(\d+)r(\d+)a\d+_", dirname)
     if not bkr_match:
         raise ValueError(f"Cannot parse bits_kernel/bits_recurrent from dirname: {dirname}")
-    bits_kernel     = int(bkr_match.group(1))
-    bits_recurrent  = int(bkr_match.group(2))
-    bits = max(bits_kernel, bits_recurrent)
+    bits_kernel    = int(bkr_match.group(1))
+    bits_recurrent = int(bkr_match.group(2))
 
     # Parse student units from gru{N}x1
     gru_match = _re.search(r"_gru(\d+)x1_", dirname)
@@ -526,19 +541,19 @@ def parse_student_run_info_from_dirname(dirname):
         raise ValueError(f"Cannot parse student units from dirname: {dirname}")
     student_units = int(gru_match.group(1))
 
-    return student_units, bits, has_kd
+    return student_units, bits_kernel, bits_recurrent, has_kd
 
 
-def find_student_run_dirs_for_table3(results_dir):
+def find_student_run_dirs(results_dir):
     """
     Walk results_dir recursively and return every directory that:
-    1. Has a basename starting with "vanilla_kd"
+    1. Has a basename starting with "vanilla_kd" (only vanilla_kd — strictly)
     2. Contains student_best.weights.h5
     3. Contains student_args.json
     4. Contains test_sdf_metrics.json
 
-    This is the same discovery logic as eval_student_vanilla_sdf.py plus
-    the requirement that test_sdf_metrics.json already exists (eval is done).
+    Non-vanilla_kd directories (e.g. memoq, other prefixes) are explicitly
+    excluded by the basename check.
     """
     run_dirs = []
     for root, dirs, files in os.walk(results_dir):
@@ -554,32 +569,50 @@ def find_student_run_dirs_for_table3(results_dir):
     return run_dirs
 
 
-def build_table3(results_dir):
+def build_table3_and_table4(results_dir):
     """
     Discover all vanilla_kd student run directories, load their
-    test_sdf_metrics.json, and assemble Table 3 rows.
+    test_sdf_metrics.json, and split rows into:
+      - uniform quantization rows (bits_kernel == bits_recurrent) → Table 3
+      - hybrid quantization rows  (bits_kernel != bits_recurrent) → Table 4
 
-    When multiple directories map to the same (student_units, bits, has_kd)
-    key, keep the one with the lowest RMSE.
+    When multiple directories map to the same key, keep the one with the lowest RMSE.
 
-    Returns a list of dicts:
+    Returns (rows_uniform, rows_hybrid) where each is a list of dicts:
+
+    Uniform dict:
         {
             "units":   int   — e.g. 32
-            "bits":    int   — 4, 6, or 8
+            "bits":    int   — 4, 6, or 8  (== bits_kernel == bits_recurrent)
             "has_kd":  bool
             "label":   str   — e.g. "32 w/KD" or "32"
             "rmse":    float
             "r2":      float
             "l2":      float
         }
-    Rows are ordered: bits ascending → units ascending → no-KD before with-KD.
+
+    Hybrid dict:
+        {
+            "units":          int
+            "bits_kernel":    int
+            "bits_recurrent": int
+            "has_kd":         bool
+            "label":          str   — e.g. "32 w/KD" or "32"
+            "rmse":           float
+            "r2":             float
+            "l2":             float
+        }
+
+    Uniform rows: bits ascending → units ascending → no-KD before with-KD.
+    Hybrid rows:  (bits_kernel, bits_recurrent) ascending → units ascending → no-KD before with-KD.
     """
-    run_dirs = find_student_run_dirs_for_table3(results_dir)
-    print(f"\n[Table 3] Found {len(run_dirs)} vanilla_kd student run director(y/ies):", flush=True)
+    run_dirs = find_student_run_dirs(results_dir)
+    print(f"\n[Tables 3 & 4] Found {len(run_dirs)} vanilla_kd student run director(y/ies):", flush=True)
     for d in run_dirs:
         print(f"  {d}", flush=True)
 
-    rows_by_key = {}
+    uniform_by_key = {}
+    hybrid_by_key  = {}
 
     for run_dir in run_dirs:
         dirname   = os.path.basename(os.path.normpath(run_dir))
@@ -589,7 +622,7 @@ def build_table3(results_dir):
             continue
 
         try:
-            student_units, bits, has_kd = parse_student_run_info_from_dirname(dirname)
+            student_units, bits_kernel, bits_recurrent, has_kd = parse_student_run_info_from_dirname(dirname)
         except ValueError as exc:
             print(
                 f"  [WARN] Cannot parse run info for {run_dir}: {exc} — skipping.",
@@ -602,49 +635,88 @@ def build_table3(results_dir):
             print(f"  [WARN] Incomplete metrics in {json_path} — skipping.", flush=True)
             continue
 
-        key = (student_units, bits, has_kd)
-        kd_tag = "w/KD" if has_kd else "no KD"
-
-        if key in rows_by_key:
-            existing_rmse = rows_by_key[key]["rmse"]
-            if rmse < existing_rmse:
-                print(
-                    f"  [INFO] Better run found for {key}: RMSE {existing_rmse:.4f} -> {rmse:.4f}"
-                    f"  ({dirname})",
-                    flush=True,
-                )
-                rows_by_key[key].update({"rmse": rmse, "r2": r2, "l2": l2})
-            else:
-                print(
-                    f"  [INFO] Keeping existing run for {key} (RMSE {existing_rmse:.4f} <= {rmse:.4f})",
-                    flush=True,
-                )
-            continue
-
+        is_hybrid = (bits_kernel != bits_recurrent)
         kd_suffix = " w/KD" if has_kd else ""
         label     = f"{student_units}{kd_suffix}"
 
-        rows_by_key[key] = {
-            "units":  student_units,
-            "bits":   bits,
-            "has_kd": has_kd,
-            "label":  label,
-            "rmse":   rmse,
-            "r2":     r2,
-            "l2":     l2,
-        }
-        print(
-            f"  [{label} {bits}-bit]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
-            flush=True,
-        )
+        if is_hybrid:
+            key = (student_units, bits_kernel, bits_recurrent, has_kd)
+            kd_tag = "w/KD" if has_kd else "no KD"
+            if key in hybrid_by_key:
+                existing_rmse = hybrid_by_key[key]["rmse"]
+                if rmse < existing_rmse:
+                    print(
+                        f"  [INFO] Better hybrid run found for {key}: RMSE {existing_rmse:.4f} -> {rmse:.4f}"
+                        f"  ({dirname})",
+                        flush=True,
+                    )
+                    hybrid_by_key[key].update({"rmse": rmse, "r2": r2, "l2": l2})
+                else:
+                    print(
+                        f"  [INFO] Keeping existing hybrid run for {key} (RMSE {existing_rmse:.4f} <= {rmse:.4f})",
+                        flush=True,
+                    )
+                continue
+            hybrid_by_key[key] = {
+                "units":          student_units,
+                "bits_kernel":    bits_kernel,
+                "bits_recurrent": bits_recurrent,
+                "has_kd":         has_kd,
+                "label":          label,
+                "rmse":           rmse,
+                "r2":             r2,
+                "l2":             l2,
+            }
+            print(
+                f"  [HYBRID {label} k{bits_kernel}r{bits_recurrent}]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+                flush=True,
+            )
+        else:
+            bits = bits_kernel  # == bits_recurrent
+            key  = (student_units, bits, has_kd)
+            kd_tag = "w/KD" if has_kd else "no KD"
+            if key in uniform_by_key:
+                existing_rmse = uniform_by_key[key]["rmse"]
+                if rmse < existing_rmse:
+                    print(
+                        f"  [INFO] Better uniform run found for {key}: RMSE {existing_rmse:.4f} -> {rmse:.4f}"
+                        f"  ({dirname})",
+                        flush=True,
+                    )
+                    uniform_by_key[key].update({"rmse": rmse, "r2": r2, "l2": l2})
+                else:
+                    print(
+                        f"  [INFO] Keeping existing uniform run for {key} (RMSE {existing_rmse:.4f} <= {rmse:.4f})",
+                        flush=True,
+                    )
+                continue
+            uniform_by_key[key] = {
+                "units":  student_units,
+                "bits":   bits,
+                "has_kd": has_kd,
+                "label":  label,
+                "rmse":   rmse,
+                "r2":     r2,
+                "l2":     l2,
+            }
+            print(
+                f"  [UNIFORM {label} {bits}-bit]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+                flush=True,
+            )
 
-    # Sort: bits ascending, then units ascending, then no-KD (False) before with-KD (True)
-    ordered_rows = sorted(
-        rows_by_key.values(),
+    # Sort uniform: bits ascending, then units ascending, then no-KD (False) before with-KD (True)
+    rows_uniform = sorted(
+        uniform_by_key.values(),
         key=lambda r: (r["bits"], r["units"], r["has_kd"]),
     )
 
-    return ordered_rows
+    # Sort hybrid: (bits_kernel, bits_recurrent) ascending, then units ascending, then no-KD before with-KD
+    rows_hybrid = sorted(
+        hybrid_by_key.values(),
+        key=lambda r: (r["bits_kernel"], r["bits_recurrent"], r["units"], r["has_kd"]),
+    )
+
+    return rows_uniform, rows_hybrid
 
 
 # ==============================================================================
@@ -714,7 +786,6 @@ def render_table1_latex(rows):
     lines.append(r"    \midrule")
     for row in rows:
         is_baseline = row.get("is_baseline", False)
-        # Baseline is never bolded; for non-baseline rows bold the best value
         bold_rmse = (not is_baseline and row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
         bold_l2   = (not is_baseline and row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
@@ -804,7 +875,7 @@ def render_table2_latex(rows):
 
 def render_table3_latex(rows):
     """
-    Render Table 3 as a LaTeX tabular.
+    Render Table 3 (uniform quantization) as a LaTeX tabular.
 
     Column layout (matching the paper):
       Seq2SeqLite Models | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
@@ -815,7 +886,7 @@ def render_table3_latex(rows):
     The first row in each bit-width group gets the bit-width label in the
     Type column; subsequent rows in the same group get an empty Type cell.
 
-    Best value per metric across the ENTIRE table is bolded.
+    Best value per metric across the ENTIRE Table 3 is bolded.
     """
     best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=False)
 
@@ -823,7 +894,7 @@ def render_table3_latex(rows):
     lines.append(r"\begin{table}[!ht]")
     lines.append(r"  \centering")
     lines.append(
-        r"  \caption{Performance metrics for Seq2SeqLite quantized models "
+        r"  \caption{Performance metrics for Seq2SeqLite uniformly quantized models "
         r"(with and without knowledge distillation (KD)) on experimental data.}"
     )
     lines.append(r"  \label{tab:student_kd}")
@@ -836,7 +907,7 @@ def render_table3_latex(rows):
     lines.append(r"    \midrule")
 
     # Group rows by bits, maintaining sorted order
-    bits_seen = []
+    bits_seen   = []
     bits_groups = {}
     for row in rows:
         b = row["bits"]
@@ -869,6 +940,77 @@ def render_table3_latex(rows):
     return "\n".join(lines)
 
 
+def render_table4_latex(rows):
+    """
+    Render Table 4 (hybrid quantization) as a LaTeX tabular.
+
+    Column layout:
+      Seq2SeqLite Models | Kernel bits | Recurrent bits | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+
+    Rows are grouped by (bits_kernel, bits_recurrent) pair (ascending), within
+    each group ordered by units ascending with no-KD before with-KD.
+
+    The first row in each (bits_kernel, bits_recurrent) group shows those values
+    in their columns; subsequent rows in the same group get empty cells for those columns.
+
+    Best value per metric across the ENTIRE Table 4 is bolded.
+    """
+    best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=False)
+
+    lines = []
+    lines.append(r"\begin{table}[!ht]")
+    lines.append(r"  \centering")
+    lines.append(
+        r"  \caption{Performance metrics for Seq2SeqLite hybrid quantized models "
+        r"(mixed kernel/recurrent bit-widths, with and without knowledge distillation (KD)) "
+        r"on experimental data.}"
+    )
+    lines.append(r"  \label{tab:student_kd_hybrid}")
+    lines.append(r"  \begin{tabular}{llllccc}")
+    lines.append(r"    \toprule")
+    lines.append(
+        r"    Seq2SeqLite Models & Kernel bits & Recurrent bits & Type & RMSE $\downarrow$ & "
+        r"R\textsuperscript{2} Score $\uparrow$ & L2 norm $\downarrow$ \\"
+    )
+    lines.append(r"    \midrule")
+
+    # Group rows by (bits_kernel, bits_recurrent), maintaining sorted order
+    pair_seen   = []
+    pair_groups = {}
+    for row in rows:
+        pair = (row["bits_kernel"], row["bits_recurrent"])
+        if pair not in pair_groups:
+            pair_groups[pair] = []
+            pair_seen.append(pair)
+        pair_groups[pair].append(row)
+
+    first_group = True
+    for pair in pair_seen:
+        group = pair_groups[pair]
+        if not first_group:
+            lines.append(r"    \midrule")
+        first_group = False
+        bk, br = pair
+        for i, row in enumerate(group):
+            kernel_cell    = str(bk) if i == 0 else ""
+            recurrent_cell = str(br) if i == 0 else ""
+            type_cell      = f"{bk}/{br}-bit" if i == 0 else ""
+            bold_rmse = (row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
+            bold_r2   = (row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
+            bold_l2   = (row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
+            lines.append(
+                f"    {row['label']} & {kernel_cell} & {recurrent_cell} & {type_cell} & "
+                f"{fmt(row['rmse'], bold=bold_rmse)} & "
+                f"{fmt(row['r2'],   bold=bold_r2)} & "
+                f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
+            )
+
+    lines.append(r"    \bottomrule")
+    lines.append(r"  \end{tabular}")
+    lines.append(r"\end{table}")
+    return "\n".join(lines)
+
+
 # ==============================================================================
 # Main
 # ==============================================================================
@@ -879,7 +1021,7 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     print("=" * 70, flush=True)
-    print("build_tables.py — constructing Tables 1, 2, 3", flush=True)
+    print("build_tables.py — constructing Tables 1, 2, 3, 4", flush=True)
     print(f"  results-dir : {args.results_dir}", flush=True)
     print(f"  out-dir     : {args.out_dir}", flush=True)
     print("=" * 70, flush=True)
@@ -902,17 +1044,25 @@ def main():
     print(f"\n[Table 2] Saved -> {path2}", flush=True)
     print(tex2, flush=True)
 
-    # ── Table 3: Student KD ───────────────────────────────────────────────────
-    rows3 = build_table3(args.results_dir)
-    tex3  = render_table3_latex(rows3)
+    # ── Tables 3 & 4: Student KD (uniform + hybrid) ───────────────────────────
+    rows3_uniform, rows4_hybrid = build_table3_and_table4(args.results_dir)
+
+    tex3  = render_table3_latex(rows3_uniform)
     path3 = os.path.join(args.out_dir, "table3_student.tex")
     with open(path3, "w") as f:
         f.write(tex3 + "\n")
     print(f"\n[Table 3] Saved -> {path3}", flush=True)
     print(tex3, flush=True)
 
+    tex4  = render_table4_latex(rows4_hybrid)
+    path4 = os.path.join(args.out_dir, "table4_student_hybrid.tex")
+    with open(path4, "w") as f:
+        f.write(tex4 + "\n")
+    print(f"\n[Table 4] Saved -> {path4}", flush=True)
+    print(tex4, flush=True)
+
     print("\n" + "=" * 70, flush=True)
-    print("Done. All three tables written.", flush=True)
+    print("Done. All four tables written.", flush=True)
     print("=" * 70, flush=True)
 
 

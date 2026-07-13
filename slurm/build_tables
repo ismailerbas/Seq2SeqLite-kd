@@ -13,11 +13,16 @@
 # ============================================================================
 # build_tables — reads test_sdf_metrics.json files already produced by
 # eval_teacher_sdf, eval_ptq_sdf, and eval_student_vanilla_sdf, then
-# constructs Tables 1, 2, and 3 from the paper and writes:
+# constructs Tables 1, 2, 3, and 4 from the paper and writes:
 #
 #   tables/table1_teacher.tex
 #   tables/table2_ptq.tex
 #   tables/table3_student.tex
+#   tables/table4_student_hybrid.tex
+#
+# Only vanilla_kd_* directories are processed for Tables 3 and 4.
+# Table 3 = uniform quantization (bits_kernel == bits_recurrent).
+# Table 4 = hybrid quantization  (bits_kernel != bits_recurrent).
 #
 # No GPU required.  No TF model loading.  Pure Python / JSON / numpy.
 # Wall time 30 min is generous; typical runtime is under 60 seconds.
@@ -79,9 +84,10 @@ mkdir -p "${OUT_DIR}"
 
 # --- Log ---
 echo "============================================================"
-echo "BUILD TABLES — Tables 1, 2, 3"
+echo "BUILD TABLES — Tables 1, 2, 3, 4"
 echo "Reading test_sdf_metrics.json from ${RESULTS_PATH}"
 echo "Writing .tex files to ${OUT_DIR}"
+echo "Only vanilla_kd_* dirs processed for Tables 3 and 4"
 echo "============================================================"
 echo "SLURM JOB ID        : ${SLURM_JOBID}"
 echo "SLURM JOB NAME      : ${SLURM_JOB_NAME}"
@@ -119,10 +125,12 @@ if [ ${EXIT_CODE} -eq 0 ]; then
     echo "  ${OUT_DIR}/table1_teacher.tex"
     echo "  ${OUT_DIR}/table2_ptq.tex"
     echo "  ${OUT_DIR}/table3_student.tex"
+    echo "  ${OUT_DIR}/table4_student_hybrid.tex"
     echo "Line counts:"
     wc -l "${OUT_DIR}/table1_teacher.tex" 2>/dev/null
     wc -l "${OUT_DIR}/table2_ptq.tex"     2>/dev/null
     wc -l "${OUT_DIR}/table3_student.tex" 2>/dev/null
+    wc -l "${OUT_DIR}/table4_student_hybrid.tex" 2>/dev/null
 else
     echo "FAILED (exit code: ${EXIT_CODE})"
     echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
