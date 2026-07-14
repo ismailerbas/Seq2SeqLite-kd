@@ -798,11 +798,14 @@ def train_step_per_replica(
     tgt_b   = batch_y
 
     alpha_f = tf.cast(alpha, tf.float32)
+    T       = tf.cast(temperature, tf.float32)
 
     with tf.GradientTape() as tape:
         student_output = student_model([enc_b, dec_b], training=True)
         hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_b))
-        soft_loss  = tf.reduce_mean(tf.square(tpred_b - student_output))
+        soft_loss  = T * T * tf.reduce_mean(
+            tf.square(tpred_b / T - student_output / T)
+        )
         total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
 
     grads = tape.gradient(total_loss, student_model.trainable_variables)
@@ -842,11 +845,14 @@ def val_step_per_replica(
     tgt_b   = batch_y
 
     alpha_f = tf.cast(alpha, tf.float32)
+    T       = tf.cast(temperature, tf.float32)
 
     student_output = student_model([enc_b, dec_b], training=False)
 
     hard_loss  = tf.reduce_mean(tf.square(student_output - tgt_b))
-    soft_loss  = mse_kd_loss(tpred_b, student_output)
+    soft_loss  = T * T * tf.reduce_mean(
+        tf.square(tpred_b / T - student_output / T)
+    )
     total_loss = alpha_f * soft_loss + (1.0 - alpha_f) * hard_loss
     mae        = tf.reduce_mean(tf.abs(student_output - tgt_b))
 
