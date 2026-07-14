@@ -176,6 +176,90 @@ def compute_student_params(student_units, n_out=3):
     return 6 * u * u + 12 * u + u * n_out + n_out
 
 
+def compute_teacher_params(layers_teacher, n_out=3):
+    """
+    Compute the total trainable parameter count for the teacher Seq2Seq GRU model.
+
+    Architecture (from train_teacher.py / build_teacher in eval_ptq_sdf.py):
+      Encoder: RNN([GRUCell(u0, input=1), GRUCell(u1, input=u0), ...], reset_after=True)
+      Decoder: RNN([GRUCell(u0, input=1), GRUCell(u1, input=u0), ...], reset_after=True)
+               — identical architecture and weight shapes to encoder
+      Dense:   Dense(n_out) with bias   kernel=(u_last, n_out) + bias=(n_out,)
+
+    GRUCell(units=U, input_dim=I) with reset_after=True:
+      kernel    : (I, 3*U)     -> 3 * I * U  params
+      recurrent : (U, 3*U)     -> 3 * U * U  params
+      bias      : (2, 3*U)     -> 6 * U      params  (reset_after doubles the bias)
+      subtotal  : 3*I*U + 3*U^2 + 6*U
+
+    For layer 0:          I = 1
+    For layer i (i > 0):  I = layers_teacher[i-1]
+
+    Encoder and decoder have identical shapes → multiply one-stack total by 2.
+
+    Dense(n_out) with bias: u_last * n_out + n_out
+
+    Parameters
+    ----------
+    layers_teacher : list[int]
+        Hidden units per GRUCell layer in order, e.g. [128, 128] or [64, 16].
+    n_out : int
+        Output channels. Fixed at 3 in all paper experiments.
+
+    Returns
+    -------
+    int
+        Total trainable parameter count.
+
+    Verified against paper Table 1:
+      [128, 128]  -> (3*1*128 + 3*128^2 + 6*128) + (3*128*128 + 3*128^2 + 6*128)
+                     = (384 + 49152 + 768) + (49152 + 49152 + 768)
+                     = 50304 + 99072  = 149376  (one stack, encoder only)
+                     encoder + decoder = 298752
+                     Dense: 128*3 + 3 = 387
+                     Total = 299139  ✓
+      [64, 64]    -> (3*1*64 + 3*64^2 + 6*64) + (3*64*64 + 3*64^2 + 6*64)
+                     = (192 + 12288 + 384) + (12288 + 12288 + 384)
+                     = 12864 + 24960 = 37824  (one stack)
+                     encoder + decoder = 75648
+                     Dense: 64*3 + 3 = 195
+                     Total = 75843  ✓
+      [45, 45]    -> (3*1*45 + 3*45^2 + 6*45) + (3*45*45 + 3*45^2 + 6*45)
+                     = (135 + 6075 + 270) + (6075 + 6075 + 270)
+                     = 6480 + 12420 = 18900  (one stack)
+                     encoder + decoder = 37800
+                     Dense: 45*3 + 3 = 138
+                     Total = 37938  ✓
+      [32, 32]    -> (3*1*32 + 3*32^2 + 6*32) + (3*32*32 + 3*32^2 + 6*32)
+                     = (96 + 3072 + 192) + (3072 + 3072 + 192)
+                     = 3360 + 6336 = 9696  (one stack)
+                     encoder + decoder = 19392
+                     Dense: 32*3 + 3 = 99
+                     Total = 19491  ✓
+      [16, 16]    -> (3*1*16 + 3*16^2 + 6*16) + (3*16*16 + 3*16^2 + 6*16)
+                     = (48 + 768 + 96) + (768 + 768 + 96)
+                     = 912 + 1632 = 2544  (one stack)
+                     encoder + decoder = 5088
+                     Dense: 16*3 + 3 = 51
+                     Total = 5139  ✓
+    """
+    total = 0
+    for i, u in enumerate(layers_teacher):
+        input_dim = 1 if i == 0 else layers_teacher[i - 1]
+        # kernel + recurrent + bias (reset_after doubles bias → 2 * 3 * U = 6 * U)
+        cell_params = 3 * input_dim * u + 3 * u * u + 6 * u
+        total += cell_params
+
+    # Encoder and decoder share identical architecture
+    total *= 2
+
+    # Dense output layer with bias
+    u_last = layers_teacher[-1]
+    total += u_last * n_out + n_out
+
+    return total
+
+
 def fmt_params(n_params):
     """
     Format an integer parameter count with thousands separators for LaTeX.
@@ -325,15 +409,17 @@ def build_table1(results_dir):
             continue
 
         is_baseline = (label == BASELINE_LABEL_TABLE1)
+        n_params = compute_teacher_params(layers_teacher, n_out=3)
         rows_by_label[label] = {
             "label":       label,
             "is_baseline": is_baseline,
+            "params":      n_params,
             "rmse":        rmse,
             "r2":          r2,
             "l2":          l2,
         }
         print(
-            f"  [{label}]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+            f"  [{label}]  params={n_params:,}  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
             flush=True,
         )
 
@@ -459,17 +545,29 @@ def build_table2(results_dir):
 
         label, bits = parse_model_label_from_ptq_dirname(dirname)
 
+        # layers_teacher_for_params holds the actual list for param computation.
+        # We resolve it from ptq_args.json (new format with layers_teacher list)
+        # or fall back to teacher_units/teacher_layers (old format).
+        layers_teacher_for_params = None
+
         if label is None:
             ptq_args_path = os.path.join(run_dir, "ptq_args.json")
             if os.path.exists(ptq_args_path):
                 with open(ptq_args_path, "r") as f:
                     ptq_args = json.load(f)
-                teacher_units  = ptq_args.get("teacher_units",  128)
-                teacher_layers = ptq_args.get("teacher_layers", 2)
-                label = "×".join([str(teacher_units)] * teacher_layers)
+                _lt = ptq_args.get("layers_teacher", None)
+                if _lt is not None and isinstance(_lt, list) and len(_lt) >= 1:
+                    layers_teacher_for_params = [int(u) for u in _lt]
+                    label = layers_to_label(layers_teacher_for_params)
+                else:
+                    teacher_units  = int(ptq_args.get("teacher_units",  128))
+                    teacher_layers = int(ptq_args.get("teacher_layers", 2))
+                    layers_teacher_for_params = [teacher_units] * teacher_layers
+                    label = "×".join([str(teacher_units)] * teacher_layers)
                 bits  = ptq_args.get("bits", bits)
                 print(
-                    f"  [INFO] Label resolved from ptq_args.json: '{label}' bits={bits}",
+                    f"  [INFO] Label resolved from ptq_args.json: '{label}' bits={bits}"
+                    f" layers_teacher={layers_teacher_for_params}",
                     flush=True,
                 )
             else:
@@ -478,6 +576,33 @@ def build_table2(results_dir):
                     flush=True,
                 )
                 continue
+
+        # If label was parsed from dirname but we still need layers_teacher_for_params,
+        # try ptq_args.json first, then fall back to parsing from dirname.
+        if layers_teacher_for_params is None:
+            ptq_args_path = os.path.join(run_dir, "ptq_args.json")
+            if os.path.exists(ptq_args_path):
+                with open(ptq_args_path, "r") as f:
+                    ptq_args = json.load(f)
+                _lt = ptq_args.get("layers_teacher", None)
+                if _lt is not None and isinstance(_lt, list) and len(_lt) >= 1:
+                    layers_teacher_for_params = [int(u) for u in _lt]
+                else:
+                    _tu = int(ptq_args.get("teacher_units",  128))
+                    _tl = int(ptq_args.get("teacher_layers", 2))
+                    layers_teacher_for_params = [_tu] * _tl
+            else:
+                # Last resort: parse from the label itself (e.g. "64×16" → [64, 16])
+                _parts = label.split("×")
+                try:
+                    layers_teacher_for_params = [int(x) for x in _parts]
+                except ValueError:
+                    layers_teacher_for_params = [128, 128]
+                    print(
+                        f"  [WARN] Cannot parse layers_teacher from label '{label}' — "
+                        f"defaulting to {layers_teacher_for_params}",
+                        flush=True,
+                    )
 
         if bits is None:
             bits_from_json = sdf.get("bits")
@@ -497,6 +622,8 @@ def build_table2(results_dir):
             print(f"  [WARN] Incomplete metrics in {json_path} — skipping.", flush=True)
             continue
 
+        n_params = compute_teacher_params(layers_teacher_for_params, n_out=3)
+
         key = (label, bits)
         if key in rows_by_key:
             print(
@@ -510,12 +637,13 @@ def build_table2(results_dir):
             "label":       label,
             "is_baseline": is_baseline,
             "bits":        bits,
+            "params":      n_params,
             "rmse":        rmse,
             "r2":          r2,
             "l2":          l2,
         }
         print(
-            f"  [{label} {bits}-bit]  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
+            f"  [{label} {bits}-bit]  params={n_params:,}  RMSE={rmse:.4f}  R²={r2:.4f}  L2={l2:.4f}",
             flush=True,
         )
 
@@ -889,10 +1017,11 @@ def render_table1_latex(rows):
     Render Table 1 as a LaTeX tabular.
 
     Column layout (matching the paper):
-      Seq2Seq model size | RMSE ↓ | R² Score ↑ | L2 norm ↓
+      Seq2Seq model size | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 
     128×128 is the baseline and is printed last without being bolded.
     The best values among non-baseline rows are bolded.
+    Params are never bolded (architecture property, not a performance metric).
     """
     best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=True)
 
@@ -904,10 +1033,10 @@ def render_table1_latex(rows):
         r"on experimental data.}"
     )
     lines.append(r"  \label{tab:teacher_ablation}")
-    lines.append(r"  \begin{tabular}{lccc}")
+    lines.append(r"  \begin{tabular}{lcccc}")
     lines.append(r"    \toprule")
     lines.append(
-        r"    Seq2Seq model size & RMSE $\downarrow$ & "
+        r"    Seq2Seq model size & Params & RMSE $\downarrow$ & "
         r"R\textsuperscript{2} Score $\uparrow$ & L2 norm $\downarrow$ \\"
     )
     lines.append(r"    \midrule")
@@ -917,8 +1046,9 @@ def render_table1_latex(rows):
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
         bold_l2   = (not is_baseline and row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
         display_label = row["label"] + (" (baseline)" if is_baseline else "")
+        params_cell = fmt_params(row["params"])
         lines.append(
-            f"    {display_label} & "
+            f"    {display_label} & {params_cell} & "
             f"{fmt(row['rmse'], bold=bold_rmse)} & "
             f"{fmt(row['r2'],   bold=bold_r2)} & "
             f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
@@ -938,11 +1068,12 @@ def render_table2_latex(rows):
     MODEL_ORDER_TABLE1 (baseline 128×128 last).
 
     Column layout:
-      Seq2Seq Models | Type | RMSE ↓ | R² Score ↑ | L2 norm ↓
+      Seq2Seq Models | Type | Params | RMSE ↓ | R² Score ↑ | L2 norm ↓
 
     The 128×128 baseline is not bolded.
     Best value per metric among non-baseline rows across the ENTIRE table
     (both bit-width blocks) is bolded.
+    Params are never bolded (architecture property, not a performance metric).
     """
     best_rmse, best_r2, best_l2 = find_best_values(rows, exclude_baseline=True)
 
@@ -954,10 +1085,10 @@ def render_table2_latex(rows):
         r"across various model sizes on experimental data.}"
     )
     lines.append(r"  \label{tab:ptq}")
-    lines.append(r"  \begin{tabular}{llccc}")
+    lines.append(r"  \begin{tabular}{llcccc}")
     lines.append(r"    \toprule")
     lines.append(
-        r"    Seq2Seq Models & Type & RMSE $\downarrow$ & "
+        r"    Seq2Seq Models & Type & Params & RMSE $\downarrow$ & "
         r"R\textsuperscript{2} Score $\uparrow$ & L2 norm $\downarrow$ \\"
     )
     lines.append(r"    \midrule")
@@ -971,8 +1102,9 @@ def render_table2_latex(rows):
         bold_rmse = (not is_baseline and row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
         bold_l2   = (not is_baseline and row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
+        params_cell = fmt_params(row["params"])
         lines.append(
-            f"    {row['label']} & {type_cell} & "
+            f"    {row['label']} & {type_cell} & {params_cell} & "
             f"{fmt(row['rmse'], bold=bold_rmse)} & "
             f"{fmt(row['r2'],   bold=bold_r2)} & "
             f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
@@ -987,8 +1119,9 @@ def render_table2_latex(rows):
         bold_rmse = (not is_baseline and row["rmse"] is not None and best_rmse is not None and row["rmse"] == best_rmse)
         bold_r2   = (not is_baseline and row["r2"]   is not None and best_r2   is not None and row["r2"]   == best_r2)
         bold_l2   = (not is_baseline and row["l2"]   is not None and best_l2   is not None and row["l2"]   == best_l2)
+        params_cell = fmt_params(row["params"])
         lines.append(
-            f"    {row['label']} & {type_cell} & "
+            f"    {row['label']} & {type_cell} & {params_cell} & "
             f"{fmt(row['rmse'], bold=bold_rmse)} & "
             f"{fmt(row['r2'],   bold=bold_r2)} & "
             f"{fmt(row['l2'],   bold=bold_l2)} \\\\"
