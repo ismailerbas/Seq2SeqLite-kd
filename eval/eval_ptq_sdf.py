@@ -200,9 +200,21 @@ def find_data_files(data_dir, seq_len):
 # Layer names: enc_input, dec_input, enc_rnn, dec_rnn, dec_dense
 # ==============================================================================
 
-def build_teacher(seq_len, n_out, teacher_units, teacher_layers, use_old_names=False):
-    LAYERS_TEACHER = [teacher_units] * teacher_layers
+def build_teacher(seq_len, n_out, layers_teacher, use_old_names=False):
+    """
+    Build the teacher Seq2Seq GRU model.
 
+    Parameters
+    ----------
+    seq_len        : int        — sequence length (informational; model uses None).
+    n_out          : int        — number of output channels.
+    layers_teacher : list[int]  — hidden units per GRUCell layer in stack order.
+                                  Examples: [128, 128], [64, 16], [64, 32], [128].
+    use_old_names  : bool       — when True uses legacy layer names (encrnn/decrnn/
+                                  decdense/encinput/decinput) matching old checkpoint
+                                  files.  When False uses new names (enc_rnn/dec_rnn/
+                                  dec_dense/enc_input/dec_input).
+    """
     if use_old_names:
         enc_input_name = "encinput"
         dec_input_name = "decinput"
@@ -219,7 +231,7 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers, use_old_names=F
     encoder_inputs = keras.layers.Input(shape=(None, 1), name=enc_input_name)
     encoder_cells = [
         keras.layers.GRUCell(units, reset_after=True, name=f"enc_cell{i}")
-        for i, units in enumerate(LAYERS_TEACHER)
+        for i, units in enumerate(layers_teacher)
     ]
     encoder_rnn = keras.layers.RNN(
         encoder_cells,
@@ -232,7 +244,7 @@ def build_teacher(seq_len, n_out, teacher_units, teacher_layers, use_old_names=F
     decoder_inputs = keras.layers.Input(shape=(None, 1), name=dec_input_name)
     decoder_cells = [
         keras.layers.GRUCell(units, reset_after=True, name=f"dec_cell{i}")
-        for i, units in enumerate(LAYERS_TEACHER)
+        for i, units in enumerate(layers_teacher)
     ]
     decoder_rnn = keras.layers.RNN(
         decoder_cells,
@@ -631,68 +643,108 @@ def evaluate_one_run_at_bits(
     # teacher_best_gru128.weights.h5      → units=128 (single number, symmetric)
     # teacher_best.weights.h5             → no number → fall through to JSON / CLI default
     import re as _re
-    teacher_units  = default_teacher_units
-    teacher_layers = default_teacher_layers
+    import h5py
 
-    ckpt_basename = os.path.basename(ckpt_path)
-    _m = _re.search(r"gru(\d+)(?:x(\d+))?", ckpt_basename)
-    if _m:
-        teacher_units = int(_m.group(1))
-        pf(
-            f"    Checkpoint filename units: {teacher_units} "
-            f"(parsed from '{ckpt_basename}')"
-        )
-    else:
-        args_path = os.path.join(run_dir, "teacher_args.json")
-        if os.path.exists(args_path):
-            with open(args_path, "r") as f:
-                run_args = json.load(f)
-            teacher_units  = int(run_args.get("teacher_units",  default_teacher_units))
-            teacher_layers = int(run_args.get("teacher_layers", default_teacher_layers))
-            pf(f"    teacher_args.json: units={teacher_units}  layers={teacher_layers}")
-        else:
-            pf(
-                f"    teacher_args.json not found — using CLI defaults: "
-                f"units={teacher_units}  layers={teacher_layers}"
-            )
-
-    # Regardless of units source, always read teacher_layers from teacher_args.json
-    # if it exists, since the filename does not encode layer count.
+    # ── Resolve layers_teacher list ──────────────────────────────────────────
+    # Priority 1: teacher_args.json contains the authoritative layers_teacher
+    # list written by train_teacher.py at training time.  This is the only
+    # source that correctly encodes heterogeneous architectures like [64, 16]
+    # or [64, 32].  Always read it first.
+    layers_teacher = None
     args_path = os.path.join(run_dir, "teacher_args.json")
     if os.path.exists(args_path):
         with open(args_path, "r") as f:
             run_args = json.load(f)
-        teacher_layers = int(run_args.get("teacher_layers", default_teacher_layers))
+        _lt = run_args.get("layers_teacher", None)
+        if _lt is not None and isinstance(_lt, list) and len(_lt) >= 1:
+            layers_teacher = [int(u) for u in _lt]
+            pf(
+                f"    teacher_args.json layers_teacher: {layers_teacher} "
+                f"(authoritative source)"
+            )
+        else:
+            # teacher_args.json exists but has no layers_teacher key —
+            # fall back to legacy teacher_units / teacher_layers fields.
+            _units  = int(run_args.get("teacher_units",  default_teacher_units))
+            _layers = int(run_args.get("teacher_layers", default_teacher_layers))
+            layers_teacher = [_units] * _layers
+            pf(
+                f"    teacher_args.json (legacy keys): units={_units}  "
+                f"layers={_layers}  -> layers_teacher={layers_teacher}"
+            )
+    else:
+        pf(
+            f"    teacher_args.json NOT FOUND in {run_dir}"
+        )
+
+    # Priority 2: if teacher_args.json was absent, parse the checkpoint
+    # filename for gruAxB or gruA patterns as a best-effort fallback.
+    # NOTE: gruAxB only encodes the first-layer units and total layer count
+    # from the filename alone — this is ambiguous for heterogeneous models.
+    # teacher_args.json should always be present for correct results.
+    if layers_teacher is None:
+        ckpt_basename = os.path.basename(ckpt_path)
+        _m = _re.search(r"gru(\d+)(?:x(\d+))?", ckpt_basename)
+        if _m:
+            _units = int(_m.group(1))
+            # gruAxB: B is either a second layer size or a layer count.
+            # We cannot distinguish here — assume symmetric [A]*N where N
+            # is derived from B if B >= units (layer count interpretation)
+            # or [A, B] if B < A (heterogeneous interpretation).
+            # This is inherently ambiguous without teacher_args.json.
+            if _m.group(2) is not None:
+                _second = int(_m.group(2))
+                if _second < _units:
+                    # e.g. gru64x16 — heterogeneous [64, 16]
+                    layers_teacher = [_units, _second]
+                else:
+                    # e.g. gru128x128 or gru64x64 — symmetric, interpret as
+                    # [units, units] (2 layers of same size)
+                    layers_teacher = [_units, _second]
+            else:
+                # e.g. gru128 — single number means one layer
+                layers_teacher = [_units]
+            pf(
+                f"    Checkpoint filename fallback: '{os.path.basename(ckpt_path)}' "
+                f"-> layers_teacher={layers_teacher}  "
+                f"(WARNING: teacher_args.json missing, result may be wrong)"
+            )
+        else:
+            # Last resort: use CLI defaults
+            layers_teacher = [default_teacher_units] * default_teacher_layers
+            pf(
+                f"    No gru pattern in checkpoint filename and no teacher_args.json "
+                f"— using CLI default layers_teacher={layers_teacher}  "
+                f"(WARNING: may be wrong)"
+            )
+
+    pf(f"    Final layers_teacher: {layers_teacher}")
+    sys.stdout.flush()
 
     # ── Save ptq_args.json ───────────────────────────────────────────────────
     ptq_args = {
-        "run_dir":        run_dir,
-        "run_basename":   run_basename,
-        "bits":           bits,
-        "teacher_units":  teacher_units,
-        "teacher_layers": teacher_layers,
-        "seq_len":        seq_len,
-        "n_out":          n_out,
-        "gate_width_ns":  gate_width_ns,
-        "infer_batch":    infer_batch,
-        "n_test":         int(len(test_idx)),
+        "run_dir":         run_dir,
+        "run_basename":    run_basename,
+        "bits":            bits,
+        "layers_teacher":  layers_teacher,
+        "seq_len":         seq_len,
+        "n_out":           n_out,
+        "gate_width_ns":   gate_width_ns,
+        "infer_batch":     infer_batch,
+        "n_test":          int(len(test_idx)),
     }
     with open(os.path.join(job_dir, "ptq_args.json"), "w") as f:
         json.dump(ptq_args, f, indent=2)
     pf(f"    ptq_args.json saved.")
     sys.stdout.flush()
 
-    # ── Build teacher and load float32 weights ───────────────────────────────
-    # Detect which layer naming convention the checkpoint uses.
-    # Old train_teacher.py: encrnn / decrnn / decdense
-    # New train_teacher.py: enc_rnn / dec_rnn / dec_dense
-    # We probe by trying new names first; on failure we fall back to old names.
-    import h5py
-
+    # ── Detect checkpoint layer naming convention ────────────────────────────
+    # Old train_teacher.py: encrnn / decrnn / decdense / encinput / decinput
+    # Current train_teacher.py: same old names — train_teacher.py has always
+    # used old-style names.  The HDF5 detection is kept for safety.
     def _detect_layer_name_convention(ckpt_path):
         with h5py.File(ckpt_path, "r") as f:
             top_keys = list(f.keys())
-            # HDF5 weight files have a top-level key per layer name
             if any("encrnn" in k or "decrnn" in k or "decdense" in k for k in top_keys):
                 return "old"
             return "new"
@@ -700,12 +752,17 @@ def evaluate_one_run_at_bits(
     convention = _detect_layer_name_convention(ckpt_path)
     pf(f"    Checkpoint layer naming convention: {convention}")
 
+    # ── Build teacher with the correct heterogeneous layers_teacher list ─────
     tf.keras.backend.clear_session()
-    teacher_model = build_teacher(seq_len, n_out, teacher_units, teacher_layers,
-                                  use_old_names=(convention == "old"))
+    teacher_model = build_teacher(
+        seq_len,
+        n_out,
+        layers_teacher,
+        use_old_names=(convention == "old"),
+    )
     teacher_model.load_weights(ckpt_path)
     teacher_model.trainable = False
-    pf(f"    Float32 weights loaded OK.")
+    pf(f"    Float32 weights loaded OK.  layers_teacher={layers_teacher}")
     sys.stdout.flush()
 
     # ── Apply weight-only quantization in-place ──────────────────────────────
