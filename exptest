@@ -83,6 +83,7 @@ TEACHER_CKPT=$8
 ABLATION_ROOT=$9
 MAT_FILE=${10}
 MASK_FILE=${11:-none}
+VANILLA_ONLY=${12:-false}
 
 # --- Required argument check (first 10 are mandatory) ---
 if [ -z "${TEACHER_LAYERS_0}" ] || [ -z "${TEACHER_LAYERS_1}" ] || \
@@ -186,6 +187,7 @@ echo "GPU names           : $(nvidia-smi --query-gpu=name --format=csv,noheader 
 echo "SCRIPT DIR          : ${SCRIPT_DIR}"
 echo "MAT FILE            : ${MAT_FILE}"
 echo "MASK FILE           : ${MASK_FILE}"
+echo "VANILLA ONLY        : ${VANILLA_ONLY}"
 echo "TEACHER CKPT        : ${TEACHER_CKPT}"
 echo "ABLATION ROOT       : ${ABLATION_ROOT}"
 echo "TEACHER LAYERS ARG  : ${TEACHER_LAYERS_ARG}"
@@ -244,6 +246,9 @@ fi
 
 if [ "${ABLATION_ROOT}" != "none" ]; then
     PYTHON_CMD="${PYTHON_CMD} --ablation-root \"${ABLATION_ROOT}\""
+    if [ "${VANILLA_ONLY}" = "true" ]; then
+        PYTHON_CMD="${PYTHON_CMD} --vanilla-only"
+    fi
 fi
 
 echo "Running: ${PYTHON_CMD}"

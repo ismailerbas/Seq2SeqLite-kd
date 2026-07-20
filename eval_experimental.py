@@ -123,6 +123,11 @@ def parse_args():
     p.add_argument("--bits-default", type=int, default=4,
                    help="Fallback quantisation bits when the folder name "
                         "cannot be parsed (kernel/recurrent/bias/activation/state).")
+    p.add_argument("--vanilla-only", action="store_true", default=False,
+                   help="When set, --ablation-root scanning is restricted to "
+                        "subdirectories whose name starts with 'vanilla_kd_'. "
+                        "All other folders (student_b*, memoq*, etc.) are skipped. "
+                        "Has no effect when --ablation-root is not provided.")
 
     args = p.parse_args()
 
@@ -130,7 +135,6 @@ def parse_args():
         p.error("Provide at least one of --ablation-root or --teacher-ckpt.")
 
     return args
-
 # ---------------------------------------------------------------------------
 # GPU setup (CPU-friendly — no MirroredStrategy needed for inference)
 # ---------------------------------------------------------------------------
@@ -608,8 +612,9 @@ def parse_config_from_path(weight_path, args):
             student_final.weights.h5
 
       Vanilla-KD student (train_student_vanilla_kd.py):
-        Any folder not matching the above patterns, containing a file
-        named student_best.weights.h5 or student_final.weights.h5.
+        results/vanilla_kd_gru{U}_bs{B}_lr{LR}_t{TU}x{TL}/
+            student_best.weights.h5
+            student_final.weights.h5
 
     Returns
     -------
@@ -625,16 +630,16 @@ def parse_config_from_path(weight_path, args):
     folder = os.path.basename(os.path.dirname(weight_path))
 
     config = {
-        "model_type":     "unknown",
-        "layers_teacher": list(args.teacher_layers_list),
-        "student_units":  args.student_units_default,
-        "teacher_units":  args.teacher_units_default,
-        "teacher_layers": args.teacher_layers_default,
-        "bits_kernel":    args.bits_default,
-        "bits_recurrent": args.bits_default,
-        "bits_bias":      args.bits_default,
-        "bits_activation":args.bits_default,
-        "bits_state":     args.bits_default,
+        "model_type":      "unknown",
+        "layers_teacher":  list(args.teacher_layers_list),
+        "student_units":   args.student_units_default,
+        "teacher_units":   args.teacher_units_default,
+        "teacher_layers":  args.teacher_layers_default,
+        "bits_kernel":     args.bits_default,
+        "bits_recurrent":  args.bits_default,
+        "bits_bias":       args.bits_default,
+        "bits_activation": args.bits_default,
+        "bits_state":      args.bits_default,
     }
 
     # --- Teacher: teacher_best_gru128x128.weights.h5 ---
@@ -644,6 +649,14 @@ def parse_config_from_path(weight_path, args):
         units_parts = [int(u) for u in gru_tag.replace("gru", "").split("x") if u]
         config["model_type"]     = "teacher"
         config["layers_teacher"] = units_parts
+        return config
+
+    # --- Vanilla-KD student folder: vanilla_kd_gru{U}_bs{B}_lr{LR}_t{TU}x{TL} ---
+    if folder.startswith("vanilla_kd_"):
+        config["model_type"] = "student_vanilla"
+        m_gru = re.search(r"gru(\d+)", folder)
+        if m_gru:
+            config["student_units"] = int(m_gru.group(1))
         return config
 
     # --- FW-QATD-RAC student folder: student_b4k4r4a4_gru32x1_dense3_bs1024 ---
@@ -666,39 +679,48 @@ def parse_config_from_path(weight_path, args):
         config["bits_state"]      = bk
         return config
 
-    # --- Vanilla-KD student: any other folder with student*.weights.h5 ---
+    # --- Fallback: any other folder with student in filename ---
     if "student" in fname.lower():
         config["model_type"] = "student_vanilla"
-        # Try to parse gru units from folder name e.g. gru32 or gru32x1
         m_gru = re.search(r"gru(\d+)", folder)
         if m_gru:
             config["student_units"] = int(m_gru.group(1))
         return config
 
-    # Fallback
     config["model_type"] = "unknown"
     return config
-
 
 # ---------------------------------------------------------------------------
 # Discover all weight files under a root directory
 # ---------------------------------------------------------------------------
-def discover_weight_files(root_dir, pf):
+def discover_weight_files(root_dir, pf, vanilla_only=False):
     """
     Walk root_dir recursively and collect all .weights.h5 files.
+
+    Parameters
+    ----------
+    root_dir     : str   Root directory to walk.
+    pf           : callable  Print function.
+    vanilla_only : bool  When True, only include weight files whose immediate
+                         parent folder name starts with 'vanilla_kd_'.
+                         All other folders (student_b*, memoq*, etc.) are skipped.
+
     Returns a sorted list of absolute paths.
     """
     found = []
     for dirpath, dirnames, filenames in os.walk(root_dir):
+        folder_name = os.path.basename(dirpath)
+        if vanilla_only and not folder_name.startswith("vanilla_kd_"):
+            continue
         for fname in filenames:
             if fname.endswith(".weights.h5"):
                 found.append(os.path.join(dirpath, fname))
     found = sorted(found)
-    pf(f"[DISCOVER] Found {len(found)} weight file(s) under {root_dir}:")
+    filter_label = "vanilla_kd_* only" if vanilla_only else "all"
+    pf(f"[DISCOVER] Found {len(found)} weight file(s) under {root_dir} ({filter_label}):")
     for f in found:
         pf(f"  {f}")
     return found
-
 
 # ---------------------------------------------------------------------------
 # Run inference with a Keras model on encoder_input
@@ -1256,7 +1278,7 @@ def main():
             pf(f"[MAIN] ERROR: --ablation-root is not a directory: "
                f"{args.ablation_root}")
             sys.exit(1)
-        discovered = discover_weight_files(args.ablation_root, pf)
+        discovered = discover_weight_files(args.ablation_root, pf, vanilla_only=args.vanilla_only)
         for wf in discovered:
             if wf not in weight_files:
                 weight_files.append(wf)
