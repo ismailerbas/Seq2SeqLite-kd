@@ -159,7 +159,7 @@ def load_and_preprocess_mat(mat_path, n_rows, n_cols, seq_len,
     Steps:
       1. Load mat file, extract tp4d (n_rows, n_cols, seq_len)
       2. Cast to float32
-      3. Per-pixel baseline correction:
+      3. Per-pixel baseline correction (skipped when baseline_bins <= 0):
            baseline[r, c] = mean(tp4d[r, c, :baseline_bins])
            tp4d[r, c, :] -= baseline[r, c]
       4. Clamp negatives to 0
@@ -203,10 +203,13 @@ def load_and_preprocess_mat(mat_path, n_rows, n_cols, seq_len,
             f"Pass --seq-len {actual_time} to fix."
         )
 
-    pf(f"[MAT] Applying baseline correction using first {baseline_bins} bins...")
-    baseline = np.mean(tp4d[:, :, :baseline_bins], axis=2, keepdims=True)
-    tp4d = tp4d - baseline
-    pf(f"[MAT] Baseline range: min={baseline.min():.4f}  max={baseline.max():.4f}")
+    if baseline_bins > 0:
+        pf(f"[MAT] Applying baseline correction using first {baseline_bins} bins...")
+        baseline = np.mean(tp4d[:, :, :baseline_bins], axis=2, keepdims=True)
+        tp4d = tp4d - baseline
+        pf(f"[MAT] Baseline range: min={baseline.min():.4f}  max={baseline.max():.4f}")
+    else:
+        pf(f"[MAT] baseline-bins={baseline_bins} — skipping baseline correction.")
 
     pf("[MAT] Clamping negatives to 0...")
     np.clip(tp4d, 0.0, None, out=tp4d)
@@ -228,7 +231,6 @@ def load_and_preprocess_mat(mat_path, n_rows, n_cols, seq_len,
        f"{encoder_input.max():.4f}]")
 
     return encoder_input, pixel_mask, n_rows, n_cols
-
 
 # ---------------------------------------------------------------------------
 # Load external binary mask and combine with intensity-based pixel_mask
@@ -352,6 +354,22 @@ def extract_lifetimes(preds, t):
 # ---------------------------------------------------------------------------
 def compute_stats(arr, label, pf):
     finite = arr[np.isfinite(arr)]
+    if len(finite) == 0:
+        pf(f"  {label:12s}  WARNING: no finite values — stats are nan")
+        stats = {
+            "label":  label,
+            "n":      0,
+            "mean":   float("nan"),
+            "median": float("nan"),
+            "std":    float("nan"),
+            "min":    float("nan"),
+            "max":    float("nan"),
+            "p5":     float("nan"),
+            "p25":    float("nan"),
+            "p75":    float("nan"),
+            "p95":    float("nan"),
+        }
+        return stats
     stats = {
         "label":  label,
         "n":      int(len(finite)),
@@ -369,7 +387,6 @@ def compute_stats(arr, label, pf):
        f"median={stats['median']:.4f}  std={stats['std']:.4f}  "
        f"[{stats['min']:.4f}, {stats['max']:.4f}]")
     return stats
-
 
 # ---------------------------------------------------------------------------
 # Build teacher model — exact replica of train_teacher.py
