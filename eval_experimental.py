@@ -18,7 +18,8 @@ Pipeline:
   7. Extract tau1, tau2, fret per pixel via extract_lifetimes
   8. Save pixel maps (484×250 images), histograms, statistics JSON,
      and scatter plots (pred vs pred self-consistency check)
-     all inside the same folder as the weight file
+     all inside a subfolder named after the .mat file stem,
+     inside the same folder as the weight file
 
 Usage:
   python eval_experimental.py \\
@@ -1019,13 +1020,16 @@ def save_mat_outputs(tau1_map, tau2_map, fret_map, pixel_mask,
     pf(f"  .mat preds saved  : {preds_path}")
 
 # ---------------------------------------------------------------------------
-# Evaluate a single weight file and save all outputs next to it
+# Evaluate a single weight file and save all outputs into a subfolder
+# named after the mat file stem, inside the weight file's directory.
 # ---------------------------------------------------------------------------
 def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
                           n_rows, n_cols, seq_len, n_out, gate_width_ns,
-                          infer_batch, args, pf):
-    out_dir    = os.path.dirname(weight_path)
-    model_tag  = os.path.basename(out_dir) + "/" + os.path.basename(weight_path)
+                          infer_batch, mat_file, args, pf):
+    mat_stem   = os.path.splitext(os.path.basename(mat_file))[0]
+    out_dir    = os.path.join(os.path.dirname(weight_path), mat_stem)
+    os.makedirs(out_dir, exist_ok=True)
+    model_tag  = os.path.basename(os.path.dirname(weight_path)) + "/" + os.path.basename(weight_path)
     pf("=" * 70)
     pf(f"[EVAL] Weight file : {weight_path}")
     pf(f"[EVAL] Output dir  : {out_dir}")
@@ -1270,6 +1274,7 @@ def main():
                 args.n_out,
                 args.gate_width_ns,
                 args.infer_batch,
+                args.mat_file,
                 args,
                 pf,
             )
@@ -1304,10 +1309,16 @@ def main():
         "results":         all_results,
     }
 
+    mat_stem = os.path.splitext(os.path.basename(args.mat_file))[0]
+
     if args.ablation_root is not None:
-        summary_dir = args.ablation_root
+        summary_dir = os.path.join(args.ablation_root, mat_stem)
+        os.makedirs(summary_dir, exist_ok=True)
     else:
-        summary_dir = os.path.dirname(os.path.abspath(args.teacher_ckpt))
+        summary_dir = os.path.join(
+            os.path.dirname(os.path.abspath(args.teacher_ckpt)), mat_stem
+        )
+        os.makedirs(summary_dir, exist_ok=True)
 
     summary_path = os.path.join(summary_dir, "experimental_eval_summary.json")
     with open(summary_path, "w") as f:
