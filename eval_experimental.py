@@ -887,6 +887,13 @@ def save_scatter_plots(tau1_vals, tau2_vals, fret_vals,
             pf(f"  [SCATTER] No valid data for {fname} — skipping.")
             continue
 
+        in_extent = (
+            (xdata >= xlim[0]) & (xdata <= xlim[1]) &
+            (ydata >= ylim[0]) & (ydata <= ylim[1])
+        )
+        xdata_clipped = xdata[in_extent]
+        ydata_clipped = ydata[in_extent]
+
         r_val = float("nan")
         if len(xdata) > 1:
             try:
@@ -895,8 +902,31 @@ def save_scatter_plots(tau1_vals, tau2_vals, fret_vals,
                 pass
 
         fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+
+        if len(xdata_clipped) == 0:
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.set_xlabel(xlabel, fontsize=11)
+            ax.set_ylabel(ylabel, fontsize=11)
+            ax.set_title(f"{model_tag}\n{xlabel} vs {ylabel}", fontsize=10,
+                         fontweight="bold")
+            ax.grid(True, alpha=0.2)
+            ax.text(
+                0.5, 0.5,
+                f"No data within plot range\nn_total={len(xdata):,}\nr={r_val:.4f}" if np.isfinite(r_val) else f"No data within plot range\nn_total={len(xdata):,}",
+                transform=ax.transAxes, fontsize=10,
+                ha="center", va="center",
+                bbox=dict(boxstyle="round,pad=0.4", facecolor="lightyellow", alpha=0.9),
+            )
+            plt.tight_layout()
+            out_path = os.path.join(out_dir, fname)
+            plt.savefig(out_path, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            pf(f"  Scatter saved (no in-range data): {out_path}")
+            continue
+
         hb = ax.hexbin(
-            xdata, ydata,
+            xdata_clipped, ydata_clipped,
             gridsize=80,
             bins="log",
             cmap=cmap,
@@ -912,18 +942,23 @@ def save_scatter_plots(tau1_vals, tau2_vals, fret_vals,
         ax.grid(True, alpha=0.2)
         ax.text(
             0.03, 0.97,
-            f"n={len(xdata):,}\nr={r_val:.4f}",
+            f"n={len(xdata_clipped):,}\nr={r_val:.4f}" if np.isfinite(r_val) else f"n={len(xdata_clipped):,}",
             transform=ax.transAxes, fontsize=9,
             verticalalignment="top",
             bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
         )
-        fig.colorbar(hb, ax=ax, pad=0.02).set_label("log₁₀(count)", fontsize=9)
+
+        counts = hb.get_array()
+        if counts is not None and np.any(counts > 0):
+            fig.colorbar(hb, ax=ax, pad=0.02).set_label("log₁₀(count)", fontsize=9)
+        else:
+            pf(f"  [SCATTER] hexbin has zero counts for {fname} — colorbar skipped.")
+
         plt.tight_layout()
         out_path = os.path.join(out_dir, fname)
         plt.savefig(out_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         pf(f"  Scatter saved: {out_path}")
-
 
 # ---------------------------------------------------------------------------
 # Combined overview figure: pixel maps + histograms in one panel
