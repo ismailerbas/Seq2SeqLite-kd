@@ -485,38 +485,70 @@ def build_teacher_student_names(seq_len, n_out, teacher_units, teacher_layers):
 
 
 # ---------------------------------------------------------------------------
-# Build vanilla-KD student model — exact replica of train_student_vanilla_kd.py
-# Plain float32 GRU student (no QKeras).
+# Build vanilla-KD student model — exact replica of train_student_vanilla_kd.py.
 # Layer names MUST match train_student_vanilla_kd.py exactly:
 #   senc_input, sdec_input, sencgru, sdecgru, sdec_dense
 # ---------------------------------------------------------------------------
-def build_vanilla_student(student_units, seq_len, n_out):
-    enc_input = tf.keras.Input(shape=(seq_len, 1), name="s_enc_input")
-    dec_input = tf.keras.Input(shape=(seq_len, 1), name="s_dec_input")
+def build_vanilla_student(student_units, seq_len, n_out,
+                           bits_kernel=4, bits_recurrent=4, bits_bias=4,
+                           bits_activation=4, bits_state=4):
+    from qkeras import QDense, QGRU, quantized_bits, quantized_tanh
 
-    enc_gru = tf.keras.layers.GRU(
-        student_units,
+    def qwk():
+        return quantized_bits(bits_kernel, 0, 1, alpha=1.0)
+
+    def qwr():
+        return quantized_bits(bits_recurrent, 0, 1, alpha=1.0)
+
+    def qwb():
+        return quantized_bits(bits_bias, 0, 1, alpha=1.0)
+
+    def qa():
+        return quantized_tanh(bits=bits_activation, symmetric=True)
+
+    def qs():
+        return quantized_bits(bits_state, 0, 1, alpha=1.0)
+
+    def qd():
+        return quantized_bits(bits_kernel, 0)
+
+    enc_inputs = tf.keras.Input(shape=(None, 1), name="senc_input")
+    dec_inputs = tf.keras.Input(shape=(None, 1), name="sdec_input")
+
+    s_enc_out, s_enc_state = QGRU(
+        units=student_units,
+        activation=qa(),
+        kernel_quantizer=qwk(),
+        recurrent_quantizer=qwr(),
+        bias_quantizer=qwb(),
+        state_quantizer=qs(),
         return_state=True,
-        return_sequences=False,
-        reset_after=False,
-        name="s_enc_gru",
-    )
-    _, enc_state = enc_gru(enc_input)
+        name="sencgru",
+    )(enc_inputs)
 
-    dec_gru = tf.keras.layers.GRU(
-        student_units,
+    s_dec_hid_seq, _ = QGRU(
+        units=student_units,
+        activation=qa(),
+        kernel_quantizer=qwk(),
+        recurrent_quantizer=qwr(),
+        bias_quantizer=qwb(),
+        state_quantizer=qs(),
         return_sequences=True,
-        return_state=False,
-        reset_after=False,
-        name="s_dec_gru",
-    )
-    dec_out = dec_gru(dec_input, initial_state=enc_state)
+        return_state=True,
+        name="sdecgru",
+    )(dec_inputs, initial_state=s_enc_state)
 
-    out = tf.keras.layers.Dense(n_out, name="s_out_dense")(dec_out)
+    s_output = QDense(
+        n_out,
+        kernel_quantizer=qd(),
+        bias_quantizer=qd(),
+        activation="linear",
+        name="sdec_dense",
+    )(s_dec_hid_seq)
 
     model = tf.keras.Model(
-        inputs=[enc_input, dec_input],
-        outputs=out,
+        inputs=[enc_inputs, dec_inputs],
+        outputs=s_output,
         name="vanilla_student",
     )
     return model
@@ -598,32 +630,6 @@ def build_qkeras_student(seq_len, n_out, student_units,
 # bits_activation, bits_state
 # ---------------------------------------------------------------------------
 def parse_config_from_path(weight_path, args):
-    """
-    Infer model architecture from the weight file path and parent folder name.
-
-    Conventions (from the training scripts):
-      Teacher:
-        teacher_best_gru{U}x{U}.weights.h5
-        teacher_best_gru{U}.weights.h5
-
-      FW-QATD-RAC student (train_student.py):
-        results/student_b{K}k{K}r{R}a{A}_gru{U}x1_dense{D}_bs{B}/
-            student_best.weights.h5
-            student_final.weights.h5
-
-      Vanilla-KD student (train_student_vanilla_kd.py):
-        results/vanilla_kd_gru{U}_bs{B}_lr{LR}_t{TU}x{TL}/
-            student_best.weights.h5
-            student_final.weights.h5
-
-    Returns
-    -------
-    dict with keys: model_type (str), layers_teacher (list[int]),
-                    student_units (int), teacher_units (int),
-                    teacher_layers (int), bits_kernel (int),
-                    bits_recurrent (int), bits_bias (int),
-                    bits_activation (int), bits_state (int)
-    """
     import re
 
     fname = os.path.basename(weight_path)
@@ -642,7 +648,6 @@ def parse_config_from_path(weight_path, args):
         "bits_state":      args.bits_default,
     }
 
-    # --- Teacher: teacher_best_gru128x128.weights.h5 ---
     m = re.search(r"teacher_best_(gru[\dx]+)\.weights\.h5", fname)
     if m:
         gru_tag = m.group(1)
@@ -651,15 +656,20 @@ def parse_config_from_path(weight_path, args):
         config["layers_teacher"] = units_parts
         return config
 
-    # --- Vanilla-KD student folder: vanilla_kd_gru{U}_bs{B}_lr{LR}_t{TU}x{TL} ---
     if folder.startswith("vanilla_kd_"):
         config["model_type"] = "student_vanilla"
         m_gru = re.search(r"gru(\d+)", folder)
         if m_gru:
             config["student_units"] = int(m_gru.group(1))
+        m_bits = re.search(r"_b(\d+)k(\d+)r(\d+)a(\d+)", folder)
+        if m_bits:
+            config["bits_kernel"]     = int(m_bits.group(1))
+            config["bits_bias"]       = int(m_bits.group(2))
+            config["bits_recurrent"]  = int(m_bits.group(3))
+            config["bits_activation"] = int(m_bits.group(4))
+            config["bits_state"]      = int(m_bits.group(1))
         return config
 
-    # --- FW-QATD-RAC student folder: student_b4k4r4a4_gru32x1_dense3_bs1024 ---
     m_folder = re.match(
         r"student_b(\d+)k(\d+)r(\d+)a(\d+)_gru(\d+)x1_dense(\d+)_bs(\d+)$",
         folder,
@@ -679,12 +689,18 @@ def parse_config_from_path(weight_path, args):
         config["bits_state"]      = bk
         return config
 
-    # --- Fallback: any other folder with student in filename ---
     if "student" in fname.lower():
         config["model_type"] = "student_vanilla"
         m_gru = re.search(r"gru(\d+)", folder)
         if m_gru:
             config["student_units"] = int(m_gru.group(1))
+        m_bits = re.search(r"_b(\d+)k(\d+)r(\d+)a(\d+)", folder)
+        if m_bits:
+            config["bits_kernel"]     = int(m_bits.group(1))
+            config["bits_bias"]       = int(m_bits.group(2))
+            config["bits_recurrent"]  = int(m_bits.group(3))
+            config["bits_activation"] = int(m_bits.group(4))
+            config["bits_state"]      = int(m_bits.group(1))
         return config
 
     config["model_type"] = "unknown"
@@ -1138,8 +1154,19 @@ def evaluate_weight_file(weight_path, encoder_input, pixel_mask,
                 config["student_units"], seq_len, n_out
             )
     elif model_type == "student_vanilla":
-        pf(f"[EVAL] Building vanilla student: units={config['student_units']}")
-        model = build_vanilla_student(config["student_units"], seq_len, n_out)
+        pf(f"[EVAL] Building vanilla student: units={config['student_units']}  "
+           f"bits_k={config['bits_kernel']}  bits_r={config['bits_recurrent']}  "
+           f"bits_a={config['bits_activation']}")
+        model = build_vanilla_student(
+            config["student_units"],
+            seq_len,
+            n_out,
+            bits_kernel=config["bits_kernel"],
+            bits_recurrent=config["bits_recurrent"],
+            bits_bias=config["bits_bias"],
+            bits_activation=config["bits_activation"],
+            bits_state=config["bits_state"],
+        )
     else:
         pf(f"[EVAL] WARNING: model_type='{model_type}' — "
            f"attempting teacher build with layers={config['layers_teacher']}")
