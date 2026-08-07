@@ -1,0 +1,157 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=16
+#SBATCH --time=06:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+# ============================================================================
+# bench_student_timing_cpu — CPU inference timing benchmark for vanilla KD
+# student ablation checkpoints. Scans /scratch/nmi/results for vanilla_kd*
+# subdirectories containing student_best.weights.h5 and student_args.json.
+# Produces timing_benchmark.json (mean/std/median/p95 latency and throughput
+# per batch size, under results["cpu"]) next to each student_best.weights.h5.
+#
+# No --gres=gpu requested: this job runs on a CPU-only allocation.
+#
+# Positional args:
+#   $1  SEQ_LEN       (optional, default 135)
+#   $2  BATCH_SIZES   (optional, default "1,8,32,128,1024,8192")
+#   $3  N_WARMUP       (optional, default 10)
+#   $4  N_REPEAT       (optional, default 50)
+#   $5  OVERWRITE      (optional, pass "overwrite" to add --overwrite flag)
+#
+# Examples:
+#   sbatch --job-name=bench_student_timing_cpu slurm/bench_student_timing_cpu
+#   sbatch --job-name=bench_student_timing_cpu slurm/bench_student_timing_cpu 135 "1,8,32,128,1024,8192" 10 50 overwrite
+# ============================================================================
+
+SEQ_LEN=${1:-135}
+BATCH_SIZES=${2:-"1,8,32,128,1024,8192"}
+N_WARMUP=${3:-10}
+N_REPEAT=${4:-50}
+OVERWRITE_ARG=""
+if [ "${5}" = "overwrite" ]; then
+    OVERWRITE_ARG="--overwrite"
+fi
+
+# ============================================================================
+# STEP 1 — modules
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+# ============================================================================
+# STEP 2 — activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+# ============================================================================
+# STEP 3 — THE FIX
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+# ============================================================================
+# STEP 4 — CPU / TF settings
+# ============================================================================
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=16
+export MKL_NUM_THREADS=16
+export OPENBLAS_NUM_THREADS=16
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${SCRATCH_BASE}/nmi"
+RESULTS_PATH="${SCRATCH_BASE}/nmi/results"
+SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}"
+
+# --- Log ---
+echo "============================================================"
+echo "BENCH STUDENT TIMING — CPU"
+echo "Scanning ${RESULTS_PATH} for vanilla_kd* student runs"
+echo "============================================================"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME       : ${SLURM_JOB_NAME}"
+echo "NODE                 : $(hostname)"
+echo "LD_LIBRARY_PATH      : ${LD_LIBRARY_PATH}"
+echo "DATA PATH            : ${DATA_PATH}"
+echo "RESULTS PATH         : ${RESULTS_PATH}"
+echo "SCRIPT DIR           : ${SCRIPT_DIR}"
+echo "SEQ LEN              : ${SEQ_LEN}"
+echo "BATCH SIZES          : ${BATCH_SIZES}"
+echo "N WARMUP             : ${N_WARMUP}"
+echo "N REPEAT             : ${N_REPEAT}"
+echo "OVERWRITE ARG        : ${OVERWRITE_ARG}"
+echo "PYTHON               : $(which python)"
+echo "TF VERSION           : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "NUMPY VERSION        : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "CPUs allocated       : ${SLURM_CPUS_PER_TASK}"
+echo "vanilla_kd runs found under ${RESULTS_PATH}:"
+find "${RESULTS_PATH}" -maxdepth 2 -name "student_best.weights.h5" \
+    -path "*/vanilla_kd*" 2>/dev/null | while read f; do dirname "$f"; done
+echo "============================================================"
+
+if [ ! -f "${SCRIPT_DIR}/eval/bench_student_timing.py" ]; then
+    echo "FATAL: eval/bench_student_timing.py not found in ${SCRIPT_DIR}/eval/"
+    exit 1
+fi
+
+if [ ! -d "${RESULTS_PATH}" ]; then
+    echo "FATAL: RESULTS_PATH does not exist: ${RESULTS_PATH}"
+    exit 1
+fi
+
+echo "bench_student_timing.py found."
+echo "Starting CPU timing benchmark..."
+echo "============================================================"
+
+# ============================================================================
+# Launch benchmark (foreground)
+# ============================================================================
+python "${SCRIPT_DIR}/eval/bench_student_timing.py" \
+    --data-dir "${DATA_PATH}" \
+    --results-dir "${RESULTS_PATH}" \
+    --seq-len "${SEQ_LEN}" \
+    --n-out 3 \
+    --batch-sizes "${BATCH_SIZES}" \
+    --n-warmup "${N_WARMUP}" \
+    --n-repeat "${N_REPEAT}" \
+    --device cpu \
+    ${OVERWRITE_ARG}
+
+EXIT_CODE=$?
+
+echo "============================================================"
+echo "Benchmark Exit Code: ${EXIT_CODE}"
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "CPU timing benchmark completed successfully."
+    echo "Results written next to each student_best.weights.h5 under:"
+    echo "  ${RESULTS_PATH}"
+    echo "  File per run: timing_benchmark.json (results.cpu key)"
+    echo "  timing_benchmark.json count: $(find "${RESULTS_PATH}" -name "timing_benchmark.json" -path "*/vanilla_kd*" 2>/dev/null | wc -l)"
+else
+    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "  grep -i 'error\|traceback\|valueerror\|assertionerror' \\"
+    echo "  slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+exit ${EXIT_CODE}
