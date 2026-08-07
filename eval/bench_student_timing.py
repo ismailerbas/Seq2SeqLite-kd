@@ -112,7 +112,13 @@ def parse_args():
     p.add_argument("--data-dir", type=str, required=True,
                    help="Directory containing tpsf_seq, res, labels, testidx .npy files.")
     p.add_argument("--results-dir", type=str, required=True,
-                   help="Root directory to scan for vanilla_kd* subdirectories.")
+                   help="Root directory to scan for vanilla_kd* subdirectories. Ignored "
+                        "when --student-run-dir is supplied.")
+    p.add_argument("--student-run-dir", type=str, default=None,
+                   help="Explicit path to a single selected student run directory containing "
+                        "student_best.weights.h5 and student_args.json. When provided, only "
+                        "this directory is benchmarked instead of recursively scanning "
+                        "--results-dir for every vanilla_kd ablation.")
     p.add_argument("--seq-len", type=int, default=135)
     p.add_argument("--n-out", type=int, default=3)
     p.add_argument("--batch-sizes", type=str,
@@ -120,6 +126,11 @@ def parse_args():
                    help="Comma-separated list of batch sizes to benchmark. "
                         f"{FPGA_FRAME_PIXELS_500X500} (500x500 pixels) is the FPGA "
                         "paper's full-frame reference size and is included by default.")
+    p.add_argument("--max-chunk-size", type=int, default=8192,
+                   help="Maximum number of samples processed in a single forward pass. "
+                        "Batch sizes larger than this are split into sequential chunks of "
+                        "at most this many samples to avoid GPU/CPU out-of-memory failures; "
+                        "the reported timing is the total wall-clock time across all chunks.")
     p.add_argument("--n-warmup", type=int, default=10,
                    help="Number of warmup iterations before timing (per batch size).")
     p.add_argument("--n-repeat", type=int, default=50,
@@ -294,23 +305,25 @@ def benchmark_model_inference(
     n_repeat,
     device_str,
     input_mode,
+    max_chunk_size,
     pf,
 ):
     """
     Time forward-pass inference latency and throughput for `model` on the
     device given by `device_str` (e.g. "/CPU:0" or "/GPU:0").
 
-    input_mode : "dict" for teacher_model({"encinput":..., "decinput":...})
-                 "list" for student_model([enc_b, dec_b])
+    input_mode : "list" for student_model([enc_b, dec_b])
 
-    Uses a single fixed batch of real data (the first `batch_size` rows of
+    If batch_size exceeds max_chunk_size, the batch is split into sequential
+    chunks of at most max_chunk_size samples each, and the reported timing is
+    the total wall-clock time to process the FULL batch_size across all
+    chunks combined. This avoids GPU/CPU out-of-memory failures on large
+    batch sizes (e.g. the 250,000-pixel FPGA full-frame reference) while
+    still reporting a true full-batch latency number.
+
+    Uses a single fixed set of real data (the first `batch_size` rows of
     enc_arr) for every warmup and timed iteration so that timing measures
     pure model forward-pass latency, not data-loading overhead.
-
-    When batch_size equals FPGA_FRAME_PIXELS_500X500 (250,000), the result
-    is flagged with is_full_frame_500x500=True so it can be directly
-    compared against the FPGA paper's full-frame (500x500-pixel SwissSPAD3
-    frame) execution-time figures.
     """
     n_available = len(enc_arr)
     actual_batch = min(batch_size, n_available)
@@ -320,31 +333,56 @@ def benchmark_model_inference(
             f"samples={n_available}. Using batch_size={actual_batch}."
         )
 
-    enc_batch_np = np.ascontiguousarray(enc_arr[:actual_batch], dtype=np.float32)
-    dec_batch_np = np.zeros((actual_batch, seq_len, 1), dtype=np.float32)
+    chunk_size = min(max_chunk_size, actual_batch)
+    n_chunks = int(np.ceil(actual_batch / chunk_size))
+    if n_chunks > 1:
+        pf(
+            f"  batch_size={actual_batch} exceeds max_chunk_size={max_chunk_size} — "
+            f"splitting into {n_chunks} chunk(s) of up to {chunk_size} samples each."
+        )
+
+    full_enc_np = np.ascontiguousarray(enc_arr[:actual_batch], dtype=np.float32)
+    full_dec_np = np.zeros((actual_batch, seq_len, 1), dtype=np.float32)
+
+    chunk_bounds = []
+    for c in range(n_chunks):
+        c_start = c * chunk_size
+        c_end = min(c_start + chunk_size, actual_batch)
+        chunk_bounds.append((c_start, c_end))
 
     with tf.device(device_str):
-        enc_b = tf.constant(enc_batch_np, dtype=tf.float32)
-        dec_b = tf.constant(dec_batch_np, dtype=tf.float32)
+        enc_chunks = [
+            tf.constant(full_enc_np[c_start:c_end], dtype=tf.float32)
+            for c_start, c_end in chunk_bounds
+        ]
+        dec_chunks = [
+            tf.constant(full_dec_np[c_start:c_end], dtype=tf.float32)
+            for c_start, c_end in chunk_bounds
+        ]
 
-        def _forward():
-            if input_mode == "dict":
-                out = model({"encinput": enc_b, "decinput": dec_b}, training=False)
-            else:
-                out = model([enc_b, dec_b], training=False)
-            return out
+        def _forward_all_chunks():
+            outputs = []
+            for enc_c, dec_c in zip(enc_chunks, dec_chunks):
+                if input_mode == "dict":
+                    out_c = model({"encinput": enc_c, "decinput": dec_c}, training=False)
+                else:
+                    out_c = model([enc_c, dec_c], training=False)
+                outputs.append(out_c)
+            return outputs
 
         pf(f"  Warming up on {device_str} for {n_warmup} iteration(s)...")
         for _ in range(n_warmup):
-            out = _forward()
-            _ = out.numpy()
+            outputs = _forward_all_chunks()
+            for out_c in outputs:
+                _ = out_c.numpy()
 
-        pf(f"  Timing on {device_str} for {n_repeat} iteration(s), batch_size={actual_batch}...")
+        pf(f"  Timing on {device_str} for {n_repeat} iteration(s), batch_size={actual_batch} ({n_chunks} chunk(s))...")
         elapsed_list = []
         for _ in range(n_repeat):
             t0 = time.perf_counter()
-            out = _forward()
-            _ = out.numpy()
+            outputs = _forward_all_chunks()
+            for out_c in outputs:
+                _ = out_c.numpy()
             t1 = time.perf_counter()
             elapsed_list.append(t1 - t0)
 
@@ -361,6 +399,8 @@ def benchmark_model_inference(
     result = {
         "device_str": device_str,
         "batch_size": int(actual_batch),
+        "n_chunks": int(n_chunks),
+        "chunk_size": int(chunk_size),
         "n_warmup": int(n_warmup),
         "n_repeat": int(n_repeat),
         "mean_ms": mean_s * 1000.0,
@@ -374,7 +414,7 @@ def benchmark_model_inference(
     }
     if is_full_frame:
         pf(
-            f"  {device_str}: [FULL-FRAME 500x500] mean={result['mean_ms']:.3f}ms "
+            f"  {device_str}: [FULL-FRAME 500x500, {n_chunks} chunk(s)] mean={result['mean_ms']:.3f}ms "
             f"std={result['std_ms']:.3f}ms median={result['median_ms']:.3f}ms "
             f"p95={result['p95_ms']:.3f}ms throughput={throughput:.1f} samples/s "
             f"— compare against FPGA paper's ~210ms full-frame figure"
@@ -401,6 +441,7 @@ def benchmark_student_run(
     n_repeat,
     device,
     device_str,
+    max_chunk_size,
     overwrite,
     pf,
 ):
@@ -461,32 +502,44 @@ def benchmark_student_run(
     device_results = []
     for batch_size in batch_sizes:
         pf(f"  --- batch_size={batch_size} ---")
-        result = benchmark_model_inference(
-            model=student_model,
-            enc_arr=normalized_input,
-            seq_len=seq_len,
-            n_out=n_out,
-            batch_size=batch_size,
-            n_warmup=n_warmup,
-            n_repeat=n_repeat,
-            device_str=device_str,
-            input_mode="list",
-            pf=pf,
-        )
-        device_results.append(result)
+        try:
+            result = benchmark_model_inference(
+                model=student_model,
+                enc_arr=normalized_input,
+                seq_len=seq_len,
+                n_out=n_out,
+                batch_size=batch_size,
+                n_warmup=n_warmup,
+                n_repeat=n_repeat,
+                device_str=device_str,
+                input_mode="list",
+                max_chunk_size=max_chunk_size,
+                pf=pf,
+            )
+            device_results.append(result)
+        except Exception as exc:
+            pf(f"  ERROR benchmarking batch_size={batch_size} on {device_str}: {exc}")
+            import traceback
+            traceback.print_exc()
+            device_results.append({
+                "device_str": device_str,
+                "batch_size": int(batch_size),
+                "error": str(exc),
+                "is_full_frame_500x500": bool(batch_size == FPGA_FRAME_PIXELS_500X500),
+            })
         sys.stdout.flush()
 
-    timing_data["run_dir"] = run_dir
-    timing_data["student_units"] = student_units
-    timing_data["bits_kernel"] = bits_kernel
-    timing_data["bits_recurrent"] = bits_recurrent
-    timing_data["bits_bias"] = bits_bias
-    timing_data["bits_activation"] = bits_activation
-    timing_data["bits_state"] = bits_state
-    timing_data["results"][device] = device_results
+        timing_data["run_dir"] = run_dir
+        timing_data["student_units"] = student_units
+        timing_data["bits_kernel"] = bits_kernel
+        timing_data["bits_recurrent"] = bits_recurrent
+        timing_data["bits_bias"] = bits_bias
+        timing_data["bits_activation"] = bits_activation
+        timing_data["bits_state"] = bits_state
+        timing_data["results"][device] = device_results
+        with open(timing_path, "w") as f:
+            json.dump(timing_data, f, indent=2)
 
-    with open(timing_path, "w") as f:
-        json.dump(timing_data, f, indent=2)
     pf(f"  timing_benchmark.json saved: {timing_path}")
     sys.stdout.flush()
 
@@ -502,13 +555,15 @@ def main():
 
     pf("=" * 70)
     pf("bench_student_timing.py — CPU/GPU inference timing for vanilla KD student models")
-    pf(f"  data-dir     : {args.data_dir}")
-    pf(f"  results-dir  : {args.results_dir}")
-    pf(f"  device       : {args.device}")
-    pf(f"  batch-sizes  : {args.batch_sizes}")
-    pf(f"  n-warmup     : {args.n_warmup}")
-    pf(f"  n-repeat     : {args.n_repeat}")
-    pf(f"  overwrite    : {args.overwrite}")
+    pf(f"  data-dir         : {args.data_dir}")
+    pf(f"  results-dir      : {args.results_dir}")
+    pf(f"  student-run-dir  : {args.student_run_dir}")
+    pf(f"  device           : {args.device}")
+    pf(f"  batch-sizes      : {args.batch_sizes}")
+    pf(f"  max-chunk-size   : {args.max_chunk_size}")
+    pf(f"  n-warmup         : {args.n_warmup}")
+    pf(f"  n-repeat         : {args.n_repeat}")
+    pf(f"  overwrite        : {args.overwrite}")
     pf("=" * 70)
     sys.stdout.flush()
 
@@ -538,15 +593,32 @@ def main():
     pf(f"  N={normalized_input.shape[0]:,} seq_len={args.seq_len} n_out={args.n_out}")
     sys.stdout.flush()
 
-    pf(f"Discovering vanilla_kd student run directories under: {args.results_dir}")
-    run_dirs = find_student_run_dirs(args.results_dir)
-    if not run_dirs:
-        pf("ERROR: No vanilla_kd* directories with student_best.weights.h5 + student_args.json found.")
-        sys.exit(1)
-    pf(f"Found {len(run_dirs)} vanilla_kd student run(s):")
-    for d in run_dirs:
-        pf(f"  {d}")
-    sys.stdout.flush()
+    if args.student_run_dir:
+        run_dir_resolved = os.path.abspath(args.student_run_dir)
+        if not os.path.isdir(run_dir_resolved):
+            pf(f"ERROR: --student-run-dir does not exist or is not a directory: {run_dir_resolved}")
+            sys.exit(1)
+        ckpt_check_path = os.path.join(run_dir_resolved, "student_best.weights.h5")
+        args_check_path = os.path.join(run_dir_resolved, "student_args.json")
+        if not os.path.exists(ckpt_check_path):
+            pf(f"ERROR: student_best.weights.h5 not found in --student-run-dir: {run_dir_resolved}")
+            sys.exit(1)
+        if not os.path.exists(args_check_path):
+            pf(f"ERROR: student_args.json not found in --student-run-dir: {run_dir_resolved}")
+            sys.exit(1)
+        run_dirs = [run_dir_resolved]
+        pf(f"Using explicit --student-run-dir (single selected model, no ablation scan): {run_dir_resolved}")
+        sys.stdout.flush()
+    else:
+        pf(f"Discovering vanilla_kd student run directories under: {args.results_dir}")
+        run_dirs = find_student_run_dirs(args.results_dir)
+        if not run_dirs:
+            pf("ERROR: No vanilla_kd* directories with student_best.weights.h5 + student_args.json found.")
+            sys.exit(1)
+        pf(f"Found {len(run_dirs)} vanilla_kd student run(s):")
+        for d in run_dirs:
+            pf(f"  {d}")
+        sys.stdout.flush()
 
     t_total = time.time()
     for idx, run_dir in enumerate(run_dirs, 1):
@@ -566,6 +638,7 @@ def main():
                 n_repeat=args.n_repeat,
                 device=args.device,
                 device_str=device_str,
+                max_chunk_size=args.max_chunk_size,
                 overwrite=args.overwrite,
                 pf=pf,
             )
