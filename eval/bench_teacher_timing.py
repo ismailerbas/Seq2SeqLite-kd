@@ -88,7 +88,15 @@ import numpy as np
 
 import tensorflow as tf
 import tensorflow.keras as keras
-
+# ==============================================================================
+# FPGA full-frame reference constant.
+# The FPGA paper (On-sensor Intelligence for Real-Time Biomedical Inference)
+# reports all full-frame execution times for a 500x500-pixel SwissSPAD3 frame,
+# i.e. 250,000 spatial pixels processed per frame. This constant is always
+# appended to the benchmarked batch sizes so CPU/GPU timing is directly
+# comparable to the FPGA full-frame numbers reported in that paper.
+# ==============================================================================
+FPGA_FRAME_PIXELS_500X500 = 500 * 500
 # ==============================================================================
 # Argument parsing
 # ==============================================================================
@@ -108,8 +116,11 @@ def parse_args():
                    help="Default teacher GRU hidden units (overridden by teacher_args.json if found).")
     p.add_argument("--teacher-layers", type=int, default=2,
                    help="Default teacher GRU layers (overridden by teacher_args.json if found).")
-    p.add_argument("--batch-sizes", type=str, default="1,8,32,128,1024,8192",
-                   help="Comma-separated list of batch sizes to benchmark.")
+    p.add_argument("--batch-sizes", type=str,
+                   default=f"1,8,32,128,1024,8192,{FPGA_FRAME_PIXELS_500X500}",
+                   help="Comma-separated list of batch sizes to benchmark. "
+                        f"{FPGA_FRAME_PIXELS_500X500} (500x500 pixels) is the FPGA "
+                        "paper's full-frame reference size and is included by default.")
     p.add_argument("--n-warmup", type=int, default=10,
                    help="Number of warmup iterations before timing (per batch size).")
     p.add_argument("--n-repeat", type=int, default=50,
@@ -121,7 +132,6 @@ def parse_args():
                    help="Re-benchmark and overwrite the entry for --device if it already "
                         "exists in timing_benchmark.json.")
     return p.parse_args()
-
 # ==============================================================================
 # GPU setup
 # ==============================================================================
@@ -316,10 +326,16 @@ def benchmark_model_inference(
     device given by `device_str` (e.g. "/CPU:0" or "/GPU:0").
 
     input_mode : "dict" for teacher_model({"encinput":..., "decinput":...})
+                 "list" for student_model([enc_b, dec_b])
 
     Uses a single fixed batch of real data (the first `batch_size` rows of
     enc_arr) for every warmup and timed iteration so that timing measures
     pure model forward-pass latency, not data-loading overhead.
+
+    When batch_size equals FPGA_FRAME_PIXELS_500X500 (250,000), the result
+    is flagged with is_full_frame_500x500=True so it can be directly
+    compared against the FPGA paper's full-frame (500x500-pixel SwissSPAD3
+    frame) execution-time figures.
     """
     n_available = len(enc_arr)
     actual_batch = min(batch_size, n_available)
@@ -365,6 +381,7 @@ def benchmark_model_inference(
     min_s = float(np.min(elapsed_arr))
     max_s = float(np.max(elapsed_arr))
     throughput = float(actual_batch / mean_s) if mean_s > 0 else 0.0
+    is_full_frame = bool(actual_batch == FPGA_FRAME_PIXELS_500X500)
 
     result = {
         "device_str": device_str,
@@ -378,15 +395,24 @@ def benchmark_model_inference(
         "min_ms": min_s * 1000.0,
         "max_ms": max_s * 1000.0,
         "throughput_samples_per_sec": throughput,
+        "is_full_frame_500x500": is_full_frame,
     }
-    pf(
-        f"  {device_str}: mean={result['mean_ms']:.3f}ms "
-        f"std={result['std_ms']:.3f}ms median={result['median_ms']:.3f}ms "
-        f"p95={result['p95_ms']:.3f}ms throughput={throughput:.1f} samples/s"
-    )
+    if is_full_frame:
+        pf(
+            f"  {device_str}: [FULL-FRAME 500x500] mean={result['mean_ms']:.3f}ms "
+            f"std={result['std_ms']:.3f}ms median={result['median_ms']:.3f}ms "
+            f"p95={result['p95_ms']:.3f}ms throughput={throughput:.1f} samples/s "
+            f"— compare against FPGA paper's ~210ms full-frame figure"
+        )
+    else:
+        pf(
+            f"  {device_str}: mean={result['mean_ms']:.3f}ms "
+            f"std={result['std_ms']:.3f}ms median={result['median_ms']:.3f}ms "
+            f"p95={result['p95_ms']:.3f}ms throughput={throughput:.1f} samples/s"
+        )
     return result
 
-# ==============================================================================
+#  ==============================================================================
 # Benchmark one teacher run directory
 # ==============================================================================
 
