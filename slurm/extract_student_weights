@@ -1,0 +1,161 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+# ============================================================================
+# extract_student_weights — Extract QKeras Seq2SeqLite student weights into
+# int8 arrays and a C header for Vitis HLS.
+# Loads a single student_best.weights.h5 checkpoint (rebuilt via the exact
+# build_student architecture from train_student_vanilla_kd.py), splits each
+# QGRU kernel/recurrent_kernel/bias into [z, r, h] gates, quantizes to int8
+# using quantized_bits(bits, 0, 1, alpha=1.0), and writes:
+#   student_weights_int8.h      (Vitis HLS header, static const int8 arrays)
+#   student_weights_fp32.npz    (pre-split float32 tensors, for cross-checking)
+#   student_weights_int8.npz    (post-split int8 tensors)
+#   extraction_report.json      (per-tensor shape/bits/min/max/saturation)
+#
+# CPU-only job -- no GPU is requested or used.
+#
+# Positional args:
+#   $1  WEIGHTS_H5        (required) path to student_best.weights.h5
+#   $2  STUDENT_ARGS_JSON (required) path to student_args.json saved alongside it
+#   $3  OUT_DIR           (required) output directory for extracted files
+#   $4  SEQ_LEN           (optional, default 135)
+#   $5  N_OUT             (optional, default 3)
+#
+# Example:
+#   sbatch --job-name=extract_student_weights slurm/extract_student_weights \
+#       /gpfs/u/scratch/HBNN/HBNNrbss/nmi/results/vanilla_kd_T4.0_a0.7_b8k8r8a8_gru32x1_dense3_effbs16384_microbs16384_lr1e-03/student_best.weights.h5 \
+#       /gpfs/u/scratch/HBNN/HBNNrbss/nmi/results/vanilla_kd_T4.0_a0.7_b8k8r8a8_gru32x1_dense3_effbs16384_microbs16384_lr1e-03/student_args.json \
+#       /gpfs/u/scratch/HBNN/HBNNrbss/nmi/hls_weights \
+#       135 3
+# ============================================================================
+
+WEIGHTS_H5=${1}
+STUDENT_ARGS_JSON=${2}
+OUT_DIR=${3}
+SEQ_LEN=${4:-135}
+N_OUT=${5:-3}
+
+if [ -z "${WEIGHTS_H5}" ] || [ -z "${STUDENT_ARGS_JSON}" ] || [ -z "${OUT_DIR}" ]; then
+    echo "FATAL: missing required positional args."
+    echo "Usage: sbatch --job-name=extract_student_weights slurm/extract_student_weights <weights_h5> <student_args_json> <out_dir> [seq_len] [n_out]"
+    exit 1
+fi
+
+# ============================================================================
+# STEP 1 — modules
+# ============================================================================
+module purge
+module load gcc/9.3.0/1
+
+# ============================================================================
+# STEP 2 — activate conda
+# ============================================================================
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+# ============================================================================
+# STEP 3 — THE FIX
+# ============================================================================
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH}"
+
+# ============================================================================
+# STEP 4 — force CPU-only (no GPU needed for weight extraction)
+# ============================================================================
+export CUDA_VISIBLE_DEVICES=""
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=4
+export MKL_NUM_THREADS=4
+export OPENBLAS_NUM_THREADS=4
+
+# --- Paths ---
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+# --- Scratch / cache dirs ---
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+mkdir -p "${TMPDIR}" "${PIP_CACHE_DIR}" "${MPLCONFIGDIR}" "${XDG_CACHE_HOME}" "${OUT_DIR}"
+
+# --- Log ---
+echo "============================================================"
+echo "EXTRACT STUDENT WEIGHTS — int8 export for Vitis HLS"
+echo "============================================================"
+echo "SLURM JOB ID        : ${SLURM_JOBID}"
+echo "SLURM JOB NAME       : ${SLURM_JOB_NAME}"
+echo "NODE                 : $(hostname)"
+echo "LD_LIBRARY_PATH       : ${LD_LIBRARY_PATH}"
+echo "WEIGHTS_H5            : ${WEIGHTS_H5}"
+echo "STUDENT_ARGS_JSON     : ${STUDENT_ARGS_JSON}"
+echo "OUT_DIR               : ${OUT_DIR}"
+echo "SEQ_LEN               : ${SEQ_LEN}"
+echo "N_OUT                 : ${N_OUT}"
+echo "SCRIPT_DIR            : ${SCRIPT_DIR}"
+echo "PYTHON                : $(which python)"
+echo "TF VERSION            : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "QKERAS VERSION        : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null)"
+echo "NUMPY VERSION         : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+echo "============================================================"
+
+if [ ! -f "${WEIGHTS_H5}" ]; then
+    echo "FATAL: WEIGHTS_H5 does not exist: ${WEIGHTS_H5}"
+    exit 1
+fi
+
+if [ ! -f "${STUDENT_ARGS_JSON}" ]; then
+    echo "FATAL: STUDENT_ARGS_JSON does not exist: ${STUDENT_ARGS_JSON}"
+    exit 1
+fi
+
+if [ ! -f "${SCRIPT_DIR}/extract_student_weights.py" ]; then
+    echo "FATAL: extract_student_weights.py not found in ${SCRIPT_DIR}/"
+    exit 1
+fi
+
+echo "extract_student_weights.py found."
+echo "Starting extraction..."
+echo "============================================================"
+
+# ============================================================================
+# Launch extraction (foreground)
+# ============================================================================
+python "${SCRIPT_DIR}/extract_student_weights.py" \
+    --weights-h5    "${WEIGHTS_H5}" \
+    --student-args  "${STUDENT_ARGS_JSON}" \
+    --out-dir       "${OUT_DIR}" \
+    --seq-len       "${SEQ_LEN}" \
+    --n-out         "${N_OUT}"
+
+EXIT_CODE=$?
+
+echo "============================================================"
+echo "Extraction Exit Code: ${EXIT_CODE}"
+if [ ${EXIT_CODE} -eq 0 ]; then
+    echo "Extraction completed successfully."
+    echo "Files written to: ${OUT_DIR}"
+    echo "  $(ls -la "${OUT_DIR}" 2>/dev/null)"
+else
+    echo "FAILED (exit code: ${EXIT_CODE})"
+    echo "Check: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+    echo "  grep -i 'error\|traceback\|valueerror\|assertionerror' \\"
+    echo "       slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err | head -40"
+fi
+echo "============================================================"
+echo "Log files:"
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+echo "============================================================"
+
+exit ${EXIT_CODE}

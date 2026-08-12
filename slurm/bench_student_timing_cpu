@@ -37,6 +37,10 @@ OVERWRITE_ARG=""
 if [ "${5}" = "overwrite" ]; then
     OVERWRITE_ARG="--overwrite"
 fi
+STUDENT_RUN_DIR_ARG=""
+if [ -n "${6}" ]; then
+    STUDENT_RUN_DIR_ARG="--student-run-dir ${6}"
+fi
 
 # ============================================================================
 # STEP 1 — modules
@@ -130,8 +134,8 @@ python "${SCRIPT_DIR}/eval/bench_student_timing.py" \
     --n-warmup "${N_WARMUP}" \
     --n-repeat "${N_REPEAT}" \
     --device cpu \
-    ${OVERWRITE_ARG}
-
+    ${OVERWRITE_ARG} \
+    ${STUDENT_RUN_DIR_ARG}
 EXIT_CODE=$?
 
 echo "============================================================"

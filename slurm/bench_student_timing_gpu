@@ -29,12 +29,16 @@
 # ============================================================================
 
 SEQ_LEN=${1:-135}
-BATCH_SIZES=${2:-"1,8,32,128,1024,8192"}
+BATCH_SIZES=${2:-"1,8,32,128,1024,8192,250000"}
 N_WARMUP=${3:-10}
 N_REPEAT=${4:-50}
 OVERWRITE_ARG=""
 if [ "${5}" = "overwrite" ]; then
     OVERWRITE_ARG="--overwrite"
+fi
+STUDENT_RUN_DIR_ARG=""
+if [ -n "${6}" ]; then
+    STUDENT_RUN_DIR_ARG="--student-run-dir ${6}"
 fi
 
 # ============================================================================
@@ -142,8 +146,8 @@ python "${SCRIPT_DIR}/eval/bench_student_timing.py" \
     --n-warmup "${N_WARMUP}" \
     --n-repeat "${N_REPEAT}" \
     --device gpu \
-    ${OVERWRITE_ARG}
-
+    ${OVERWRITE_ARG} \
+    ${STUDENT_RUN_DIR_ARG}
 EXIT_CODE=$?
 
 echo "============================================================"
