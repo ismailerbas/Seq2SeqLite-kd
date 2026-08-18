@@ -1,0 +1,438 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=06:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -u
+
+# ============================================================================
+# analyze_memoq_deadzone — post-hoc hidden-state resolution diagnostics for the
+# exact MemoQ paper run identified by the saved P2D/P2E/P2F/P3 metrics.
+#
+# This job is inference-only. It does not modify or retrain any checkpoint.
+# It analyzes the exact paper checkpoints:
+#   stage2d_best.weights.h5
+#   stage2e_best.weights.h5
+#   stage2f_best.weights.h5
+#
+# Python performs a reconstruction fidelity guard before accepting results:
+# recomputed raw-sequence MAE must match each saved test_metrics_<PHASE>.json
+# within 5e-5. Any mismatch exits non-zero and no completion flag is written.
+#
+# Outputs:
+#   <RUN_DIR>/deadzone_analysis/deadzone_summary.json
+#   <RUN_DIR>/deadzone_analysis/deadzone_summary.csv
+#   <RUN_DIR>/deadzone_analysis/deadzone_per_unit.csv
+#   <RUN_DIR>/deadzone_analysis/deadzone_per_sequence.npz
+#   <RUN_DIR>/deadzone_analysis/deadzone_update_histogram.csv
+#   <RUN_DIR>/deadzone_analysis/deadzone_update_cdf_full.png
+#   <RUN_DIR>/deadzone_analysis/deadzone_update_cdf_zoom.png
+#   <RUN_DIR>/deadzone_analysis/deadzone_dead_fraction_per_unit.png
+#   <RUN_DIR>/deadzone_analysis/deadzone_same_bin_fraction_per_unit.png
+#   <RUN_DIR>/deadzone_analysis/deadzone_summary_percent.png
+#   <RUN_DIR>/deadzone_analysis/deadzone_manifest.json
+#   <RUN_DIR>/deadzone_analysis/deadzone_complete.flag
+#
+# Submit from the repository root with:
+#   sbatch --job-name=memoq_deadzone_paper slurm/analyze_memoq_deadzone
+# ============================================================================
+
+
+# ============================================================================
+# STEP 1 — modules
+# ============================================================================
+
+module purge
+module load gcc/9.3.0/1
+
+
+# ============================================================================
+# STEP 2 — activate conda
+# ============================================================================
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+
+# ============================================================================
+# STEP 3 — cuDNN library path
+# ============================================================================
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+
+# ============================================================================
+# STEP 4 — GPU / TF settings
+# ============================================================================
+
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+
+# ============================================================================
+# Exact repository/data/run paths
+# ============================================================================
+
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+
+SCRIPT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+RUN_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi/bozukolanveyamemoq/memoq_b4k4r4a4s4_gru32_dense3_effbs1024_microbs1024_lr1e-04_p1-40_2a30_2b30_2c10_p3-170p2fcalismadipapericinkullan"
+
+OUT_DIR="${RUN_DIR}/deadzone_analysis"
+
+PYTHON_SCRIPT="${SCRIPT_DIR}/eval/analyze_memoq_deadzone.py"
+
+TRAIN_MEMOQ_SCRIPT="${SCRIPT_DIR}/train_student_memoq.py"
+
+ANALYSIS_REL_PATH="eval/analyze_memoq_deadzone.py"
+
+SLURM_REL_PATH="slurm/analyze_memoq_deadzone"
+
+EXPECTED_TRAIN_MEMOQ_BLOB="71eee1eb022919558068891258250ec7658c6921"
+
+
+# ============================================================================
+# Exact analysis settings used for the paper diagnostic
+# ============================================================================
+
+INFER_BATCH=4096
+
+HIGH_Z_THRESHOLD=0.90
+
+BOOTSTRAP_REPS=2000
+
+BOOTSTRAP_SEED=42
+
+BOOTSTRAP_BATCH_REPS=32
+
+HIST_BINS=4096
+
+MAE_TOLERANCE=5e-5
+
+
+# ============================================================================
+# Scratch / cache directories
+# ============================================================================
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p \
+    "${TMPDIR}" \
+    "${PIP_CACHE_DIR}" \
+    "${MPLCONFIGDIR}" \
+    "${XDG_CACHE_HOME}" \
+    "${OUT_DIR}"
+
+
+# ============================================================================
+# Pre-flight checks
+# ============================================================================
+
+if [ ! -d "${SCRIPT_DIR}/.git" ]; then
+    echo "FATAL: Git repository not found at ${SCRIPT_DIR}"
+    exit 1
+fi
+
+
+if [ ! -f "${PYTHON_SCRIPT}" ]; then
+    echo "FATAL: analyze_memoq_deadzone.py not found: ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+
+if [ ! -f "${TRAIN_MEMOQ_SCRIPT}" ]; then
+    echo "FATAL: train_student_memoq.py not found: ${TRAIN_MEMOQ_SCRIPT}"
+    exit 1
+fi
+
+
+if [ ! -d "${DATA_PATH}" ]; then
+    echo "FATAL: DATA_PATH does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+
+if [ ! -d "${RUN_DIR}" ]; then
+    echo "FATAL: RUN_DIR does not exist: ${RUN_DIR}"
+    exit 1
+fi
+
+
+for REQUIRED_FILE in \
+    "student_args.json" \
+    "stage2d_best.weights.h5" \
+    "stage2e_best.weights.h5" \
+    "stage2f_best.weights.h5" \
+    "test_metrics_P2D.json" \
+    "test_metrics_P2E.json" \
+    "test_metrics_P2F.json"
+do
+    if [ ! -f "${RUN_DIR}/${REQUIRED_FILE}" ]; then
+        echo "FATAL: required paper-run file missing: ${RUN_DIR}/${REQUIRED_FILE}"
+        exit 1
+    fi
+done
+
+
+GIT_HEAD=$(git -C "${SCRIPT_DIR}" rev-parse HEAD 2>/dev/null)
+
+GIT_BRANCH=$(git -C "${SCRIPT_DIR}" branch --show-current 2>/dev/null)
+
+GIT_STATUS=$(git -C "${SCRIPT_DIR}" status --porcelain 2>/dev/null)
+
+
+if [ -z "${GIT_HEAD}" ]; then
+    echo "FATAL: could not determine git HEAD in ${SCRIPT_DIR}"
+    exit 1
+fi
+
+
+if [ "${GIT_BRANCH}" != "main" ]; then
+    echo "FATAL: expected git branch main, found: ${GIT_BRANCH}"
+    exit 1
+fi
+
+
+if ! git -C "${SCRIPT_DIR}" ls-files --error-unmatch "${ANALYSIS_REL_PATH}" >/dev/null 2>&1; then
+    echo "FATAL: ${ANALYSIS_REL_PATH} is not tracked by git."
+    echo "Commit the analysis files before submitting."
+    exit 1
+fi
+
+
+if ! git -C "${SCRIPT_DIR}" ls-files --error-unmatch "${SLURM_REL_PATH}" >/dev/null 2>&1; then
+    echo "FATAL: ${SLURM_REL_PATH} is not tracked by git."
+    echo "Commit the analysis files before submitting."
+    exit 1
+fi
+
+
+TRAIN_MEMOQ_BLOB=$(git -C "${SCRIPT_DIR}" hash-object "${TRAIN_MEMOQ_SCRIPT}" 2>/dev/null)
+
+
+if [ "${TRAIN_MEMOQ_BLOB}" != "${EXPECTED_TRAIN_MEMOQ_BLOB}" ]; then
+    echo "FATAL: train_student_memoq.py does not match the GitHub main source validated for this analysis."
+    echo "Expected blob: ${EXPECTED_TRAIN_MEMOQ_BLOB}"
+    echo "Actual blob  : ${TRAIN_MEMOQ_BLOB}"
+    exit 1
+fi
+
+
+# Slurm creates slurm-*.out/.err in the submit directory before this script
+# starts, and those files are not ignored by the repository. Therefore the
+# reproducibility guard checks tracked/staged diffs only and permits untracked
+# runtime log files.
+
+if ! git -C "${SCRIPT_DIR}" diff --quiet --ignore-submodules --; then
+    echo "FATAL: repository has uncommitted modifications to tracked files."
+    git -C "${SCRIPT_DIR}" diff --stat
+    exit 1
+fi
+
+
+if ! git -C "${SCRIPT_DIR}" diff --cached --quiet --ignore-submodules --; then
+    echo "FATAL: repository has staged but uncommitted changes."
+    git -C "${SCRIPT_DIR}" diff --cached --stat
+    exit 1
+fi
+
+
+# ============================================================================
+# Log header
+# ============================================================================
+
+echo "================================================================================"
+echo "MEMOQ DEAD-ZONE ANALYSIS — PAPER RUN"
+echo "================================================================================"
+
+echo "SLURM JOB ID         : ${SLURM_JOBID}"
+echo "SLURM JOB NAME       : ${SLURM_JOB_NAME}"
+echo "NODE                 : $(hostname)"
+
+echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES}"
+echo "LD_LIBRARY_PATH      : ${LD_LIBRARY_PATH}"
+
+echo "GPUs available       : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l)"
+
+echo "GPU names            : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | tr '\n' ',' | sed 's/,$//')"
+
+echo "SCRIPT DIR           : ${SCRIPT_DIR}"
+echo "PYTHON SCRIPT        : ${PYTHON_SCRIPT}"
+echo "TRAIN MEMOQ SCRIPT   : ${TRAIN_MEMOQ_SCRIPT}"
+echo "TRAIN MEMOQ BLOB     : ${TRAIN_MEMOQ_BLOB}"
+
+echo "DATA PATH            : ${DATA_PATH}"
+echo "RUN DIR              : ${RUN_DIR}"
+echo "OUT DIR              : ${OUT_DIR}"
+
+echo "GIT BRANCH           : ${GIT_BRANCH}"
+echo "GIT HEAD             : ${GIT_HEAD}"
+echo "GIT TRACKED STATUS   : clean"
+echo "GIT PORCELAIN        : ${GIT_STATUS:-clean}"
+
+echo "INFER BATCH          : ${INFER_BATCH}"
+echo "HIGH-Z THRESHOLD     : ${HIGH_Z_THRESHOLD}"
+echo "BOOTSTRAP REPS       : ${BOOTSTRAP_REPS}"
+echo "BOOTSTRAP SEED       : ${BOOTSTRAP_SEED}"
+echo "BOOTSTRAP BATCH REPS : ${BOOTSTRAP_BATCH_REPS}"
+echo "HIST BINS            : ${HIST_BINS}"
+echo "MAE TOLERANCE        : ${MAE_TOLERANCE}"
+
+echo "PYTHON               : $(which python)"
+
+echo "TF VERSION           : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+
+echo "QKERAS VERSION       : $(python -c 'import qkeras; print(getattr(qkeras, "__version__", "n/a"))' 2>/dev/null)"
+
+echo "NUMPY VERSION        : $(python -c 'import numpy as np; print(np.__version__)' 2>/dev/null)"
+
+echo "================================================================================"
+
+
+echo "Paper checkpoint timestamps:"
+
+stat -c '%y  %n' \
+    "${RUN_DIR}/stage2d_best.weights.h5" \
+    "${RUN_DIR}/stage2e_best.weights.h5" \
+    "${RUN_DIR}/stage2f_best.weights.h5"
+
+echo "================================================================================"
+
+
+# ============================================================================
+# GPU sanity check
+# ============================================================================
+
+GPU_CHECK=$(python -c "import tensorflow as tf; gpus=tf.config.list_physical_devices('GPU'); print(len(gpus))" 2>/dev/null)
+
+echo "TF physical GPUs found: ${GPU_CHECK}"
+
+
+if [ "${GPU_CHECK}" = "0" ] || [ -z "${GPU_CHECK}" ]; then
+    echo "FATAL: TensorFlow found 0 GPUs."
+    echo "Check LD_LIBRARY_PATH includes \$CONDA_PREFIX/lib"
+    echo "libcudnn.so.8 location:"
+
+    find "${CONDA_PREFIX}/lib" \
+        -name "libcudnn.so.8" \
+        2>/dev/null
+
+    exit 1
+fi
+
+
+# ============================================================================
+# Launch deterministic post-hoc analysis
+# ============================================================================
+
+echo "Starting MemoQ dead-zone analysis..."
+echo "================================================================================"
+
+
+python "${PYTHON_SCRIPT}" \
+    --run-dir "${RUN_DIR}" \
+    --data-dir "${DATA_PATH}" \
+    --out-dir "${OUT_DIR}" \
+    --phases P2D P2E P2F \
+    --infer-batch "${INFER_BATCH}" \
+    --high-z-threshold "${HIGH_Z_THRESHOLD}" \
+    --bootstrap-reps "${BOOTSTRAP_REPS}" \
+    --bootstrap-seed "${BOOTSTRAP_SEED}" \
+    --bootstrap-batch-reps "${BOOTSTRAP_BATCH_REPS}" \
+    --hist-bins "${HIST_BINS}" \
+    --mae-tolerance "${MAE_TOLERANCE}"
+
+
+EXIT_CODE=$?
+
+
+# ============================================================================
+# Final validation / summary
+# ============================================================================
+
+echo "================================================================================"
+
+echo "Dead-zone analysis exit code: ${EXIT_CODE}"
+
+
+if [ ${EXIT_CODE} -eq 0 ]; then
+
+    if [ ! -f "${OUT_DIR}/deadzone_complete.flag" ]; then
+        echo "FATAL: Python exited 0 but deadzone_complete.flag is missing."
+        exit 1
+    fi
+
+
+    if [ ! -f "${OUT_DIR}/deadzone_summary.csv" ]; then
+        echo "FATAL: Python exited 0 but deadzone_summary.csv is missing."
+        exit 1
+    fi
+
+
+    if [ ! -f "${OUT_DIR}/deadzone_summary.json" ]; then
+        echo "FATAL: Python exited 0 but deadzone_summary.json is missing."
+        exit 1
+    fi
+
+
+    echo "Analysis completed successfully."
+    echo "Results: ${OUT_DIR}"
+
+    echo ""
+    echo "deadzone_summary.csv:"
+
+    cat "${OUT_DIR}/deadzone_summary.csv"
+
+    echo ""
+    echo "Output files:"
+
+    ls -lh "${OUT_DIR}"
+
+else
+
+    echo "FAILED (exit code: ${EXIT_CODE})"
+
+    echo "Check:"
+    echo "  slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+
+    echo "Check:"
+    echo "  slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+
+    echo "Useful error search:"
+    echo "  grep -i 'error\|traceback\|runtimeerror\|valueerror\|fidelity' slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+
+fi
+
+
+echo "================================================================================"
+
+echo "Log files:"
+
+echo "  Out: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.out"
+echo "  Err: slurm-${SLURM_JOBID}_${SLURM_JOB_NAME}.err"
+
+echo "================================================================================"
+
+
+exit ${EXIT_CODE}
