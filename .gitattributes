@@ -1,0 +1,3 @@
+slurm/analyze_memoq_deadzone text eol=lf
+.gitattributes text eol=lf
+eval/analyze_memoq_deadzone.py text eol=lf

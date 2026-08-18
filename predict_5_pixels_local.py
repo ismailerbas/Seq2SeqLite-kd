@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-predict_5_pixels_local.py -- Pure NumPy replica of the student GRU seq2seq
-model, using the FAKE-QUANTIZED float32 weights and the CONFIRMED-CORRECT
-0.5-slope QKeras hard_sigmoid (verified via inspect.getsource on the real
-installed QGRUCell), run on all 5 experimental pixels. Computes both the
-raw decay predictions and the extracted lifetimes (tau1, tau2, fret) for
-each pixel, and compares both against the real ground truth files.
+predict_5_pixels_real_model.py -- Run the ACTUAL trained QKeras model
+(real TensorFlow + real QKeras) on all 5 experimental pixels, compute
+both the raw decay predictions and extracted lifetimes (tau1, tau2, fret)
+for each, and compare against the real ground truth files.
 
-No TensorFlow, no QKeras required -- only numpy.
+Requires: tensorflow (2.10.x), qkeras, numpy.
 
 EDIT THE PATHS BELOW to match your actual files before running.
 """
@@ -15,61 +13,50 @@ EDIT THE PATHS BELOW to match your actual files before running.
 import numpy as np
 import os
 import sys
+import tensorflow as tf
+from qkeras import QDense, QGRU, quantized_bits, quantized_tanh
 
 # ============================================================================
 # EDIT THESE PATHS
 # ============================================================================
-NPZ_PATH = r"D:\ismail\IBM\s2slitekd\hls_seq2seqlite\student_weights_fp32.npz"
+WEIGHTS_H5_PATH = r"D:\ismail\IBM\s2slitekd\hls_seq2seqlite\student_final.weights.h5"
 CSV_DIR = r"E:\ismail\IBM\nminewmodel\vitis"
 NUM_PIXELS = 5
 # ============================================================================
 
 UNITS = 32
+BITS = 8
 BASELINE_BINS = 10
 SEQ_LEN = 135
 GATE_WIDTH_NS = 0.09
 
 
-def hard_sigmoid(x):
-    # CONFIRMED via inspect.getsource(cell.recurrent_activation) on a real
-    # instantiated QGRUCell: QKeras's own hard_sigmoid, slope 0.5, NOT the
-    # standard tf.keras.backend hard_sigmoid (slope 0.2).
-    return np.clip(0.5 * x + 0.5, 0.0, 1.0)
+def qwk(): return quantized_bits(BITS, 0, 1, alpha=1.0)
+def qwr(): return quantized_bits(BITS, 0, 1, alpha=1.0)
+def qwb(): return quantized_bits(BITS, 0, 1, alpha=1.0)
+def qa(): return quantized_tanh(bits=BITS, symmetric=True)
+def qs(): return quantized_bits(BITS, 0, 1, alpha=1.0)
+def qd(): return quantized_bits(BITS, 0)
 
 
-def gru_forward(x_seq, kernel, recurrent_kernel, bias, units, init_state):
-    T = x_seq.shape[0]
-    h = init_state.copy()
-    outputs = np.zeros((T, units), dtype=np.float32)
-
-    Wz = kernel[:, 0 * units:1 * units]
-    Wr = kernel[:, 1 * units:2 * units]
-    Wh = kernel[:, 2 * units:3 * units]
-    Uz = recurrent_kernel[:, 0 * units:1 * units]
-    Ur = recurrent_kernel[:, 1 * units:2 * units]
-    Uh = recurrent_kernel[:, 2 * units:3 * units]
-    bz = bias[0 * units:1 * units]
-    br = bias[1 * units:2 * units]
-    bh = bias[2 * units:3 * units]
-
-    for t in range(T):
-        x = x_seq[t]
-        x_z = x @ Wz + bz
-        x_r = x @ Wr + br
-        x_h = x @ Wh + bh
-        rec_z = h @ Uz
-        rec_r = h @ Ur
-        z = hard_sigmoid(x_z + rec_z)
-        r = hard_sigmoid(x_r + rec_r)
-        rec_h = (r * h) @ Uh
-        # quantized_tanh reduces algebraically to clip(x,-1,1) when
-        # use_real_tanh=False (default, never overridden) -- confirmed
-        # earlier this session via inspect.getsource(quantized_tanh.__call__).
-        hh = np.clip(x_h + rec_h, -1.0, 1.0)
-        h = z * h + (1 - z) * hh
-        outputs[t] = h
-
-    return outputs, h
+def build_model():
+    enc_in = tf.keras.Input(shape=(None, 1), name="senc_input")
+    dec_in = tf.keras.Input(shape=(None, 1), name="sdec_input")
+    senc_out, senc_state = QGRU(
+        units=UNITS, activation=qa(), kernel_quantizer=qwk(),
+        recurrent_quantizer=qwr(), bias_quantizer=qwb(), state_quantizer=qs(),
+        return_state=True, name="sencgru",
+    )(enc_in)
+    sdec_hid, _ = QGRU(
+        units=UNITS, activation=qa(), kernel_quantizer=qwk(),
+        recurrent_quantizer=qwr(), bias_quantizer=qwb(), state_quantizer=qs(),
+        return_sequences=True, return_state=True, name="sdecgru",
+    )(dec_in, initial_state=senc_state)
+    out = QDense(
+        3, kernel_quantizer=qd(), bias_quantizer=qd(), activation="linear",
+        name="sdec_dense",
+    )(sdec_hid)
+    return tf.keras.Model(inputs=[enc_in, dec_in], outputs=out)
 
 
 def preprocess_pixel(raw):
@@ -81,13 +68,13 @@ def preprocess_pixel(raw):
 
 
 def extract_lifetimes(preds):
-    # preds: (SEQ_LEN, 3). channel 0 = full decay, 1 = short, 2 = long.
-    # Replicates extract_lifetimes() from eval_experimental.py exactly.
-    t = np.arange(SEQ_LEN, dtype=np.float64) * GATE_WIDTH_NS
+    h = GATE_WIDTH_NS
     ch1 = preds[:, 1].astype(np.float64)
     ch2 = preds[:, 2].astype(np.float64)
-    int1 = np.trapz(ch1, t)
-    int2 = np.trapz(ch2, t)
+
+    int1 = h * (0.5 * ch1[0] + ch1[1:-1].sum() + 0.5 * ch1[-1])
+    int2 = h * (0.5 * ch2[0] + ch2[1:-1].sum() + 0.5 * ch2[-1])
+
     amp1 = ch1[0]
     amp2 = ch2[0]
     tau1 = (int1 / amp1) if amp1 > 1e-6 else 0.0
@@ -97,7 +84,7 @@ def extract_lifetimes(preds):
     return tau1, tau2, fret
 
 
-def run_one_pixel(idx, data):
+def run_one_pixel(idx, model):
     raw_path = os.path.join(CSV_DIR, f"raw_pixel_{idx}.csv")
     expected_path = os.path.join(CSV_DIR, f"expected_out_{idx}.csv")
 
@@ -115,27 +102,11 @@ def run_one_pixel(idx, data):
         return None
 
     norm, baseline, max_val = preprocess_pixel(raw)
-    enc_input = norm.reshape(-1, 1).astype(np.float32)
-
-    enc_kernel = data["sencgru_kernel_fq"]
-    enc_recurrent = data["sencgru_recurrent_kernel_fq"]
-    enc_bias = data["sencgru_bias_fq"]
-    _, h_enc_final = gru_forward(
-        enc_input, enc_kernel, enc_recurrent, enc_bias, UNITS,
-        np.zeros(UNITS, dtype=np.float32)
-    )
-
-    dec_kernel = data["sdecgru_kernel_fq"]
-    dec_recurrent = data["sdecgru_recurrent_kernel_fq"]
-    dec_bias = data["sdecgru_bias_fq"]
+    enc_input = norm.reshape(1, -1, 1)
     dec_input = np.zeros_like(enc_input)
-    dec_hidden_seq, _ = gru_forward(
-        dec_input, dec_kernel, dec_recurrent, dec_bias, UNITS, h_enc_final
-    )
 
-    dense_kernel = data["sdec_dense_kernel_fq"]
-    dense_bias = data["sdec_dense_bias_fq"]
-    preds = dec_hidden_seq @ dense_kernel + dense_bias
+    pred = model({"senc_input": enc_input, "sdec_input": dec_input}, training=False)
+    pred = pred.numpy()[0]
 
     expected = np.loadtxt(expected_path, delimiter=",")
     if expected.shape[0] != SEQ_LEN:
@@ -143,19 +114,18 @@ def run_one_pixel(idx, data):
               f"expected {SEQ_LEN}. Skipping.")
         return None
 
-    decay_diff = np.abs(preds - expected)
+    decay_diff = np.abs(pred - expected)
     max_decay_err = decay_diff.max()
     max_decay_err_loc = np.unravel_index(np.argmax(decay_diff), decay_diff.shape)
 
-    tau1_pred, tau2_pred, fret_pred = extract_lifetimes(preds)
+    tau1_pred, tau2_pred, fret_pred = extract_lifetimes(pred)
     tau1_true, tau2_true, fret_true = extract_lifetimes(expected)
 
-    print(f"\n========== pixel_{idx} ==========")
+    print(f"\n========== pixel_{idx} (REAL TF/QKeras model) ==========")
     print(f"baseline={baseline:.6f}  max_val={max_val:.6f}")
-    print(f"tpsf_in[0..9]: {norm[:10]}")
     print(f"\nDecay predictions vs expected, t=0..5:")
     for t in range(6):
-        print(f"  t={t}  pred={preds[t]}  expected={expected[t]}")
+        print(f"  t={t}  pred={pred[t]}  expected={expected[t]}")
     print(f"\nMax abs decay error: {max_decay_err:.6f} at t={max_decay_err_loc[0]}, "
           f"channel={max_decay_err_loc[1]}")
     print(f"\nLifetimes:")
@@ -176,31 +146,23 @@ def run_one_pixel(idx, data):
 
 
 def main():
-    if not os.path.isfile(NPZ_PATH):
-        print(f"ERROR: NPZ_PATH not found: {NPZ_PATH}")
+    if not os.path.isfile(WEIGHTS_H5_PATH):
+        print(f"ERROR: WEIGHTS_H5_PATH not found: {WEIGHTS_H5_PATH}")
         sys.exit(1)
 
-    print(f"Loading weights from {NPZ_PATH}")
-    data = np.load(NPZ_PATH)
-
-    required_keys = [
-        "sencgru_kernel_fq", "sencgru_recurrent_kernel_fq", "sencgru_bias_fq",
-        "sdecgru_kernel_fq", "sdecgru_recurrent_kernel_fq", "sdecgru_bias_fq",
-        "sdec_dense_kernel_fq", "sdec_dense_bias_fq",
-    ]
-    missing = [k for k in required_keys if k not in data.files]
-    if missing:
-        print(f"ERROR: missing expected keys: {missing}")
-        print(f"Available keys: {list(data.files)}")
-        sys.exit(1)
+    print("Building model architecture...")
+    model = build_model()
+    print(f"Loading weights from {WEIGHTS_H5_PATH}")
+    model.load_weights(WEIGHTS_H5_PATH)
+    print("Weights loaded OK.")
 
     results = []
     for idx in range(1, NUM_PIXELS + 1):
-        r = run_one_pixel(idx, data)
+        r = run_one_pixel(idx, model)
         if r is not None:
             results.append(r)
 
-    print("\n\n========== SUMMARY ==========")
+    print("\n\n========== SUMMARY (REAL TF/QKeras model) ==========")
     print(f"{'pixel':<8}{'max_decay_err':<16}{'tau1_diff_ns':<15}"
           f"{'tau2_diff_ns':<15}{'fret_diff':<12}")
     for r in results:

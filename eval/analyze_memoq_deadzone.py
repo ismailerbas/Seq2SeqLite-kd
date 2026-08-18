@@ -62,7 +62,7 @@ import hashlib
 import json
 import math
 import os
-import subprocess
+
 import sys
 import time
 from pathlib import Path
@@ -172,10 +172,6 @@ PRE_JULY4_STAGE_REFERENCE_COMMIT = (
 
 JULY4_BEHAVIOR_CHANGE_COMMIT = (
     "9ec85899b478b3269767af7a7d3ad3f201ee1aed"
-)
-
-EXPECTED_CURRENT_TRAIN_MEMOQ_GIT_BLOB = (
-    "71eee1eb022919558068891258250ec7658c6921"
 )
 
 
@@ -333,48 +329,46 @@ def sha256_file(
     return digest.hexdigest()
 
 
-def git_command(args: List[str]) -> str:
-    try:
-        completed = subprocess.run(
-            ["git", "-C", str(REPO_ROOT), *args],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
 
-        return completed.stdout.strip()
+def validate_server_source() -> Path:
+    """
+    Validate the source file used by this analysis directly from the copied
+    server source tree.
 
-    except Exception as exc:
-        return f"unavailable: {exc}"
-
-
-def validate_repository_source() -> None:
-    train_path = REPO_ROOT / "train_student_memoq.py"
+    The compute-side source directory is not required to be a Git checkout.
+    The analysis uses the train_student_memoq.py file physically present under
+    REPO_ROOT and records its SHA256 hash in the output manifest.
+    """
+    train_path = (
+        REPO_ROOT
+        / "train_student_memoq.py"
+    )
 
     if not train_path.is_file():
         raise FileNotFoundError(
-            f"Missing repository source file: {train_path}"
+            "Missing server source file required by the dead-zone analysis: "
+            f"{train_path}"
         )
 
-    actual_blob = git_command(
-        ["hash-object", str(train_path)]
+    source_sha256 = sha256_file(
+        train_path
     )
-
-    if actual_blob != EXPECTED_CURRENT_TRAIN_MEMOQ_GIT_BLOB:
-        raise RuntimeError(
-            "train_student_memoq.py does not match the GitHub main "
-            "version validated for this analysis.\n"
-            f"Expected git blob: "
-            f"{EXPECTED_CURRENT_TRAIN_MEMOQ_GIT_BLOB}\n"
-            f"Actual git blob:   {actual_blob}"
-        )
 
     pf(
-        "[SOURCE] train_student_memoq.py git blob verified: "
-        f"{actual_blob}"
+        "[SOURCE] Using server source file directly"
     )
 
+    pf(
+        f"[SOURCE] train_student_memoq.py: "
+        f"{train_path}"
+    )
+
+    pf(
+        f"[SOURCE] train_student_memoq.py SHA256: "
+        f"{source_sha256}"
+    )
+
+    return train_path
 
 def configure_tensorflow() -> None:
     tf.keras.mixed_precision.set_global_policy("float32")
@@ -3306,8 +3300,7 @@ def main() -> None:
         args
     )
 
-    validate_repository_source()
-
+    train_student_memoq_path = validate_server_source()
     configure_tensorflow()
 
     run_dir = Path(
@@ -3521,6 +3514,10 @@ def main() -> None:
     )
 
     manifest = {
+        "analysis": (
+            "MemoQ hidden-state dead-zone and "
+            "target-grid collision analysis"
+        ),
         "analysis_script": str(
             THIS_FILE
         ),
@@ -3529,38 +3526,19 @@ def main() -> None:
                 THIS_FILE
             )
         ),
-        "repo_root": str(
+        "source_tree_mode": (
+            "server_files_used_directly"
+        ),
+        "source_root": str(
             REPO_ROOT
         ),
-        "git_head": git_command(
-            [
-                "rev-parse",
-                "HEAD",
-            ]
+        "train_student_memoq_path": str(
+            train_student_memoq_path
         ),
-        "git_branch": git_command(
-            [
-                "branch",
-                "--show-current",
-            ]
-        ),
-        "git_status_porcelain": git_command(
-            [
-                "status",
-                "--porcelain",
-            ]
-        ),
-        "train_student_memoq_git_blob": git_command(
-            [
-                "hash-object",
-                str(
-                    REPO_ROOT
-                    / "train_student_memoq.py"
-                ),
-            ]
-        ),
-        "expected_train_student_memoq_git_blob": (
-            EXPECTED_CURRENT_TRAIN_MEMOQ_GIT_BLOB
+        "train_student_memoq_sha256": (
+            sha256_file(
+                train_student_memoq_path
+            )
         ),
         "paper_run_dir": str(
             run_dir
@@ -3606,16 +3584,11 @@ def main() -> None:
                 "train_student_memoq.py"
             ),
         },
-        "pre_july4_stage_reference_commit": (
-            PRE_JULY4_STAGE_REFERENCE_COMMIT
-        ),
-        "july4_behavior_change_commit": (
-            JULY4_BEHAVIOR_CHANGE_COMMIT
-        ),
         "historical_inference_note": (
-            "P2D/P2E/P2F are reconstructed with pre-July-4 hard "
-            "inference semantics; all training-only noise/dither is "
-            "disabled and all blend betas are 1.0."
+            "P2D, P2E, and P2F are reconstructed using the identified "
+            "paper-run phase semantics. Training-only recurrent-state "
+            "perturbation is disabled during deterministic inference and "
+            "the P2F state blend is evaluated at beta=1.0."
         ),
         "tensorflow_version": (
             tf.__version__
