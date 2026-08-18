@@ -87,6 +87,7 @@ import matplotlib
 
 matplotlib.use("Agg")
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
@@ -104,6 +105,7 @@ if str(REPO_ROOT) not in sys.path:
 from train_student_memoq import (  # noqa: E402
     MemoQGRUCell,
     MemoQRNNUnroll,
+    build_phase2_model,
     find_data_files,
 )
 
@@ -615,13 +617,628 @@ def validate_paper_run(
 
     return saved_metrics
 
+def _decode_h5_text(value) -> str:
+    """
+    Decode Keras HDF5 attributes consistently across h5py versions.
+    """
+    if isinstance(value, bytes):
+        return value.decode("utf-8")
 
-def build_phase2_diagnostic_model(
+    if isinstance(value, np.bytes_):
+        return value.tobytes().decode("utf-8")
+
+    return str(value)
+
+
+def _leaf_weight_name(name: str) -> str:
+    """
+    Return only the final tensor name from a scoped Keras weight name.
+
+    Examples:
+        sencgru_unroll/memoq_enc_cell/W_z:0 -> W_z:0
+        sdec_dense/kernel:0                 -> kernel:0
+    """
+    return str(name).split("/")[-1]
+
+
+def _collect_hdf5_datasets(
+    group,
+) -> List[Dict]:
+    """
+    Recursively list every HDF5 dataset below a group.
+
+    This is used only for checkpoint inspection and diagnostics when a legacy
+    HDF5 layer does not expose an explicit weight_names attribute.
+    """
+    datasets = []
+
+    def visitor(name, obj):
+        if isinstance(
+            obj,
+            h5py.Dataset,
+        ):
+            datasets.append(
+                {
+                    "path": str(name),
+                    "shape": tuple(
+                        int(dim)
+                        for dim in obj.shape
+                    ),
+                    "dtype": str(
+                        obj.dtype
+                    ),
+                }
+            )
+
+    group.visititems(
+        visitor
+    )
+
+    datasets.sort(
+        key=lambda item: item[
+            "path"
+        ]
+    )
+
+    return datasets
+
+
+def _ordered_hdf5_layer_weights(
+    layer_group,
+) -> List[Dict]:
+    """
+    Return one HDF5 layer's weights in the exact order stored by Keras.
+
+    Keras HDF5 weight files store a weight_names attribute on each weighted
+    layer. model.load_weights(..., by_name=True) uses that order when assigning
+    tensors to a matching model layer.
+
+    When weight_names is absent, the function falls back to recursive dataset
+    enumeration so that the checkpoint layout can still be printed and
+    rejected explicitly if necessary.
+    """
+    if "weight_names" not in layer_group.attrs:
+        return _collect_hdf5_datasets(
+            layer_group
+        )
+
+    raw_weight_names = (
+        layer_group.attrs[
+            "weight_names"
+        ]
+    )
+
+    weight_names = [
+        _decode_h5_text(
+            name
+        )
+        for name in raw_weight_names
+    ]
+
+    weights = []
+
+    for weight_name in weight_names:
+        if weight_name not in layer_group:
+            raise RuntimeError(
+                "Keras HDF5 checkpoint declares weight "
+                f"{weight_name!r} in layer group "
+                f"{layer_group.name!r}, but that dataset cannot be found."
+            )
+
+        dataset = layer_group[
+            weight_name
+        ]
+
+        if not isinstance(
+            dataset,
+            h5py.Dataset,
+        ):
+            raise RuntimeError(
+                "Keras HDF5 checkpoint weight path is not a dataset: "
+                f"layer={layer_group.name!r}, "
+                f"weight={weight_name!r}"
+            )
+
+        weights.append(
+            {
+                "path": weight_name,
+                "leaf_name": (
+                    _leaf_weight_name(
+                        weight_name
+                    )
+                ),
+                "shape": tuple(
+                    int(dim)
+                    for dim in dataset.shape
+                ),
+                "dtype": str(
+                    dataset.dtype
+                ),
+            }
+        )
+
+    return weights
+
+
+def inspect_keras_hdf5_checkpoint(
+    checkpoint_path: Path,
+    pf,
+) -> Dict:
+    """
+    Inspect the actual Keras HDF5 checkpoint stored on the server.
+
+    No model assumptions are made here. The function reads the layer_names and
+    weight_names attributes that Keras itself wrote into the checkpoint and
+    returns the exact weighted-layer order and tensor shapes.
+
+    Both common Keras layouts are supported:
+        /<layer groups>
+        /model_weights/<layer groups>
+    """
+    checkpoint_path = Path(
+        checkpoint_path
+    ).resolve()
+
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Checkpoint does not exist: {checkpoint_path}"
+        )
+
+    with h5py.File(
+        checkpoint_path,
+        "r",
+    ) as handle:
+
+        if "layer_names" in handle.attrs:
+            weight_root = handle
+            root_name = "/"
+
+        elif (
+            "model_weights" in handle
+            and "layer_names"
+            in handle[
+                "model_weights"
+            ].attrs
+        ):
+            weight_root = handle[
+                "model_weights"
+            ]
+            root_name = (
+                "/model_weights"
+            )
+
+        else:
+            raise RuntimeError(
+                "Unsupported Keras HDF5 checkpoint layout. "
+                "No layer_names attribute was found at '/' or "
+                f"'/model_weights' in {checkpoint_path}"
+            )
+
+        raw_layer_names = (
+            weight_root.attrs[
+                "layer_names"
+            ]
+        )
+
+        all_layer_names = [
+            _decode_h5_text(
+                name
+            )
+            for name in raw_layer_names
+        ]
+
+        weighted_layer_order = []
+
+        weighted_layers = {}
+
+        for layer_name in all_layer_names:
+
+            if layer_name not in weight_root:
+                raise RuntimeError(
+                    "Keras HDF5 checkpoint declares layer "
+                    f"{layer_name!r}, but its group is missing "
+                    f"from {checkpoint_path}"
+                )
+
+            layer_group = (
+                weight_root[
+                    layer_name
+                ]
+            )
+
+            ordered_weights = (
+                _ordered_hdf5_layer_weights(
+                    layer_group
+                )
+            )
+
+            if not ordered_weights:
+                continue
+
+            weighted_layer_order.append(
+                layer_name
+            )
+
+            weighted_layers[
+                layer_name
+            ] = {
+                "weight_count": len(
+                    ordered_weights
+                ),
+                "weights": (
+                    ordered_weights
+                ),
+                "weight_leaf_names": [
+                    item.get(
+                        "leaf_name",
+                        _leaf_weight_name(
+                            item["path"]
+                        ),
+                    )
+                    for item
+                    in ordered_weights
+                ],
+                "shapes": [
+                    tuple(
+                        item[
+                            "shape"
+                        ]
+                    )
+                    for item
+                    in ordered_weights
+                ],
+            }
+
+    pf(
+        f"[CKPT] Checkpoint: "
+        f"{checkpoint_path}"
+    )
+
+    pf(
+        f"[CKPT] HDF5 weight root: "
+        f"{root_name}"
+    )
+
+    pf(
+        f"[CKPT] All Keras layers in file "
+        f"({len(all_layer_names)}): "
+        + ", ".join(
+            all_layer_names
+        )
+    )
+
+    pf(
+        f"[CKPT] Weighted layers "
+        f"({len(weighted_layer_order)}): "
+        + ", ".join(
+            weighted_layer_order
+        )
+    )
+
+    for layer_name in (
+        weighted_layer_order
+    ):
+        layer_info = (
+            weighted_layers[
+                layer_name
+            ]
+        )
+
+        pf(
+            f"[CKPT]   {layer_name}: "
+            f"weight_names="
+            f"{layer_info['weight_leaf_names']} "
+            f"shapes="
+            f"{layer_info['shapes']}"
+        )
+
+    return {
+        "checkpoint": str(
+            checkpoint_path
+        ),
+        "hdf5_weight_root": (
+            root_name
+        ),
+        "all_layer_names": (
+            all_layer_names
+        ),
+        "weighted_layer_order": (
+            weighted_layer_order
+        ),
+        "weighted_layers": (
+            weighted_layers
+        ),
+    }
+
+
+def _model_weight_layout(
+    model,
+) -> Dict[str, Dict]:
+    """
+    Return the model's weighted top-level layers in Keras assignment order.
+    """
+    layout = {}
+
+    for layer in model.layers:
+
+        if not layer.weights:
+            continue
+
+        weight_names = [
+            str(
+                weight.name
+            )
+            for weight
+            in layer.weights
+        ]
+
+        layout[
+            layer.name
+        ] = {
+            "weight_count": len(
+                layer.weights
+            ),
+            "weight_names": (
+                weight_names
+            ),
+            "weight_leaf_names": [
+                _leaf_weight_name(
+                    name
+                )
+                for name
+                in weight_names
+            ],
+            "shapes": [
+                tuple(
+                    int(dim)
+                    for dim
+                    in weight.shape
+                )
+                for weight
+                in layer.weights
+            ],
+        }
+
+    return layout
+
+
+def validate_checkpoint_model_weight_layout(
+    model,
+    checkpoint_layout: Dict,
+    pf,
+) -> None:
+    """
+    Validate every weighted layer required by the reconstructed model before
+    loading anything.
+
+    Extra weighted layers in the historical checkpoint are allowed because the
+    exact failure that motivated this loader is a legacy checkpoint containing
+    one more saved weighted layer than the current diagnostic graph.
+
+    Missing model layers, tensor-count differences, shape differences, and
+    differing leaf tensor names are NOT allowed.
+    """
+    model_layout = (
+        _model_weight_layout(
+            model
+        )
+    )
+
+    saved_layout = (
+        checkpoint_layout[
+            "weighted_layers"
+        ]
+    )
+
+    pf(
+        f"[MODEL] Weighted layers "
+        f"({len(model_layout)}): "
+        + ", ".join(
+            model_layout.keys()
+        )
+    )
+
+    for (
+        layer_name,
+        layer_info,
+    ) in model_layout.items():
+
+        pf(
+            f"[MODEL]   {layer_name}: "
+            f"weight_names="
+            f"{layer_info['weight_leaf_names']} "
+            f"shapes="
+            f"{layer_info['shapes']}"
+        )
+
+    problems = []
+
+    for (
+        layer_name,
+        model_info,
+    ) in model_layout.items():
+
+        if layer_name not in saved_layout:
+            problems.append(
+                "Required model layer is not present in checkpoint: "
+                f"{layer_name}"
+            )
+            continue
+
+        saved_info = (
+            saved_layout[
+                layer_name
+            ]
+        )
+
+        model_count = int(
+            model_info[
+                "weight_count"
+            ]
+        )
+
+        saved_count = int(
+            saved_info[
+                "weight_count"
+            ]
+        )
+
+        if model_count != saved_count:
+            problems.append(
+                f"Weight-count mismatch for {layer_name}: "
+                f"model={model_count}, checkpoint={saved_count}"
+            )
+            continue
+
+        model_shapes = [
+            tuple(
+                shape
+            )
+            for shape
+            in model_info[
+                "shapes"
+            ]
+        ]
+
+        saved_shapes = [
+            tuple(
+                shape
+            )
+            for shape
+            in saved_info[
+                "shapes"
+            ]
+        ]
+
+        if model_shapes != saved_shapes:
+            problems.append(
+                f"Ordered weight-shape mismatch for {layer_name}: "
+                f"model={model_shapes}, "
+                f"checkpoint={saved_shapes}"
+            )
+
+        model_leaf_names = [
+            str(
+                name
+            )
+            for name
+            in model_info[
+                "weight_leaf_names"
+            ]
+        ]
+
+        saved_leaf_names = [
+            str(
+                name
+            )
+            for name
+            in saved_info[
+                "weight_leaf_names"
+            ]
+        ]
+
+        if (
+            saved_leaf_names
+            and model_leaf_names
+            != saved_leaf_names
+        ):
+            problems.append(
+                f"Ordered weight-name mismatch for {layer_name}: "
+                f"model={model_leaf_names}, "
+                f"checkpoint={saved_leaf_names}"
+            )
+
+    if problems:
+        raise RuntimeError(
+            "Checkpoint/model compatibility validation failed:\n  "
+            + "\n  ".join(
+                problems
+            )
+        )
+
+    extra_layers = [
+        layer_name
+        for layer_name
+        in checkpoint_layout[
+            "weighted_layer_order"
+        ]
+        if layer_name
+        not in model_layout
+    ]
+
+    if extra_layers:
+        pf(
+            "[CKPT] Additional historical weighted layer(s) "
+            "not required by this reconstructed diagnostic graph: "
+            + ", ".join(
+                extra_layers
+            )
+        )
+
+    pf(
+        "[CKPT] Every weighted layer required by the reconstructed "
+        "diagnostic graph exists in the checkpoint with matching "
+        "tensor names, counts, and shapes."
+    )
+
+
+def load_phase2_checkpoint_by_name(
+    model,
+    checkpoint_path: Path,
+    checkpoint_layout: Dict,
+    phase: str,
+    pf,
+) -> None:
+    """
+    Load a historical Phase-2 checkpoint by exact Keras layer name.
+
+    by_name=True intentionally avoids the global topological layer-count check
+    that fails when a historical HDF5 checkpoint contains an additional saved
+    weighted layer.
+
+    skip_mismatch=False is mandatory. A matching layer is never silently
+    skipped because of an incompatible tensor count or shape.
+    """
+    validate_checkpoint_model_weight_layout(
+        model,
+        checkpoint_layout,
+        pf,
+    )
+
+    pf(
+        f"[{phase}] Loading checkpoint by exact layer name:"
+    )
+
+    pf(
+        f"[{phase}]   {checkpoint_path}"
+    )
+
+    try:
+        model.load_weights(
+            str(
+                checkpoint_path
+            ),
+            by_name=True,
+            skip_mismatch=False,
+        )
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"[{phase}] HDF5 by-name checkpoint loading failed after "
+            "the explicit compatibility check.\n"
+            f"Checkpoint: {checkpoint_path}\n"
+            f"Original error: {exc}"
+        ) from exc
+
+    pf(
+        f"[{phase}] Checkpoint loaded by name successfully"
+    )
+
+
+def build_legacy_phase2_softplus_model(
     seq_len: int,
     n_out: int,
     student_units: int,
-    bits_kernel: int,
-    q_alpha: float,
     input_dim: int = 1,
 ) -> Tuple[
     keras.Model,
@@ -629,14 +1246,15 @@ def build_phase2_diagnostic_model(
     MemoQGRUCell,
 ]:
     """
-    Exact Phase-2 topology from build_phase2_model(), with one additional
-    read-only output: encoder final hidden state.
+    Reconstruct the historical MemoQ Phase-2 output-head variant present in
+    earlier repository revisions:
 
-    No trainable layer or weight shape is added or removed, so the historical
-    stage2*.weights.h5 files load directly.
+        Dense(name='sdec_dense_raw', activation='linear')
+        Lambda(softplus, name='sdec_dense')
 
-    The extra output lets the analysis include the encoder-final ->
-    decoder-step-0 recurrent transition instead of dropping that transition.
+    The recurrent encoder/decoder are the repository MemoQGRUCell and
+    MemoQRNNUnroll classes so the saved split-gate tensor names remain the
+    historical names used by the checkpoints.
     """
     enc_cell = MemoQGRUCell(
         units=student_units,
@@ -676,7 +1294,11 @@ def build_phase2_diagnostic_model(
         name="sdec_input",
     )
 
-    _, _, enc_final_h = enc_unroll(
+    (
+        _,
+        _,
+        enc_final_h,
+    ) = enc_unroll(
         enc_inputs
     )
 
@@ -699,40 +1321,19 @@ def build_phase2_diagnostic_model(
         ],
     )
 
-    if q_alpha == 1.0:
-        dense_kernel_quantizer = quantized_bits(
-            bits_kernel,
-            0,
-        )
-
-        dense_bias_quantizer = quantized_bits(
-            bits_kernel,
-            0,
-        )
-
-    else:
-        dense_kernel_quantizer = quantized_bits(
-            bits_kernel,
-            0,
-            1,
-            alpha=q_alpha,
-        )
-
-        dense_bias_quantizer = quantized_bits(
-            bits_kernel,
-            0,
-            1,
-            alpha=q_alpha,
-        )
-
-    seq_output = QDense(
+    seq_output_raw = keras.layers.Dense(
         n_out,
-        kernel_quantizer=dense_kernel_quantizer,
-        bias_quantizer=dense_bias_quantizer,
         activation="linear",
-        name="sdec_dense",
+        name="sdec_dense_raw",
     )(
         dec_hidden_seq
+    )
+
+    seq_output = keras.layers.Lambda(
+        lambda x: tf.nn.softplus(x),
+        name="sdec_dense",
+    )(
+        seq_output_raw
     )
 
     model = keras.models.Model(
@@ -744,12 +1345,8 @@ def build_phase2_diagnostic_model(
             seq_output,
             dec_hidden_seq,
             dec_z_logit_seq,
-            enc_final_h,
         ],
-        name=(
-            "memoq_phase2_"
-            "deadzone_diagnostic_model"
-        ),
+        name="memoq_phase2_model",
     )
 
     return (
@@ -758,6 +1355,209 @@ def build_phase2_diagnostic_model(
         dec_cell,
     )
 
+
+def build_phase2_diagnostic_model(
+    seq_len: int,
+    n_out: int,
+    student_units: int,
+    bits_kernel: int,
+    q_alpha: float,
+    checkpoint_layout: Dict,
+    pf,
+    input_dim: int = 1,
+) -> Tuple[
+    keras.Model,
+    MemoQGRUCell,
+    MemoQGRUCell,
+    str,
+]:
+    """
+    Build the Phase-2 graph that corresponds to the actual saved HDF5
+    checkpoint, then expose encoder final hidden state as an additional
+    diagnostic output.
+
+    Current/recent MemoQ Phase-2 graph:
+        repository build_phase2_model()
+        weighted head: sdec_dense
+
+    Historical MemoQ Phase-2 graph:
+        Dense sdec_dense_raw -> softplus Lambda sdec_dense
+        weighted head: sdec_dense_raw
+
+    The diagnostic model shares the exact recurrent and output layers with the
+    selected base model. Adding enc_final_h as an output adds no trainable
+    variable and changes no recurrent computation.
+    """
+    weighted_layer_names = set(
+        checkpoint_layout[
+            "weighted_layers"
+        ].keys()
+    )
+
+    has_weighted_sdec_dense = (
+        "sdec_dense"
+        in weighted_layer_names
+    )
+
+    has_weighted_sdec_dense_raw = (
+        "sdec_dense_raw"
+        in weighted_layer_names
+    )
+
+    if (
+        has_weighted_sdec_dense
+        and has_weighted_sdec_dense_raw
+    ):
+        raise RuntimeError(
+            "The actual checkpoint contains both a weighted "
+            "'sdec_dense' layer and a weighted 'sdec_dense_raw' layer. "
+            "That combination does not match either known MemoQ Phase-2 "
+            "output-head implementation in the repository history.\n"
+            "Weighted checkpoint layers: "
+            + ", ".join(
+                checkpoint_layout[
+                    "weighted_layer_order"
+                ]
+            )
+        )
+
+    if has_weighted_sdec_dense:
+
+        pf(
+            "[MODEL] Checkpoint output head detected: "
+            "weighted linear QDense 'sdec_dense'"
+        )
+
+        (
+            base_model,
+            enc_cell,
+            dec_cell,
+        ) = build_phase2_model(
+            seq_len=seq_len,
+            n_out=n_out,
+            student_units=student_units,
+            input_dim=input_dim,
+            q_alpha=q_alpha,
+            bits_kernel=bits_kernel,
+        )
+
+        graph_variant = (
+            "phase2_linear_qdense_sdec_dense"
+        )
+
+    elif has_weighted_sdec_dense_raw:
+
+        pf(
+            "[MODEL] Checkpoint output head detected: "
+            "weighted Dense 'sdec_dense_raw' followed by "
+            "softplus 'sdec_dense'"
+        )
+
+        (
+            base_model,
+            enc_cell,
+            dec_cell,
+        ) = build_legacy_phase2_softplus_model(
+            seq_len=seq_len,
+            n_out=n_out,
+            student_units=student_units,
+            input_dim=input_dim,
+        )
+
+        graph_variant = (
+            "phase2_legacy_dense_raw_softplus"
+        )
+
+    else:
+        raise RuntimeError(
+            "Could not identify a known MemoQ Phase-2 output head "
+            "from the actual checkpoint.\n"
+            "Expected a weighted 'sdec_dense' or 'sdec_dense_raw' layer.\n"
+            "Weighted checkpoint layers: "
+            + ", ".join(
+                checkpoint_layout[
+                    "weighted_layer_order"
+                ]
+            )
+        )
+
+    try:
+        enc_unroll = (
+            base_model.get_layer(
+                "sencgru_unroll"
+            )
+        )
+
+    except ValueError as exc:
+        raise RuntimeError(
+            "The selected repository Phase-2 model does not contain "
+            "the required 'sencgru_unroll' layer."
+        ) from exc
+
+    enc_outputs = (
+        enc_unroll.output
+    )
+
+    if (
+        not isinstance(
+            enc_outputs,
+            (list, tuple),
+        )
+        or len(enc_outputs) != 3
+    ):
+        raise RuntimeError(
+            "'sencgru_unroll' must expose exactly three outputs: "
+            "hidden_seq, z_logit_seq, and final_h."
+        )
+
+    if len(
+        base_model.outputs
+    ) != 3:
+        raise RuntimeError(
+            "The selected Phase-2 base model must expose exactly "
+            "three outputs: seq_output, dec_hidden_seq, and "
+            "dec_z_logit_seq."
+        )
+
+    enc_final_h = (
+        enc_outputs[
+            2
+        ]
+    )
+
+    diagnostic_model = (
+        keras.models.Model(
+            inputs=base_model.inputs,
+            outputs=[
+                base_model.outputs[
+                    0
+                ],
+                base_model.outputs[
+                    1
+                ],
+                base_model.outputs[
+                    2
+                ],
+                enc_final_h,
+            ],
+            name=(
+                "memoq_phase2_"
+                "deadzone_diagnostic_model"
+            ),
+        )
+    )
+
+    pf(
+        f"[MODEL] Diagnostic graph variant: "
+        f"{graph_variant}"
+    )
+
+    return (
+        diagnostic_model,
+        enc_cell,
+        dec_cell,
+        graph_variant,
+    )
 
 def configure_paper_phase_quantizers(
     cfg: Dict,
@@ -1477,16 +2277,49 @@ def analyze_phase(
 
     keras.backend.clear_session()
 
+    checkpoint_path = (
+        run_dir
+        / CHECKPOINT_NAMES[
+            phase
+        ]
+    )
+
+    pf(
+        "="
+        * 88
+    )
+
+    pf(
+        f"[{phase}] INSPECTING ACTUAL SAVED CHECKPOINT"
+    )
+
+    pf(
+        "="
+        * 88
+    )
+
+    checkpoint_layout = (
+        inspect_keras_hdf5_checkpoint(
+            checkpoint_path,
+            pf,
+        )
+    )
+
     (
         model,
         enc_cell,
         dec_cell,
+        graph_variant,
     ) = build_phase2_diagnostic_model(
         seq_len=seq_len,
         n_out=n_out,
         student_units=student_units,
         bits_kernel=bits_kernel,
         q_alpha=q_alpha,
+        checkpoint_layout=(
+            checkpoint_layout
+        ),
+        pf=pf,
         input_dim=1,
     )
 
@@ -1497,24 +2330,30 @@ def analyze_phase(
         phase,
     )
 
-    checkpoint_path = (
-        run_dir
-        / CHECKPOINT_NAMES[phase]
+    pf(
+        "="
+        * 88
     )
 
     pf(
-        f"[{phase}] Loading checkpoint: "
-        f"{checkpoint_path}"
+        f"[{phase}] VALIDATING AND LOADING CHECKPOINT"
     )
 
-    model.load_weights(
-        str(
+    pf(
+        "="
+        * 88
+    )
+
+    load_phase2_checkpoint_by_name(
+        model=model,
+        checkpoint_path=(
             checkpoint_path
-        )
-    )
-
-    pf(
-        f"[{phase}] Checkpoint loaded successfully"
+        ),
+        checkpoint_layout=(
+            checkpoint_layout
+        ),
+        phase=phase,
+        pf=pf,
     )
 
     q_state = quantized_bits(
@@ -2189,6 +3028,24 @@ def analyze_phase(
         "phase": phase,
         "checkpoint": str(
             checkpoint_path
+        ),
+        "checkpoint_graph_variant": (
+            graph_variant
+        ),
+        "checkpoint_hdf5_weight_root": (
+            checkpoint_layout[
+                "hdf5_weight_root"
+            ]
+        ),
+        "checkpoint_all_layer_names": list(
+            checkpoint_layout[
+                "all_layer_names"
+            ]
+        ),
+        "checkpoint_weighted_layer_order": list(
+            checkpoint_layout[
+                "weighted_layer_order"
+            ]
         ),
         "n_sequences": n_sequences,
         "seq_len": seq_len,
