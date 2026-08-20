@@ -1702,176 +1702,304 @@ def training_loop_memoq(
 #   bias[1] = recurrent bias [z|r|h]
 # ==============================================================================
 
-def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_student, pf):
+def transfer_splitgate_to_qkeras(
+    enc_cell,
+    dec_cell,
+    phase2_model,
+    final_qkeras_student,
+    pf,
+):
     """
-    Pack split-gate MemoQGRUCell weights into standard Keras/QKeras QGRU
-    packed format [z | r | h] and load into final_qkeras_student.
+    Pack the reset-before MemoQ split-gate parameters into the final QKeras
+    QGRU layout.
 
-    MemoQGRUCell variables:
-        W_z, W_r, W_h       (input_dim, H)
-        U_z, U_r, U_h       (H,         H)
-        b_z_inp, b_r_inp, b_h_inp  (H,) input biases
-        b_z_rec, b_r_rec, b_h_rec  (H,) recurrent biases
+    Target layout for reset_after=False:
 
-    Keras/QKeras reset_after=True QGRU weight layouts (version-dependent):
-      3-weight, bias shape (3*H,)    -> input bias only, flat
-      3-weight, bias shape (2, 3*H)  -> stacked [input | recurrent]
-      4-weight                       -> bias_inp (3*H,), bias_rec (3*H,) separate
-      6-weight (quantizer scale vars)-> first 3 or 4 are the actual weight arrays
+        kernel:
+            (input_dim, 3*H)
+            [W_z | W_r | W_h]
 
-    This function probes the actual shape of the bias tensor and dispatches
-    to the correct packing strategy so it never fails on a shape mismatch.
+        recurrent_kernel:
+            (H, 3*H)
+            [U_z | U_r | U_h]
+
+        bias:
+            (3*H,)
+            [b_z | b_r | b_h]
+
+    No recurrent-bias row exists.
     """
-    pf("[EXPORT] transfer_splitgate_to_qkeras: packing MemoQGRUCell -> QKeras QGRU [z|r|h]...")
 
-    def pack_and_load(cell, layer_name, target_model):
-        W_z = cell.W_z.numpy()
-        W_r = cell.W_r.numpy()
-        W_h = cell.W_h.numpy()
+    pf(
+        "[P2->P3 TRANSFER] Packing QKeras-compatible reset-before "
+        "split-gate weights into QGRU..."
+    )
 
-        U_z = cell.U_z.numpy()
-        U_r = cell.U_r.numpy()
-        U_h = cell.U_h.numpy()
-
-        b_z_inp = cell.b_z_inp.numpy()
-        b_r_inp = cell.b_r_inp.numpy()
-        b_h_inp = cell.b_h_inp.numpy()
-
-        b_z_rec = cell.b_z_rec.numpy()
-        b_r_rec = cell.b_r_rec.numpy()
-        b_h_rec = cell.b_h_rec.numpy()
-
-        packed_kernel    = np.concatenate([W_z, W_r, W_h], axis=1)
-        packed_recurrent = np.concatenate([U_z, U_r, U_h], axis=1)
-        packed_bias_inp  = np.concatenate([b_z_inp, b_r_inp, b_h_inp], axis=0)
-        packed_bias_rec  = np.concatenate([b_z_rec, b_r_rec, b_h_rec], axis=0)
-        packed_bias_2row = np.stack([packed_bias_inp, packed_bias_rec], axis=0)
-
+    def pack_and_set(
+        cell,
+        layer_name,
+    ):
         try:
-            target_layer = target_model.get_layer(layer_name)
-        except ValueError:
-            pf(f"[EXPORT]   SKIP {layer_name} — not found in target model")
-            return
+            target_layer = final_qkeras_student.get_layer(
+                layer_name
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{layer_name} is missing from final_qkeras_student"
+            ) from exc
 
-        q_weights = target_layer.get_weights()
-        n_w = len(q_weights)
+        target_cell = target_layer.cell
 
-        pf(f"[EXPORT]   {layer_name}: layer has {n_w} weight tensors, shapes: {[w.shape for w in q_weights]}")
-
-        if n_w >= 4:
-            bias_inp_shape = q_weights[2].shape
-            bias_rec_shape = q_weights[3].shape
-            if bias_inp_shape == packed_bias_inp.shape and bias_rec_shape == packed_bias_rec.shape:
-                target_layer.set_weights([
-                    packed_kernel,
-                    packed_recurrent,
-                    packed_bias_inp,
-                    packed_bias_rec,
-                ] + list(q_weights[4:]))
-                pf(
-                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
-                    f"recurrent={packed_recurrent.shape}  "
-                    f"bias_inp={packed_bias_inp.shape}  bias_rec={packed_bias_rec.shape} (4-weight mode)"
-                )
-                return
-            pf(
-                f"[EXPORT]   {layer_name}: 4-weight mode shape mismatch, "
-                f"expected bias_inp={packed_bias_inp.shape} bias_rec={packed_bias_rec.shape} "
-                f"got {bias_inp_shape} {bias_rec_shape}, falling through to 3-weight probe"
+        if bool(target_cell.reset_after):
+            raise RuntimeError(
+                f"{layer_name}: final QGRU reset_after must be False"
             )
 
-        if n_w >= 3:
-            bias_slot_shape = q_weights[2].shape
-            if bias_slot_shape == packed_bias_2row.shape:
-                target_layer.set_weights([
-                    packed_kernel,
-                    packed_recurrent,
-                    packed_bias_2row,
-                ] + list(q_weights[3:]))
-                pf(
-                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
-                    f"recurrent={packed_recurrent.shape}  bias={packed_bias_2row.shape} (3-weight 2-row bias mode)"
-                )
-                return
-            if bias_slot_shape == packed_bias_inp.shape:
-                target_layer.set_weights([
-                    packed_kernel,
-                    packed_recurrent,
-                    packed_bias_inp,
-                ] + list(q_weights[3:]))
-                pf(
-                    f"[EXPORT]   {layer_name}: kernel={packed_kernel.shape}  "
-                    f"recurrent={packed_recurrent.shape}  bias={packed_bias_inp.shape} (3-weight flat bias mode, recurrent bias dropped)"
-                )
-                pf(
-                    f"[EXPORT]   WARNING: {layer_name} QKeras QGRU only exposes 1 bias tensor of shape "
-                    f"{bias_slot_shape}. Recurrent bias b_{{z,r,h}}_rec is not transferred. "
-                    f"This is a QKeras version limitation (reset_after bias not separately stored)."
-                )
-                return
-            pf(
-                f"[EXPORT]   ERROR: {layer_name} bias slot shape {bias_slot_shape} does not match "
-                f"packed_bias_2row {packed_bias_2row.shape} or packed_bias_inp {packed_bias_inp.shape}. "
-                f"Attempting raw set_weights with 2-row bias to let Keras raise a clear error."
+        if int(target_cell.implementation) != 1:
+            raise RuntimeError(
+                f"{layer_name}: final QGRU implementation must be 1"
             )
-            raise ValueError(
-                f"transfer_splitgate_to_qkeras: layer '{layer_name}' has {n_w} weight tensors, "
-                f"bias slot shape is {bias_slot_shape}, expected either "
-                f"{packed_bias_inp.shape} (flat) or {packed_bias_2row.shape} (2-row). "
-                f"All weight shapes: {[w.shape for w in q_weights]}. "
-                f"packed_kernel={packed_kernel.shape}, packed_recurrent={packed_recurrent.shape}."
+
+        probe = tf.constant(
+            [
+                -2.0,
+                -1.0,
+                0.0,
+                1.0,
+                2.0,
+            ],
+            dtype=tf.float32,
+        )
+
+        expected_gate = qkeras_hard_sigmoid(
+            probe
+        )
+
+        actual_gate = tf.cast(
+            target_cell.recurrent_activation(
+                probe
+            ),
+            tf.float32,
+        )
+
+        activation_error = float(
+            tf.reduce_max(
+                tf.abs(
+                    expected_gate
+                    - actual_gate
+                )
+            ).numpy()
+        )
+
+        if activation_error > 1.0e-7:
+            raise RuntimeError(
+                f"{layer_name}: final QGRU recurrent activation is not "
+                f"QKeras hard_sigmoid. "
+                f"max_error={activation_error:.9e}"
             )
+
+        W_z = np.asarray(
+            cell.W_z.numpy(),
+            dtype=np.float32,
+        )
+
+        W_r = np.asarray(
+            cell.W_r.numpy(),
+            dtype=np.float32,
+        )
+
+        W_h = np.asarray(
+            cell.W_h.numpy(),
+            dtype=np.float32,
+        )
+
+        U_z = np.asarray(
+            cell.U_z.numpy(),
+            dtype=np.float32,
+        )
+
+        U_r = np.asarray(
+            cell.U_r.numpy(),
+            dtype=np.float32,
+        )
+
+        U_h = np.asarray(
+            cell.U_h.numpy(),
+            dtype=np.float32,
+        )
+
+        b_z = np.asarray(
+            cell.b_z_inp.numpy(),
+            dtype=np.float32,
+        )
+
+        b_r = np.asarray(
+            cell.b_r_inp.numpy(),
+            dtype=np.float32,
+        )
+
+        b_h = np.asarray(
+            cell.b_h_inp.numpy(),
+            dtype=np.float32,
+        )
+
+        packed_kernel = np.concatenate(
+            [
+                W_z,
+                W_r,
+                W_h,
+            ],
+            axis=1,
+        ).astype(
+            np.float32
+        )
+
+        packed_recurrent = np.concatenate(
+            [
+                U_z,
+                U_r,
+                U_h,
+            ],
+            axis=1,
+        ).astype(
+            np.float32
+        )
+
+        packed_bias = np.concatenate(
+            [
+                b_z,
+                b_r,
+                b_h,
+            ],
+            axis=0,
+        ).astype(
+            np.float32
+        )
+
+        target_weights = target_layer.get_weights()
+
+        if len(target_weights) < 3:
+            raise RuntimeError(
+                f"{layer_name}: expected at least three target weight tensors, "
+                f"got {[tuple(weight.shape) for weight in target_weights]}"
+            )
+
+        if target_weights[0].shape != packed_kernel.shape:
+            raise RuntimeError(
+                f"{layer_name}: kernel shape mismatch. "
+                f"source={packed_kernel.shape} "
+                f"target={target_weights[0].shape}"
+            )
+
+        if target_weights[1].shape != packed_recurrent.shape:
+            raise RuntimeError(
+                f"{layer_name}: recurrent-kernel shape mismatch. "
+                f"source={packed_recurrent.shape} "
+                f"target={target_weights[1].shape}"
+            )
+
+        if target_weights[2].shape != packed_bias.shape:
+            raise RuntimeError(
+                f"{layer_name}: bias shape mismatch. "
+                f"source={packed_bias.shape} "
+                f"target={target_weights[2].shape}. "
+                "The target must be a reset_after=False QGRU."
+            )
+
+        replacement_weights = list(
+            target_weights
+        )
+
+        replacement_weights[0] = packed_kernel
+        replacement_weights[1] = packed_recurrent
+        replacement_weights[2] = packed_bias
+
+        target_layer.set_weights(
+            replacement_weights
+        )
 
         pf(
-            f"[EXPORT]   ERROR: {layer_name} has only {n_w} weight tensors — too few to transfer. "
-            f"Expected at least 3. Shapes: {[w.shape for w in q_weights]}"
-        )
-        raise ValueError(
-            f"transfer_splitgate_to_qkeras: layer '{layer_name}' has {n_w} weight tensors, "
-            f"cannot transfer (need >= 3). Shapes: {[w.shape for w in q_weights]}"
+            f"  OK {layer_name}: "
+            f"kernel={packed_kernel.shape} "
+            f"recurrent={packed_recurrent.shape} "
+            f"bias={packed_bias.shape}"
         )
 
-    pack_and_load(enc_cell, "sencgru", final_qkeras_student)
-    pack_and_load(dec_cell, "sdecgru", final_qkeras_student)
+    pack_and_set(
+        enc_cell,
+        "sencgru",
+    )
 
-    pf("[EXPORT] Dense head (sdec_dense): transferring from phase2_model...")
+    pack_and_set(
+        dec_cell,
+        "sdecgru",
+    )
+
     try:
-        src_dense = phase2_model.get_layer("sdec_dense")
-        dst_dense = final_qkeras_student.get_layer("sdec_dense")
-        src_w = src_dense.get_weights()
-        dst_w = dst_dense.get_weights()
-        if len(src_w) < 2:
-            pf(
-                f"[EXPORT]   sdec_dense: source has only {len(src_w)} tensors, "
-                f"cannot transfer kernel+bias — SKIPPED"
-            )
-        else:
-            # Overwrite by index: slot 0 = kernel, slot 1 = bias.
-            # Any trailing tensors (QKeras per-tensor scale vars) are kept
-            # at their default values so quantizer state is not corrupted.
-            new_w = list(dst_w)
-            if new_w[0].shape != src_w[0].shape:
-                pf(
-                    f"[EXPORT]   sdec_dense: kernel shape mismatch "
-                    f"src={src_w[0].shape} dst={new_w[0].shape} — SKIPPED"
-                )
-            elif new_w[1].shape != src_w[1].shape:
-                pf(
-                    f"[EXPORT]   sdec_dense: bias shape mismatch "
-                    f"src={src_w[1].shape} dst={new_w[1].shape} — SKIPPED"
-                )
-            else:
-                new_w[0] = src_w[0]
-                new_w[1] = src_w[1]
-                dst_dense.set_weights(new_w)
-                pf(
-                    f"[EXPORT]   sdec_dense: OK 2 tensors transferred "
-                    f"(dst had {len(dst_w)} total slots, trailing slots preserved)"
-                )
-    except Exception as exc:
-        pf(f"[EXPORT]   sdec_dense: FAILED ({exc}) — skipped")
+        src_dense = phase2_model.get_layer(
+            "sdec_dense"
+        )
+
+        dst_dense = final_qkeras_student.get_layer(
+            "sdec_dense"
+        )
+
+    except ValueError as exc:
+        raise RuntimeError(
+            "sdec_dense is missing during P2->P3 transfer"
+        ) from exc
+
+    src_weights = src_dense.get_weights()
+    dst_weights = dst_dense.get_weights()
+
+    if len(src_weights) < 2:
+        raise RuntimeError(
+            "Phase-2 sdec_dense does not expose kernel and bias"
+        )
+
+    if len(dst_weights) < 2:
+        raise RuntimeError(
+            "Final sdec_dense does not expose kernel and bias"
+        )
+
+    if src_weights[0].shape != dst_weights[0].shape:
+        raise RuntimeError(
+            "sdec_dense kernel shape mismatch: "
+            f"src={src_weights[0].shape} "
+            f"dst={dst_weights[0].shape}"
+        )
+
+    if src_weights[1].shape != dst_weights[1].shape:
+        raise RuntimeError(
+            "sdec_dense bias shape mismatch: "
+            f"src={src_weights[1].shape} "
+            f"dst={dst_weights[1].shape}"
+        )
+
+    dense_replacement = list(
+        dst_weights
+    )
+
+    dense_replacement[0] = np.asarray(
+        src_weights[0],
+        dtype=np.float32,
+    )
+
+    dense_replacement[1] = np.asarray(
+        src_weights[1],
+        dtype=np.float32,
+    )
+
+    dst_dense.set_weights(
+        dense_replacement
+    )
+
+    pf(
+        "  OK sdec_dense"
+    )
 
     sys.stdout.flush()
+
 # ==============================================================================
 # MemoQGRUCell — custom training-time GRU cell with split gate variables.
 #
@@ -1893,204 +2021,597 @@ def transfer_splitgate_to_qkeras(enc_cell, dec_cell, phase2_model, final_qkeras_
 #
 # At inference (in final QKeras model): this cell is NOT used.
 # ==============================================================================
+def qkeras_hard_sigmoid(x):
+    """
+    Exact QKeras hard_sigmoid used by QGRU.
+
+    QKeras quantizers.hard_sigmoid implements:
+
+        clip(0.5 * x + 0.5, 0.0, 1.0)
+
+    Do not replace this with tf.keras.activations.hard_sigmoid. The historical
+    Keras hard-sigmoid implementation uses a different slope and therefore
+    does not reproduce the QKeras recurrent activation used by the vanilla
+    QGRU and the HLS implementation.
+    """
+    x = tf.cast(x, tf.float32)
+
+    return tf.clip_by_value(
+        0.5 * x + 0.5,
+        0.0,
+        1.0,
+    )
 
 class MemoQGRUCell(keras.layers.Layer):
+    """
+    Split-gate GRU cell used by the MemoQ progressive-hardening trajectory.
+
+    The recurrent mathematics intentionally matches the vanilla QKeras QGRU:
+
+        recurrent_activation = QKeras hard_sigmoid
+        implementation       = 1
+        reset_after           = False
+
+    Hard-inference recurrence:
+
+        h_prev_q = Q_state(h_prev)
+
+        z_logit = x @ W_z + h_prev_q @ U_z + b_z
+        r_logit = x @ W_r + h_prev_q @ U_r + b_r
+
+        z = hard_sigmoid(z_logit)
+        r = hard_sigmoid(r_logit)
+
+        candidate_preact =
+            x @ W_h
+            + (r * h_prev_q) @ U_h
+            + b_h
+
+        candidate = Q_activation(candidate_preact)
+
+        h_t =
+            z * h_prev_q
+            + (1.0 - z) * candidate
+
+    The newly produced h_t is deliberately NOT state-quantized before it is
+    returned. It is carried at higher precision and Q_state is applied when
+    that raw state re-enters the cell on the next recurrent step. This is the
+    exact state_quantizer location used by QKeras QGRUCell.call().
+
+    MemoQ's existing training-only activation/state blending and dither fields
+    are retained. They change the training path only. At the hard tail and at
+    inference, beta=1 and dither=0 recover the exact QKeras recurrence above.
+    """
+
     def __init__(
-            self,
-            units,
-            input_dim,
-            quantizer_z=None,
-            quantizer_r=None,
-            quantizer_h=None,
-            quantizer_state=None,
-            quantizer_activation=None,
-            quantizer_recurrent_z=None,
-            quantizer_recurrent_r=None,
-            quantizer_recurrent_h=None,
-            quantizer_bias=None,
-            **kwargs,
-        ):
-            super().__init__(**kwargs)
-            self.units = units
-            self.input_dim = input_dim
-            self._quantizer_z = quantizer_z
-            self._quantizer_r = quantizer_r
-            self._quantizer_h = quantizer_h
-            self._quantizer_state = quantizer_state
-            self._quantizer_activation = quantizer_activation
-            self._quantizer_recurrent_z = quantizer_recurrent_z
-            self._quantizer_recurrent_r = quantizer_recurrent_r
-            self._quantizer_recurrent_h = quantizer_recurrent_h
-            self._quantizer_bias = quantizer_bias
-            self.state_size = [units, units]
-            self.output_size = units
-            self._state_blend_beta = 1.0
-            # Fix 0: activation blend beta — mirrors state_blend_beta exactly.
-            # Set 0.0 at the start of the merged P2E+P2F anneal, ramped to 1.0.
-            # At beta=1.0 the hard quantizer path is used, identical to inference.
-            self._activation_blend_beta = 1.0
-            # Fix 1: replace the mis-sized Gaussian LSB noise with correct
-            # subtractive uniform dither half-widths. These are set to
-            # DELTA/2 = 0.0625 during the anneal window and 0.0 in hard tail.
-            # The old _state_lsb_noise_std Gaussian is REMOVED from call().
-            self._act_dither_delta = 0.0
-            self._state_dither_delta = 0.0
-            # Legacy field kept so set_phase2_quantizers assignment does not
-            # raise AttributeError on old code paths. Value is never read
-            # inside call() — the new dither fields replace it.
-            self._state_lsb_noise_std = 0.0
+        self,
+        units,
+        input_dim,
+        quantizer_z=None,
+        quantizer_r=None,
+        quantizer_h=None,
+        quantizer_state=None,
+        quantizer_activation=None,
+        quantizer_recurrent_z=None,
+        quantizer_recurrent_r=None,
+        quantizer_recurrent_h=None,
+        quantizer_bias=None,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+
+        self.units = int(units)
+        self.input_dim = int(input_dim)
+
+        self._quantizer_z = quantizer_z
+        self._quantizer_r = quantizer_r
+        self._quantizer_h = quantizer_h
+
+        self._quantizer_state = quantizer_state
+        self._quantizer_activation = quantizer_activation
+
+        self._quantizer_recurrent_z = quantizer_recurrent_z
+        self._quantizer_recurrent_r = quantizer_recurrent_r
+        self._quantizer_recurrent_h = quantizer_recurrent_h
+
+        self._quantizer_bias = quantizer_bias
+
+        self.state_size = [
+            self.units,
+            self.units,
+        ]
+
+        self.output_size = self.units
+
+        self._state_blend_beta = 1.0
+        self._activation_blend_beta = 1.0
+
+        self._act_dither_delta = 0.0
+        self._state_dither_delta = 0.0
+
+        self._state_lsb_noise_std = 0.0
 
     def build(self, input_shape):
-        d = self.input_dim
+        input_dim_from_shape = int(input_shape[-1])
+
+        if input_dim_from_shape != self.input_dim:
+            raise ValueError(
+                f"{self.name}: configured input_dim={self.input_dim}, "
+                f"but received input_shape={input_shape}"
+            )
+
         H = self.units
 
-        init  = keras.initializers.GlorotUniform()
-        orth  = keras.initializers.Orthogonal()
+        glorot = keras.initializers.GlorotUniform()
+        orth = keras.initializers.Orthogonal()
         zeros = keras.initializers.Zeros()
 
-        self.W_z     = self.add_weight(name="W_z",     shape=(d, H), initializer=init,  trainable=True)
-        self.W_r     = self.add_weight(name="W_r",     shape=(d, H), initializer=init,  trainable=True)
-        self.W_h     = self.add_weight(name="W_h",     shape=(d, H), initializer=init,  trainable=True)
-        self.U_z     = self.add_weight(name="U_z",     shape=(H, H), initializer=orth,  trainable=True)
-        self.U_r     = self.add_weight(name="U_r",     shape=(H, H), initializer=orth,  trainable=True)
-        self.U_h     = self.add_weight(name="U_h",     shape=(H, H), initializer=orth,  trainable=True)
-        self.b_z_inp = self.add_weight(name="b_z_inp", shape=(H,),   initializer=zeros, trainable=True)
-        self.b_r_inp = self.add_weight(name="b_r_inp", shape=(H,),   initializer=zeros, trainable=True)
-        self.b_h_inp = self.add_weight(name="b_h_inp", shape=(H,),   initializer=zeros, trainable=True)
-        self.b_z_rec = self.add_weight(name="b_z_rec", shape=(H,),   initializer=zeros, trainable=True)
-        self.b_r_rec = self.add_weight(name="b_r_rec", shape=(H,),   initializer=zeros, trainable=True)
-        self.b_h_rec = self.add_weight(name="b_h_rec", shape=(H,),   initializer=zeros, trainable=True)
-        self.built = True
+        self.W_z = self.add_weight(
+            name="W_z",
+            shape=(self.input_dim, H),
+            initializer=glorot,
+            trainable=True,
+        )
 
-    def _apply_quantizer(self, q, w):
-        if q is None:
-            return w
-        return q(w)
+        self.W_r = self.add_weight(
+            name="W_r",
+            shape=(self.input_dim, H),
+            initializer=glorot,
+            trainable=True,
+        )
 
-    def call(self, inputs, states, training=None):
-        h_prev = states[0]   # (B, units)
+        self.W_h = self.add_weight(
+            name="W_h",
+            shape=(self.input_dim, H),
+            initializer=glorot,
+            trainable=True,
+        )
 
-        is_training = tf.cast(training, tf.bool) if training is not None else tf.constant(False)
+        self.U_z = self.add_weight(
+            name="U_z",
+            shape=(H, H),
+            initializer=orth,
+            trainable=True,
+        )
 
-        # Fix 1 — Subtractive uniform dither on state, replaces the old
-        # Gaussian _state_lsb_noise_std injection.
-        # Active only during training when _state_dither_delta > 0.
-        # Subtractive triangular dither: sum of two independent Uniform(-d/2, d/2)
-        # gives triangular distribution on (-d, d). E[Q(h+dither)-dither] = h,
-        # so the dead-zone is linearised during training without biasing the
-        # expected value. At beta=1, dither=0 the inference path is exact.
+        self.U_r = self.add_weight(
+            name="U_r",
+            shape=(H, H),
+            initializer=orth,
+            trainable=True,
+        )
+
+        self.U_h = self.add_weight(
+            name="U_h",
+            shape=(H, H),
+            initializer=orth,
+            trainable=True,
+        )
+
+        # reset_after=False has one bias vector per gate.
+        # There are deliberately NO recurrent-bias variables.
+        self.b_z_inp = self.add_weight(
+            name="b_z_inp",
+            shape=(H,),
+            initializer=zeros,
+            trainable=True,
+        )
+
+        self.b_r_inp = self.add_weight(
+            name="b_r_inp",
+            shape=(H,),
+            initializer=zeros,
+            trainable=True,
+        )
+
+        self.b_h_inp = self.add_weight(
+            name="b_h_inp",
+            shape=(H,),
+            initializer=zeros,
+            trainable=True,
+        )
+
+        super().build(input_shape)
+
+    @staticmethod
+    def _apply_quantizer(quantizer, tensor):
+        if quantizer is None:
+            return tf.cast(
+                tensor,
+                tf.float32,
+            )
+
+        return tf.cast(
+            quantizer(tensor),
+            tf.float32,
+        )
+
+    def call(
+        self,
+        inputs,
+        states,
+        training=None,
+    ):
+        inputs = tf.cast(
+            inputs,
+            tf.float32,
+        )
+
+        h_prev_raw = tf.cast(
+            states[0],
+            tf.float32,
+        )
+
+        if training is None:
+            is_training = tf.constant(
+                False,
+                dtype=tf.bool,
+            )
+        elif isinstance(training, bool):
+            is_training = tf.constant(
+                training,
+                dtype=tf.bool,
+            )
+        else:
+            is_training = tf.cast(
+                training,
+                tf.bool,
+            )
+
+        # ------------------------------------------------------------------
+        # Training-only state dither.
+        #
+        # Inference is unaffected because training=False contributes zero
+        # dither. The hard deployment recurrence therefore begins exactly
+        # with Q_state(h_prev_raw).
+        # ------------------------------------------------------------------
+
+        h_prev_for_state = h_prev_raw
+
         if self._state_dither_delta > 0.0:
-            sd = tf.cast(self._state_dither_delta, tf.float32)
-            u1_s = tf.random.uniform(tf.shape(h_prev), -sd, sd, dtype=tf.float32)
-            u2_s = tf.random.uniform(tf.shape(h_prev), -sd, sd, dtype=tf.float32)
+            sd = tf.cast(
+                self._state_dither_delta,
+                tf.float32,
+            )
+
+            u1_s = tf.random.uniform(
+                tf.shape(h_prev_raw),
+                minval=-sd,
+                maxval=sd,
+                dtype=tf.float32,
+            )
+
+            u2_s = tf.random.uniform(
+                tf.shape(h_prev_raw),
+                minval=-sd,
+                maxval=sd,
+                dtype=tf.float32,
+            )
+
             tri_s = u1_s + u2_s
-            h_prev = h_prev + tf.cond(
+
+            training_state_dither = tf.cond(
                 is_training,
                 lambda: tri_s,
                 lambda: tf.zeros_like(tri_s),
             )
 
-        # Fix 0+1 — Soft-blend state quantizer with subtractive dither.
-        # h_prev_q = beta * Q_s(h_prev + dither) - dither_correction + (1-beta) * h_prev
-        # The dither is already added to h_prev above, and subtracted back after
-        # rounding by the STE path, so the net effect is subtractive dither.
+            h_prev_for_state = (
+                h_prev_raw
+                + training_state_dither
+            )
+
+        # ------------------------------------------------------------------
+        # Exact QKeras state-quantizer location:
+        #
+        #     quantize the PREVIOUS raw state when it re-enters the cell.
+        #
+        # Do not quantize h_t after the final blend.
+        # ------------------------------------------------------------------
+
         if self._quantizer_state is not None:
-            h_prev_q_hard = self._quantizer_state(h_prev)
-            beta_s = tf.cast(self._state_blend_beta, tf.float32)
-            h_prev_q = beta_s * h_prev_q_hard + (1.0 - beta_s) * h_prev
+            h_prev_q_hard = tf.cast(
+                self._quantizer_state(
+                    h_prev_for_state
+                ),
+                tf.float32,
+            )
+
+            beta_s = tf.cast(
+                self._state_blend_beta,
+                tf.float32,
+            )
+
+            h_prev_q = (
+                beta_s * h_prev_q_hard
+                + (1.0 - beta_s) * h_prev_for_state
+            )
+
         else:
-            h_prev_q = h_prev
+            h_prev_q = h_prev_for_state
 
-        # Input kernels.
-        W_z = self._apply_quantizer(self._quantizer_z, self.W_z)
-        W_r = self._apply_quantizer(self._quantizer_r, self.W_r)
-        W_h = self._apply_quantizer(self._quantizer_h, self.W_h)
+        # ------------------------------------------------------------------
+        # Quantized parameters.
+        # ------------------------------------------------------------------
 
-        # Recurrent kernels.
-        rq_z = self._quantizer_recurrent_z if self._quantizer_recurrent_z is not None else self._quantizer_z
-        rq_r = self._quantizer_recurrent_r if self._quantizer_recurrent_r is not None else self._quantizer_r
-        rq_h = self._quantizer_recurrent_h if self._quantizer_recurrent_h is not None else self._quantizer_h
-        U_z = self._apply_quantizer(rq_z, self.U_z)
-        U_r = self._apply_quantizer(rq_r, self.U_r)
-        U_h = self._apply_quantizer(rq_h, self.U_h)
+        W_z = self._apply_quantizer(
+            self._quantizer_z,
+            self.W_z,
+        )
 
-        # Biases.
-        b_z_inp = self._apply_quantizer(self._quantizer_bias, self.b_z_inp)
-        b_r_inp = self._apply_quantizer(self._quantizer_bias, self.b_r_inp)
-        b_h_inp = self._apply_quantizer(self._quantizer_bias, self.b_h_inp)
-        b_z_rec = self._apply_quantizer(self._quantizer_bias, self.b_z_rec)
-        b_r_rec = self._apply_quantizer(self._quantizer_bias, self.b_r_rec)
-        b_h_rec = self._apply_quantizer(self._quantizer_bias, self.b_h_rec)
+        W_r = self._apply_quantizer(
+            self._quantizer_r,
+            self.W_r,
+        )
+
+        W_h = self._apply_quantizer(
+            self._quantizer_h,
+            self.W_h,
+        )
+
+        U_z = self._apply_quantizer(
+            self._quantizer_recurrent_z,
+            self.U_z,
+        )
+
+        U_r = self._apply_quantizer(
+            self._quantizer_recurrent_r,
+            self.U_r,
+        )
+
+        U_h = self._apply_quantizer(
+            self._quantizer_recurrent_h,
+            self.U_h,
+        )
+
+        b_z = self._apply_quantizer(
+            self._quantizer_bias,
+            self.b_z_inp,
+        )
+
+        b_r = self._apply_quantizer(
+            self._quantizer_bias,
+            self.b_r_inp,
+        )
+
+        b_h = self._apply_quantizer(
+            self._quantizer_bias,
+            self.b_h_inp,
+        )
+
+        # ------------------------------------------------------------------
+        # Exact QKeras update/reset logits.
+        #
+        # reset_after=False has no recurrent bias row.
+        # ------------------------------------------------------------------
 
         z_logit = (
-            tf.matmul(inputs, W_z) + b_z_inp
-            + tf.matmul(h_prev_q, U_z) + b_z_rec
+            tf.matmul(
+                inputs,
+                W_z,
+            )
+            + tf.matmul(
+                h_prev_q,
+                U_z,
+            )
+            + b_z
         )
+
         r_logit = (
-            tf.matmul(inputs, W_r) + b_r_inp
-            + tf.matmul(h_prev_q, U_r) + b_r_rec
+            tf.matmul(
+                inputs,
+                W_r,
+            )
+            + tf.matmul(
+                h_prev_q,
+                U_r,
+            )
+            + b_r
         )
 
-        z = tf.sigmoid(z_logit)
-        r = tf.sigmoid(r_logit)
-
-        cand_preact = (
-            tf.matmul(inputs, W_h) + b_h_inp
-            + r * (tf.matmul(h_prev_q, U_h) + b_h_rec)
+        # Exact QKeras hard_sigmoid, NOT tf.sigmoid.
+        z = qkeras_hard_sigmoid(
+            z_logit
         )
 
-        # Fix 0 — Soft-blend activation quantizer with subtractive triangular dither.
-        # When _quantizer_activation is None: plain tanh, no change.
-        # When beta_a == 1.0 and act_dither_delta == 0.0 (hard tail / inference):
-        #   h_candidate = quantizer_activation(cand_preact) — exact inference op.
-        # During anneal (0 < beta_a < 1, act_dither_delta > 0):
-        #   1. Compute float tanh.
-        #   2. Apply triangular subtractive dither in tanh-output (grid) domain.
-        #   3. STE-round the dithered value to the 4-bit grid, then subtract
-        #      the dither back, so E[output] = tanh (linearises the rounding).
-        #   4. Blend: beta_a * dithered_quantized + (1-beta_a) * tanh.
-        # This destroys the inter-unit error correlation that causes the tau1 bands.
+        r = qkeras_hard_sigmoid(
+            r_logit
+        )
+
+        # ------------------------------------------------------------------
+        # Exact reset-before candidate:
+        #
+        #     (r * h_prev_q) @ U_h
+        #
+        # NOT:
+        #
+        #     r * (h_prev_q @ U_h + recurrent_bias)
+        # ------------------------------------------------------------------
+
+        recurrent_candidate = tf.matmul(
+            r * h_prev_q,
+            U_h,
+        )
+
+        candidate_preact = (
+            tf.matmul(
+                inputs,
+                W_h,
+            )
+            + recurrent_candidate
+            + b_h
+        )
+
+        # ------------------------------------------------------------------
+        # Candidate activation.
+        #
+        # At hard inference:
+        #
+        #     h_candidate = QKeras quantized_tanh(candidate_preact)
+        #
+        # Existing MemoQ training-only soft blending/dither is retained.
+        # ------------------------------------------------------------------
+
         if self._quantizer_activation is not None:
-            tanh_f = tf.tanh(cand_preact)
-            beta_a = tf.cast(self._activation_blend_beta, tf.float32)
+            tanh_f = tf.tanh(
+                candidate_preact
+            )
+
+            beta_a = tf.cast(
+                self._activation_blend_beta,
+                tf.float32,
+            )
+
             if self._act_dither_delta > 0.0:
-                ad = tf.cast(self._act_dither_delta, tf.float32)
-                g  = tf.cast(0.125, tf.float32)   # Delta_a for 4-bit symmetric tanh
-                u1_a = tf.random.uniform(tf.shape(tanh_f), -ad, ad, dtype=tf.float32)
-                u2_a = tf.random.uniform(tf.shape(tanh_f), -ad, ad, dtype=tf.float32)
-                tri_a = u1_a + u2_a   # triangular dither on (-2*ad, 2*ad)
-                dithered = tanh_f + tri_a
-                # STE round: forward = round-to-grid, backward = identity.
-                # Clip to quantizer output range [-1, 1-g] to match quantized_tanh.
-                rounded = tf.stop_gradient(
-                    tf.clip_by_value(tf.round(dithered / g) * g, -1.0, 1.0 - g) - dithered
-                ) + dithered
-                # Subtractive: remove the dither so E[output - tri_a] = tanh.
-                q_dith = rounded - tri_a
+                ad = tf.cast(
+                    self._act_dither_delta,
+                    tf.float32,
+                )
+
+                grid_step = tf.cast(
+                    0.125,
+                    tf.float32,
+                )
+
+                u1_a = tf.random.uniform(
+                    tf.shape(tanh_f),
+                    minval=-ad,
+                    maxval=ad,
+                    dtype=tf.float32,
+                )
+
+                u2_a = tf.random.uniform(
+                    tf.shape(tanh_f),
+                    minval=-ad,
+                    maxval=ad,
+                    dtype=tf.float32,
+                )
+
+                tri_a = u1_a + u2_a
+
+                dithered = (
+                    tanh_f
+                    + tri_a
+                )
+
+                rounded_forward = tf.clip_by_value(
+                    tf.round(
+                        dithered
+                        / grid_step
+                    )
+                    * grid_step,
+                    -1.0,
+                    1.0 - grid_step,
+                )
+
+                rounded_ste = (
+                    dithered
+                    + tf.stop_gradient(
+                        rounded_forward
+                        - dithered
+                    )
+                )
+
+                q_dith_training = (
+                    rounded_ste
+                    - tri_a
+                )
+
+                q_exact_inference = tf.cast(
+                    self._quantizer_activation(
+                        candidate_preact
+                    ),
+                    tf.float32,
+                )
+
                 q_dith = tf.cond(
                     is_training,
-                    lambda: q_dith,
-                    lambda: self._quantizer_activation(cand_preact),
+                    lambda: tf.cast(
+                        q_dith_training,
+                        tf.float32,
+                    ),
+                    lambda: q_exact_inference,
                 )
+
             else:
-                q_dith = self._quantizer_activation(cand_preact)
-            h_candidate = beta_a * q_dith + (1.0 - beta_a) * tanh_f
+                q_dith = tf.cast(
+                    self._quantizer_activation(
+                        candidate_preact
+                    ),
+                    tf.float32,
+                )
+
+            h_candidate = (
+                beta_a * q_dith
+                + (1.0 - beta_a) * tanh_f
+            )
+
         else:
-            h_candidate = tf.tanh(cand_preact)
+            h_candidate = tf.tanh(
+                candidate_preact
+            )
 
-        h_t = z * h_prev_q + (1.0 - z) * h_candidate
+        # ------------------------------------------------------------------
+        # Exact QKeras update equation.
+        #
+        # z is a RETENTION coefficient.
+        #
+        # h_t stays raw/high precision. State quantization happens when this
+        # value becomes h_prev_raw on the NEXT call.
+        # ------------------------------------------------------------------
 
-        return h_t, [h_t, z_logit]
+        h_t = (
+            z * h_prev_q
+            + (1.0 - z) * h_candidate
+        )
 
-    def get_initial_state(self, inputs=None, batch_size=None, dtype=None):
+        return h_t, [
+            h_t,
+            z_logit,
+        ]
+
+    def get_initial_state(
+        self,
+        inputs=None,
+        batch_size=None,
+        dtype=None,
+    ):
         if batch_size is None and inputs is not None:
-            batch_size = tf.shape(inputs)[0]
+            batch_size = tf.shape(
+                inputs
+            )[0]
+
         if dtype is None:
             dtype = tf.float32
+
         return [
-            tf.zeros((batch_size, self.units), dtype=dtype),
-            tf.zeros((batch_size, self.units), dtype=dtype),
+            tf.zeros(
+                (
+                    batch_size,
+                    self.units,
+                ),
+                dtype=dtype,
+            ),
+            tf.zeros(
+                (
+                    batch_size,
+                    self.units,
+                ),
+                dtype=dtype,
+            ),
         ]
+
+    def get_config(self):
+        config = super().get_config()
+
+        config.update(
+            {
+                "units": self.units,
+                "input_dim": self.input_dim,
+            }
+        )
+
+        return config
 
     @property
     def quantizer_z(self):
@@ -2203,7 +2724,6 @@ class MemoQGRUCell(keras.layers.Layer):
     @state_lsb_noise_std.setter
     def state_lsb_noise_std(self, v):
         self._state_lsb_noise_std = float(v)
-
 # ==============================================================================
 # build_phase2_model:
 # Constructs the training-time phase2 model using MemoQGRUCell instances.
@@ -2338,65 +2858,125 @@ def build_phase2_model(seq_len, n_out, student_units, input_dim=1, q_alpha=1.0, 
 # ==============================================================================
 
 def build_final_qkeras_student(
-    seq_len, n_out, student_units,
-    bits_kernel, bits_recurrent, bits_bias,
-    bits_activation, bits_state,
+    seq_len,
+    n_out,
+    student_units,
+    bits_kernel,
+    bits_recurrent,
+    bits_bias,
+    bits_activation,
+    bits_state,
     q_alpha=1.0,
 ):
-    # q_alpha selects the weight quantizer scaling family for the controlled
-    # experiment. For the paper q_alpha=1.0 makes this graph byte-identical to
-    # the vanilla 4-bit KD student, so any MemoQ gain is attributable purely to
-    # the training procedure, not to a different quantizer. State stays at
-    # alpha=1.0 because the convex-combination hidden state is bounded to [-1,1].
+    """
+    Final hard QKeras student.
+
+    This graph explicitly states the QKeras recurrent defaults used by the
+    vanilla student rather than relying on implicit defaults:
+
+        recurrent_activation = "hard_sigmoid"
+        implementation       = 1
+        reset_after           = False
+
+    With q_alpha=1.0 and the same bit widths, this is the same inference
+    architecture and quantizer family as the vanilla QKeras student.
+    """
+
     def qwk():
-        return quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
+        return quantized_bits(
+            bits_kernel,
+            0,
+            1,
+            alpha=q_alpha,
+        )
 
     def qwr():
-        return quantized_bits(bits_recurrent, 0, 1, alpha=q_alpha)
+        return quantized_bits(
+            bits_recurrent,
+            0,
+            1,
+            alpha=q_alpha,
+        )
 
     def qwb():
-        return quantized_bits(bits_bias, 0, 1, alpha=q_alpha)
+        return quantized_bits(
+            bits_bias,
+            0,
+            1,
+            alpha=q_alpha,
+        )
 
     def qa():
-        return quantized_tanh(bits=bits_activation, symmetric=True)
+        return quantized_tanh(
+            bits=bits_activation,
+            symmetric=True,
+        )
 
     def qs():
-        return quantized_bits(bits_state, 0, 1, alpha=1.0)
+        return quantized_bits(
+            bits_state,
+            0,
+            1,
+            alpha=1.0,
+        )
 
     def qd():
         if q_alpha == 1.0:
-            return quantized_bits(bits_kernel, 0)
-        return quantized_bits(bits_kernel, 0, 1, alpha=q_alpha)
+            return quantized_bits(
+                bits_kernel,
+                0,
+            )
 
-    enc_inputs = keras.layers.Input(shape=(None, 1), name="senc_input")
-    dec_inputs = keras.layers.Input(shape=(None, 1), name="sdec_input")
+        return quantized_bits(
+            bits_kernel,
+            0,
+            1,
+            alpha=q_alpha,
+        )
+
+    enc_inputs = keras.layers.Input(
+        shape=(None, 1),
+        name="senc_input",
+    )
+
+    dec_inputs = keras.layers.Input(
+        shape=(None, 1),
+        name="sdec_input",
+    )
 
     s_enc_out, s_enc_state = QGRU(
         units=student_units,
         activation=qa(),
-        recurrent_activation="sigmoid",
+        recurrent_activation="hard_sigmoid",
+        implementation=1,
         kernel_quantizer=qwk(),
         recurrent_quantizer=qwr(),
         bias_quantizer=qwb(),
         state_quantizer=qs(),
         return_state=True,
-        reset_after=True,
+        reset_after=False,
         name="sencgru",
-    )(enc_inputs)
+    )(
+        enc_inputs
+    )
 
     s_dec_hid_seq, _ = QGRU(
         units=student_units,
         activation=qa(),
-        recurrent_activation="sigmoid",
+        recurrent_activation="hard_sigmoid",
+        implementation=1,
         kernel_quantizer=qwk(),
         recurrent_quantizer=qwr(),
         bias_quantizer=qwb(),
         state_quantizer=qs(),
         return_sequences=True,
         return_state=True,
-        reset_after=True,
+        reset_after=False,
         name="sdecgru",
-    )(dec_inputs, initial_state=s_enc_state)
+    )(
+        dec_inputs,
+        initial_state=s_enc_state,
+    )
 
     s_output = QDense(
         n_out,
@@ -2404,37 +2984,162 @@ def build_final_qkeras_student(
         bias_quantizer=qd(),
         activation="linear",
         name="sdec_dense",
-    )(s_dec_hid_seq)
+    )(
+        s_dec_hid_seq
+    )
 
     return keras.models.Model(
-        inputs=[enc_inputs, dec_inputs],
+        inputs=[
+            enc_inputs,
+            dec_inputs,
+        ],
         outputs=s_output,
         name="memoq_final_qkeras_student",
     )
-def log_final_student_config(final_qkeras_student, pf):
+
+def log_final_student_config(
+    final_qkeras_student,
+    pf,
+):
     """
-    Print the instantiated QGRU/QDense configs of the final student so the
-    'vanilla-identical' claim is verifiable rather than assumed. Compare these
-    lines against the vanilla student's get_config() output. The control is
-    only valid if recurrent_activation, reset_after, the quantizer configs,
-    and units match between the two builders.
+    Validate and log the final QKeras architecture.
+
+    The final MemoQ student is only a valid vanilla-matched controlled
+    experiment when BOTH recurrent layers satisfy:
+
+        QKeras hard_sigmoid
+        implementation=1
+        reset_after=False
+        state_quantizer present
+
+    A mismatch is fatal.
     """
-    for layer_name in ["sencgru", "sdecgru", "sdec_dense"]:
+
+    probe = tf.constant(
+        [
+            -3.0,
+            -2.0,
+            -1.0,
+            0.0,
+            1.0,
+            2.0,
+            3.0,
+        ],
+        dtype=tf.float32,
+    )
+
+    expected_gate = qkeras_hard_sigmoid(
+        probe
+    )
+
+    for layer_name in [
+        "sencgru",
+        "sdecgru",
+    ]:
         try:
-            layer = final_qkeras_student.get_layer(layer_name)
-        except ValueError:
-            pf(f"[CONFIG] {layer_name}: not found")
-            continue
-        cfg = layer.get_config()
-        keys = [
-            "units", "activation", "recurrent_activation", "reset_after",
-            "kernel_quantizer", "recurrent_quantizer", "bias_quantizer",
-            "state_quantizer",
-        ]
-        shown = {k: cfg.get(k, "<absent>") for k in keys if k in cfg or k in (
-            "units", "recurrent_activation", "reset_after")}
-        pf(f"[CONFIG] {layer_name}: {shown}")
+            layer = final_qkeras_student.get_layer(
+                layer_name
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"[CONFIG] Missing required QGRU layer: {layer_name}"
+            ) from exc
+
+        cell = layer.cell
+
+        if bool(cell.reset_after):
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: reset_after=True. "
+                "Expected reset_after=False."
+            )
+
+        if int(cell.implementation) != 1:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: "
+                f"implementation={cell.implementation}. "
+                "Expected implementation=1."
+            )
+
+        actual_gate = tf.cast(
+            cell.recurrent_activation(
+                probe
+            ),
+            tf.float32,
+        )
+
+        gate_error = float(
+            tf.reduce_max(
+                tf.abs(
+                    actual_gate
+                    - expected_gate
+                )
+            ).numpy()
+        )
+
+        if gate_error > 1.0e-7:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: recurrent activation does not "
+                f"match QKeras hard_sigmoid. "
+                f"max_error={gate_error:.9e}"
+            )
+
+        if cell.kernel_quantizer_internal is None:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: kernel quantizer is missing"
+            )
+
+        if cell.recurrent_quantizer_internal is None:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: recurrent quantizer is missing"
+            )
+
+        if cell.bias_quantizer_internal is None:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: bias quantizer is missing"
+            )
+
+        if cell.state_quantizer_internal is None:
+            raise RuntimeError(
+                f"[CONFIG] {layer_name}: state quantizer is missing"
+            )
+
+        pf(
+            f"[CONFIG] {layer_name}: "
+            f"units={cell.units} "
+            f"implementation={cell.implementation} "
+            f"reset_after={cell.reset_after} "
+            f"kernel_quantizer={cell.kernel_quantizer_internal} "
+            f"recurrent_quantizer={cell.recurrent_quantizer_internal} "
+            f"bias_quantizer={cell.bias_quantizer_internal} "
+            f"state_quantizer={cell.state_quantizer_internal} "
+            f"activation={cell.activation} "
+            f"hard_sigmoid_max_error={gate_error:.3e}"
+        )
+
+    try:
+        dense_layer = final_qkeras_student.get_layer(
+            "sdec_dense"
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "[CONFIG] Missing required QDense layer: sdec_dense"
+        ) from exc
+
+    pf(
+        "[CONFIG] sdec_dense: "
+        f"kernel_quantizer={dense_layer.kernel_quantizer_internal} "
+        f"bias_quantizer={dense_layer.bias_quantizer_internal} "
+        f"activation={dense_layer.activation}"
+    )
+
+    pf(
+        "[CONFIG] PASS: final MemoQ QKeras graph uses "
+        "hard_sigmoid / implementation=1 / reset_after=False / "
+        "state-on-reentry quantization."
+    )
+
     sys.stdout.flush()
+
 # ==============================================================================
 # MemoQ auxiliary losses.
 # All losses are tf.function-traceable.
@@ -3667,114 +4372,283 @@ def materialise_memoq_buffers(
 # recurrent_kernel (H, 3*H) in columns [z, r, h] order.
 # ==============================================================================
 
-def transfer_float_to_phase2(float_student, phase2_model, enc_cell_p2, dec_cell_p2, pf):
+def transfer_float_to_phase2(
+    float_student,
+    phase2_model,
+    enc_cell_p2,
+    dec_cell_p2,
+    pf,
+):
     """
-    Transfer weights from phase1 float student (standard Keras GRU, reset_after=True)
-    into the MemoQGRUCell split-gate variables of phase2_model.
+    Transfer reset_after=False Phase-1 Keras GRU parameters into the
+    split-gate MemoQGRUCell.
 
-    Keras GRU reset_after=True weight layout:
-      kernel           (input_dim, 3*H)  columns: [z | r | h]
-      recurrent_kernel (H,         3*H)  columns: [z | r | h]
-      bias             (2,         3*H)  row 0 = input bias [z|r|h], row 1 = recurrent bias [z|r|h]
+    Keras GRU reset_after=False layout:
 
-    MemoQGRUCell variables:
-      W_z, W_r, W_h       (input_dim, H)
-      U_z, U_r, U_h       (H,         H)
-      b_z_inp, b_r_inp, b_h_inp  (H,)
-      b_z_rec, b_r_rec, b_h_rec  (H,)
+        kernel:
+            shape (input_dim, 3*H)
+            columns [z | r | h]
+
+        recurrent_kernel:
+            shape (H, 3*H)
+            columns [z | r | h]
+
+        bias:
+            shape (3*H,)
+            values [b_z | b_r | b_h]
+
+    There is no recurrent-bias row.
     """
-    pf("[P1->P2 TRANSFER] Unpacking float GRU weights into MemoQGRUCell split-gate variables...")
 
-    def unpack_and_set(gru_layer_name, cell):
+    pf(
+        "[P1->P2 TRANSFER] Unpacking reset-before float GRU weights "
+        "into QKeras-compatible split-gate variables..."
+    )
+
+    def unpack_and_set(
+        gru_layer_name,
+        cell,
+    ):
         try:
-            layer = float_student.get_layer(gru_layer_name)
-        except ValueError:
-            pf(f"  SKIP {gru_layer_name} — not found in float_student")
-            return
+            layer = float_student.get_layer(
+                gru_layer_name
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{gru_layer_name} is missing from float_student"
+            ) from exc
+
+        if bool(layer.reset_after):
+            raise RuntimeError(
+                f"{gru_layer_name}: reset_after must be False"
+            )
+
+        if int(layer.implementation) != 1:
+            raise RuntimeError(
+                f"{gru_layer_name}: implementation must be 1"
+            )
 
         weights = layer.get_weights()
-        if len(weights) < 3:
-            pf(f"  SKIP {gru_layer_name} — only {len(weights)} weight tensors (expected 3)")
-            return
 
-        kernel           = weights[0]   # (input_dim, 3*H)
-        recurrent_kernel = weights[1]   # (H, 3*H)
-        bias             = weights[2]   # (2, 3*H) for reset_after=True
+        if len(weights) != 3:
+            raise RuntimeError(
+                f"{gru_layer_name}: expected exactly three GRU weight tensors "
+                f"for reset_after=False, got "
+                f"{len(weights)} with shapes "
+                f"{[tuple(weight.shape) for weight in weights]}"
+            )
 
-        H = cell.units
+        kernel = np.asarray(
+            weights[0],
+            dtype=np.float32,
+        )
 
-        if kernel.shape[1] != 3 * H:
-            pf(f"  SKIP {gru_layer_name} — kernel column count {kernel.shape[1]} != 3*{H}")
-            return
+        recurrent_kernel = np.asarray(
+            weights[1],
+            dtype=np.float32,
+        )
 
-        # Keras GRU packed column order: [z | r | h]
-        W_z = kernel[:, 0:H]
-        W_r = kernel[:, H:2*H]
-        W_h = kernel[:, 2*H:3*H]
+        bias = np.asarray(
+            weights[2],
+            dtype=np.float32,
+        )
 
-        U_z = recurrent_kernel[:, 0:H]
-        U_r = recurrent_kernel[:, H:2*H]
-        U_h = recurrent_kernel[:, 2*H:3*H]
+        H = int(
+            cell.units
+        )
 
-        if bias.ndim == 2 and bias.shape[0] == 2:
-            # reset_after=True: row 0 = input bias, row 1 = recurrent bias
-            b_z_inp = bias[0, 0:H]
-            b_r_inp = bias[0, H:2*H]
-            b_h_inp = bias[0, 2*H:3*H]
-            b_z_rec = bias[1, 0:H]
-            b_r_rec = bias[1, H:2*H]
-            b_h_rec = bias[1, 2*H:3*H]
-        elif bias.ndim == 1 and bias.shape[0] == 3 * H:
-            # reset_after=False fallback: single flat bias, all recurrent biases = 0
-            b_z_inp = bias[0:H]
-            b_r_inp = bias[H:2*H]
-            b_h_inp = bias[2*H:3*H]
-            b_z_rec = np.zeros(H, dtype=np.float32)
-            b_r_rec = np.zeros(H, dtype=np.float32)
-            b_h_rec = np.zeros(H, dtype=np.float32)
-        else:
-            pf(f"  SKIP {gru_layer_name} — unexpected bias shape {bias.shape}")
-            return
+        expected_kernel_shape = (
+            cell.input_dim,
+            3 * H,
+        )
 
-        cell.W_z.assign(W_z)
-        cell.W_r.assign(W_r)
-        cell.W_h.assign(W_h)
-        cell.U_z.assign(U_z)
-        cell.U_r.assign(U_r)
-        cell.U_h.assign(U_h)
-        cell.b_z_inp.assign(b_z_inp)
-        cell.b_r_inp.assign(b_r_inp)
-        cell.b_h_inp.assign(b_h_inp)
-        cell.b_z_rec.assign(b_z_rec)
-        cell.b_r_rec.assign(b_r_rec)
-        cell.b_h_rec.assign(b_h_rec)
+        expected_recurrent_shape = (
+            H,
+            3 * H,
+        )
+
+        expected_bias_shape = (
+            3 * H,
+        )
+
+        if kernel.shape != expected_kernel_shape:
+            raise RuntimeError(
+                f"{gru_layer_name}: kernel shape mismatch. "
+                f"expected={expected_kernel_shape} "
+                f"actual={kernel.shape}"
+            )
+
+        if recurrent_kernel.shape != expected_recurrent_shape:
+            raise RuntimeError(
+                f"{gru_layer_name}: recurrent-kernel shape mismatch. "
+                f"expected={expected_recurrent_shape} "
+                f"actual={recurrent_kernel.shape}"
+            )
+
+        if bias.shape != expected_bias_shape:
+            raise RuntimeError(
+                f"{gru_layer_name}: bias shape mismatch. "
+                f"reset_after=False requires {expected_bias_shape}, "
+                f"actual={bias.shape}"
+            )
+
+        W_z = kernel[
+            :,
+            0:H,
+        ]
+
+        W_r = kernel[
+            :,
+            H:2 * H,
+        ]
+
+        W_h = kernel[
+            :,
+            2 * H:3 * H,
+        ]
+
+        U_z = recurrent_kernel[
+            :,
+            0:H,
+        ]
+
+        U_r = recurrent_kernel[
+            :,
+            H:2 * H,
+        ]
+
+        U_h = recurrent_kernel[
+            :,
+            2 * H:3 * H,
+        ]
+
+        b_z = bias[
+            0:H
+        ]
+
+        b_r = bias[
+            H:2 * H
+        ]
+
+        b_h = bias[
+            2 * H:3 * H
+        ]
+
+        cell.W_z.assign(
+            W_z
+        )
+
+        cell.W_r.assign(
+            W_r
+        )
+
+        cell.W_h.assign(
+            W_h
+        )
+
+        cell.U_z.assign(
+            U_z
+        )
+
+        cell.U_r.assign(
+            U_r
+        )
+
+        cell.U_h.assign(
+            U_h
+        )
+
+        cell.b_z_inp.assign(
+            b_z
+        )
+
+        cell.b_r_inp.assign(
+            b_r
+        )
+
+        cell.b_h_inp.assign(
+            b_h
+        )
 
         pf(
             f"  OK {gru_layer_name}: "
-            f"W_z={W_z.shape} W_r={W_r.shape} W_h={W_h.shape}  "
-            f"U_z={U_z.shape} U_r={U_r.shape} U_h={U_h.shape}  "
-            f"b_*_inp={b_z_inp.shape} b_*_rec={b_z_rec.shape}"
+            f"kernel={kernel.shape} "
+            f"recurrent={recurrent_kernel.shape} "
+            f"bias={bias.shape}"
         )
-        sys.stdout.flush()
 
-    unpack_and_set("sencgru", enc_cell_p2)
-    unpack_and_set("sdecgru", dec_cell_p2)
+    unpack_and_set(
+        "sencgru",
+        enc_cell_p2,
+    )
+
+    unpack_and_set(
+        "sdecgru",
+        dec_cell_p2,
+    )
 
     try:
-        src_dense = float_student.get_layer("sdec_dense")
-        dst_dense = phase2_model.get_layer("sdec_dense")
-        src_w = src_dense.get_weights()
-        dst_w = dst_dense.get_weights()
-        if len(src_w) == len(dst_w) and all(s.shape == d.shape for s, d in zip(src_w, dst_w)):
-            dst_dense.set_weights(src_w)
-            pf("  OK sdec_dense")
-        else:
-            pf(
-                f"  SKIP sdec_dense — shape mismatch "
-                f"src={[w.shape for w in src_w]} dst={[w.shape for w in dst_w]}"
-            )
-    except Exception as exc:
-        pf(f"  SKIP sdec_dense: {exc}")
+        src_dense = float_student.get_layer(
+            "sdec_dense"
+        )
+
+        dst_dense = phase2_model.get_layer(
+            "sdec_dense"
+        )
+
+    except ValueError as exc:
+        raise RuntimeError(
+            "sdec_dense is missing during P1->P2 transfer"
+        ) from exc
+
+    src_weights = src_dense.get_weights()
+    dst_weights = dst_dense.get_weights()
+
+    if len(src_weights) < 2:
+        raise RuntimeError(
+            "Float sdec_dense does not expose kernel and bias"
+        )
+
+    if len(dst_weights) < 2:
+        raise RuntimeError(
+            "Phase-2 sdec_dense does not expose kernel and bias"
+        )
+
+    if src_weights[0].shape != dst_weights[0].shape:
+        raise RuntimeError(
+            "sdec_dense kernel shape mismatch: "
+            f"src={src_weights[0].shape} "
+            f"dst={dst_weights[0].shape}"
+        )
+
+    if src_weights[1].shape != dst_weights[1].shape:
+        raise RuntimeError(
+            "sdec_dense bias shape mismatch: "
+            f"src={src_weights[1].shape} "
+            f"dst={dst_weights[1].shape}"
+        )
+
+    replacement_weights = list(
+        dst_weights
+    )
+
+    replacement_weights[0] = np.asarray(
+        src_weights[0],
+        dtype=np.float32,
+    )
+
+    replacement_weights[1] = np.asarray(
+        src_weights[1],
+        dtype=np.float32,
+    )
+
+    dst_dense.set_weights(
+        replacement_weights
+    )
+
+    pf(
+        "  OK sdec_dense"
+    )
 
     sys.stdout.flush()
 
@@ -4559,35 +5433,75 @@ def build_teacher_hidden_model(teacher_model):
 # transfer_float_to_phase2 can unpack by name.
 # ==============================================================================
 
-def build_float_student(seq_len, n_out, student_units):
-    enc_inputs = keras.layers.Input(shape=(None, 1), name="senc_input")
-    dec_inputs = keras.layers.Input(shape=(None, 1), name="sdec_input")
+def build_float_student(
+    seq_len,
+    n_out,
+    student_units,
+):
+    """
+    Phase-1 float student using the same GRU recurrence convention as the
+    vanilla QKeras QGRU, but without low-bit parameter/state/candidate
+    quantization.
+
+    Exact recurrent semantics:
+        recurrent_activation = QKeras hard_sigmoid
+        implementation       = 1
+        reset_after           = False
+        candidate activation  = float tanh
+    """
+
+    enc_inputs = keras.layers.Input(
+        shape=(None, 1),
+        name="senc_input",
+    )
+
+    dec_inputs = keras.layers.Input(
+        shape=(None, 1),
+        name="sdec_input",
+    )
 
     enc_out, enc_state = keras.layers.GRU(
         units=student_units,
+        activation="tanh",
+        recurrent_activation=qkeras_hard_sigmoid,
+        implementation=1,
         return_state=True,
-        reset_after=True,
+        reset_after=False,
         name="sencgru",
-    )(enc_inputs)
+    )(
+        enc_inputs
+    )
 
     dec_hid_seq, _ = keras.layers.GRU(
         units=student_units,
+        activation="tanh",
+        recurrent_activation=qkeras_hard_sigmoid,
+        implementation=1,
         return_sequences=True,
         return_state=True,
-        reset_after=True,
+        reset_after=False,
         name="sdecgru",
-    )(dec_inputs, initial_state=enc_state)
+    )(
+        dec_inputs,
+        initial_state=enc_state,
+    )
 
     s_output = keras.layers.Dense(
-        n_out, activation="linear", name="sdec_dense"
-    )(dec_hid_seq)
+        n_out,
+        activation="linear",
+        name="sdec_dense",
+    )(
+        dec_hid_seq
+    )
 
     return keras.models.Model(
-        inputs=[enc_inputs, dec_inputs],
+        inputs=[
+            enc_inputs,
+            dec_inputs,
+        ],
         outputs=s_output,
         name="float_student_memoq",
     )
-
 
 # ==============================================================================
 # find_data_files — identical to vanilla_kd
@@ -4633,22 +5547,61 @@ def main():
     pf(f"  res       : {file_res}")
     pf(f"  labels    : {file_labels}")
 
-    raw_input  = np.load(file_input,  mmap_mode="r")
-    res_data   = np.load(file_res,    mmap_mode="r")
-    train_idx  = np.load(file_train)
-    val_idx    = np.load(file_val)
-    test_idx   = np.load(file_test)
+    normalized_input = np.load(
+        file_input,
+        mmap_mode="r",
+    )
 
-    n_total = raw_input.shape[0]
-    pf(f"[MAIN] n_total={n_total}  train={len(train_idx)}  val={len(val_idx)}  test={len(test_idx)}")
+    res_data = np.load(
+        file_res,
+        mmap_mode="r",
+    )
 
-    # ── Normalise encoder input ───────────────────────────────────────────────
-    pf("[MAIN] Normalising encoder input...")
-    inp_mean = float(np.mean(raw_input[train_idx]))
-    inp_std  = float(np.std(raw_input[train_idx]))
-    inp_std  = max(inp_std, 1e-6)
-    pf(f"  mean={inp_mean:.6f}  std={inp_std:.6f}")
-    normalized_input = (raw_input - inp_mean) / inp_std
+    train_idx = np.load(
+        file_train
+    )
+
+    val_idx = np.load(
+        file_val
+    )
+
+    test_idx = np.load(
+        file_test
+    )
+
+    n_total = int(
+        normalized_input.shape[0]
+    )
+
+    if normalized_input.ndim != 3:
+        raise RuntimeError(
+            f"Expected encoder input rank 3, got shape "
+            f"{normalized_input.shape}"
+        )
+
+    if normalized_input.shape[1] != args.seq_len:
+        raise RuntimeError(
+            f"Expected seq_len={args.seq_len}, "
+            f"got encoder shape={normalized_input.shape}"
+        )
+
+    if normalized_input.shape[2] != 1:
+        raise RuntimeError(
+            f"Expected encoder input_dim=1, "
+            f"got encoder shape={normalized_input.shape}"
+        )
+
+    pf(
+        f"[MAIN] n_total={n_total} "
+        f"train={len(train_idx)} "
+        f"val={len(val_idx)} "
+        f"test={len(test_idx)}"
+    )
+
+    pf(
+        "[MAIN] Encoder preprocessing matches vanilla: "
+        "using tpsf_seq input directly with no additional MemoQ z-score."
+    )
 
     # ── Build teacher ─────────────────────────────────────────────────────────
     pf("[MAIN] Building teacher model...")
@@ -4664,17 +5617,31 @@ def main():
     # teacher_hidden is NOT materialised here. It is computed on-the-fly inside
     # make_dist_memoq_train / make_dist_memoq_val via teacher_hidden_model.
     # This eliminates the (N, T, teacher_units) float32 RAM footprint entirely.
+    matched_cache_dir = os.path.join(
+        args.data_dir,
+        "memoq_qkeras_matched_cache",
+    )
+
+    os.makedirs(
+        matched_cache_dir,
+        exist_ok=True,
+    )
+
+    pf(
+        f"[MAIN] QKeras-matched teacher cache directory: "
+        f"{matched_cache_dir}"
+    )
     teacher_predictions, _ = cache_teacher_predictions_and_hidden(
-        teacher_model        = teacher_model,
-        teacher_hidden_model = teacher_hidden_model,
-        normalized_input     = normalized_input,
-        seq_len              = args.seq_len,
-        n_out                = args.n_out,
-        teacher_units        = args.teacher_units,
-        n_samples            = n_total,
-        infer_batch          = args.infer_batch,
-        data_dir             = args.data_dir,
-        pf                   = pf,
+        teacher_model=teacher_model,
+        teacher_hidden_model=teacher_hidden_model,
+        normalized_input=normalized_input,
+        seq_len=args.seq_len,
+        n_out=args.n_out,
+        teacher_units=args.teacher_units,
+        n_samples=n_total,
+        infer_batch=args.infer_batch,
+        data_dir=matched_cache_dir,
+        pf=pf,
     )
     # teacher_predictions is a read-only memmap — shape (N, T, n_out), float32
 
