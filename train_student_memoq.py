@@ -343,49 +343,471 @@ def compute_channel_scales(tpred_train, n_out, pf):
 # ReduceLROnPlateau
 # ==============================================================================
 
-class ReduceLROnPlateau:
-    def __init__(self, optimizer, factor, patience, min_lr, min_delta):
-        self.factor    = factor
-        self.patience  = patience
-        self.min_lr    = min_lr
-        self.min_delta = min_delta
-        self.best      = float("inf")
-        self.wait      = 0
+# ==============================================================================
+# ReduceLROnPlateau
+# ==============================================================================
 
-        if callable(optimizer.learning_rate):
-            cur = float(optimizer.learning_rate(optimizer.iterations))
+class ReduceLROnPlateau(tf.Module):
+    """
+    Manual ReduceLROnPlateau scheduler with checkpointable state.
+
+    The scheduler is a tf.Module so its best validation value, wait counter,
+    and learning-rate variable are captured by tf.train.Checkpoint together
+    with the model and Adam optimizer.
+
+    This is required for exact SLURM resume semantics. A resumed paper run must
+    continue from the last completed epoch with the same:
+        - model parameters,
+        - Adam iteration counter,
+        - Adam first moments,
+        - Adam second moments,
+        - current learning rate,
+        - ReduceLROnPlateau best value,
+        - ReduceLROnPlateau wait counter.
+    """
+
+    def __init__(
+        self,
+        optimizer,
+        factor,
+        patience,
+        min_lr,
+        min_delta,
+    ):
+        super().__init__(
+            name="reduce_lr_on_plateau"
+        )
+
+        self.optimizer = optimizer
+
+        self.factor = float(
+            factor
+        )
+
+        self.patience = int(
+            patience
+        )
+
+        self.min_lr = float(
+            min_lr
+        )
+
+        self.min_delta = float(
+            min_delta
+        )
+
+        if callable(
+            optimizer.learning_rate
+        ):
+            current_lr = float(
+                optimizer.learning_rate(
+                    optimizer.iterations
+                )
+            )
+
         else:
-            cur = float(K.get_value(optimizer.learning_rate))
+            current_lr = float(
+                K.get_value(
+                    optimizer.learning_rate
+                )
+            )
 
-        self.lr_var = tf.Variable(cur, trainable=False, dtype=tf.float32)
+        self.best_var = tf.Variable(
+            float("inf"),
+            trainable=False,
+            dtype=tf.float64,
+            name="best_validation_loss",
+        )
+
+        self.wait_var = tf.Variable(
+            0,
+            trainable=False,
+            dtype=tf.int64,
+            name="plateau_wait",
+        )
+
+        self.lr_var = tf.Variable(
+            current_lr,
+            trainable=False,
+            dtype=tf.float32,
+            name="learning_rate",
+        )
+
         optimizer.learning_rate = self.lr_var
 
     @property
-    def current_lr(self):
-        return float(K.get_value(self.lr_var))
+    def best(self):
+        return float(
+            self.best_var.numpy()
+        )
 
-    def step(self, val_loss, epoch, pfn):
-        if val_loss < self.best - self.min_delta:
+    @best.setter
+    def best(
+        self,
+        value,
+    ):
+        self.best_var.assign(
+            float(
+                value
+            )
+        )
+
+    @property
+    def wait(self):
+        return int(
+            self.wait_var.numpy()
+        )
+
+    @wait.setter
+    def wait(
+        self,
+        value,
+    ):
+        self.wait_var.assign(
+            int(
+                value
+            )
+        )
+
+    @property
+    def current_lr(self):
+        return float(
+            K.get_value(
+                self.lr_var
+            )
+        )
+
+    def step(
+        self,
+        val_loss,
+        epoch,
+        pfn,
+    ):
+        del epoch
+
+        val_loss = float(
+            val_loss
+        )
+
+        if (
+            val_loss
+            < self.best
+            - self.min_delta
+        ):
             self.best = val_loss
             self.wait = 0
             return False
-        self.wait += 1
-        if self.wait >= self.patience:
+
+        self.wait = (
+            self.wait
+            + 1
+        )
+
+        if (
+            self.wait
+            >= self.patience
+        ):
             old_lr = self.current_lr
-            new_lr = max(old_lr * self.factor, self.min_lr)
+
+            new_lr = max(
+                old_lr
+                * self.factor,
+                self.min_lr,
+            )
+
             if new_lr < old_lr:
-                self.lr_var.assign(new_lr)
-                pfn(f"ReduceLR: {old_lr:.2e} -> {new_lr:.2e}")
+                self.lr_var.assign(
+                    float(
+                        new_lr
+                    )
+                )
+
+                pfn(
+                    f"ReduceLR: "
+                    f"{old_lr:.2e} -> "
+                    f"{new_lr:.2e}"
+                )
+
             self.wait = 0
             return True
+
         return False
 
-    def reset(self, new_lr):
-        self.best = float("inf")
+    def reset(
+        self,
+        new_lr,
+    ):
+        self.best = float(
+            "inf"
+        )
+
         self.wait = 0
-        self.lr_var.assign(float(new_lr))
+
+        self.lr_var.assign(
+            float(
+                new_lr
+            )
+        )
+
+# ==============================================================================
+# Exact epoch-boundary resume checkpoints
+# ==============================================================================
+
+def _resume_checkpoint_directory(
+    job_dir,
+    phase_tag,
+):
+    return os.path.join(
+        job_dir,
+        "resume_checkpoints",
+        str(
+            phase_tag
+        ),
+    )
 
 
+def _resume_checkpoint_prefix(
+    job_dir,
+    phase_tag,
+    completed_epochs,
+):
+    stage_dir = _resume_checkpoint_directory(
+        job_dir=job_dir,
+        phase_tag=phase_tag,
+    )
+
+    return os.path.join(
+        stage_dir,
+        f"ckpt-{int(completed_epochs)}",
+    )
+
+
+def save_exact_resume_checkpoint(
+    model,
+    lr_scheduler,
+    phase_tag,
+    completed_epochs,
+    job_dir,
+    pf,
+):
+    """
+    Save the exact state required to continue a phase from the next epoch.
+
+    The checkpoint contains:
+        - model parameters,
+        - optimizer iterations,
+        - optimizer slot variables / Adam moments,
+        - ReduceLROnPlateau state,
+        - current learning-rate variable.
+
+    completed_epochs is the number of fully completed epochs inside phase_tag.
+
+    Checkpoints are retained through tf.train.CheckpointManager with
+    max_to_keep=2. resume_state.json records the epoch number separately, so a
+    resume always restores the checkpoint whose suffix matches that epoch.
+    """
+
+    completed_epochs = int(
+        completed_epochs
+    )
+
+    if completed_epochs <= 0:
+        raise ValueError(
+            "save_exact_resume_checkpoint requires completed_epochs > 0"
+        )
+
+    stage_dir = _resume_checkpoint_directory(
+        job_dir=job_dir,
+        phase_tag=phase_tag,
+    )
+
+    os.makedirs(
+        stage_dir,
+        exist_ok=True,
+    )
+
+    checkpoint = tf.train.Checkpoint(
+        model=model,
+        optimizer=lr_scheduler.optimizer,
+        scheduler=lr_scheduler,
+    )
+
+    manager = tf.train.CheckpointManager(
+        checkpoint=checkpoint,
+        directory=stage_dir,
+        max_to_keep=2,
+        checkpoint_name="ckpt",
+    )
+
+    saved_path = manager.save(
+        checkpoint_number=completed_epochs
+    )
+
+    expected_path = _resume_checkpoint_prefix(
+        job_dir=job_dir,
+        phase_tag=phase_tag,
+        completed_epochs=completed_epochs,
+    )
+
+    if os.path.abspath(
+        saved_path
+    ) != os.path.abspath(
+        expected_path
+    ):
+        raise RuntimeError(
+            "[RESUME-CKPT] Unexpected checkpoint path. "
+            f"Expected {expected_path}, got {saved_path}"
+        )
+
+    index_path = (
+        saved_path
+        + ".index"
+    )
+
+    if not os.path.isfile(
+        index_path
+    ):
+        raise RuntimeError(
+            "[RESUME-CKPT] TensorFlow reported a saved checkpoint but "
+            f"the index file does not exist: {index_path}"
+        )
+
+    pf(
+        f"[RESUME-CKPT] Saved exact {phase_tag} state "
+        f"after {completed_epochs} completed epochs: "
+        f"{saved_path}"
+    )
+
+    sys.stdout.flush()
+
+    return saved_path
+
+
+def restore_exact_resume_checkpoint(
+    model,
+    lr_scheduler,
+    phase_tag,
+    args_resume,
+    resume_stage,
+    resume_epoch_in_stage,
+    job_dir,
+    pf,
+):
+    """
+    Restore an exact epoch-boundary phase checkpoint.
+
+    This function is intentionally fail-closed. If resume_state.json says that
+    N epochs of the current phase were completed, the matching TensorFlow
+    checkpoint ckpt-N must exist. The code will NOT silently fall back to a
+    best-validation checkpoint because doing so would roll the optimization
+    trajectory backward while keeping the later epoch counter.
+    """
+
+    if not bool(
+        args_resume
+    ):
+        return False
+
+    if str(
+        resume_stage
+    ) != str(
+        phase_tag
+    ):
+        return False
+
+    completed_epochs = int(
+        resume_epoch_in_stage
+    )
+
+    if completed_epochs <= 0:
+        return False
+
+    checkpoint_prefix = _resume_checkpoint_prefix(
+        job_dir=job_dir,
+        phase_tag=phase_tag,
+        completed_epochs=completed_epochs,
+    )
+
+    index_path = (
+        checkpoint_prefix
+        + ".index"
+    )
+
+    if not os.path.isfile(
+        index_path
+    ):
+        raise RuntimeError(
+            "[RESUME-CKPT] Exact resume checkpoint is missing. "
+            f"resume_state.json requests phase={phase_tag}, "
+            f"completed_epochs={completed_epochs}, but this file does not "
+            f"exist: {index_path}. "
+            "Refusing to roll back to a best-validation checkpoint."
+        )
+
+    optimizer = lr_scheduler.optimizer
+
+    create_optimizer_slots = getattr(
+        optimizer,
+        "_create_all_weights",
+        None,
+    )
+
+    if callable(
+        create_optimizer_slots
+    ):
+        create_optimizer_slots(
+            model.trainable_variables
+        )
+
+    checkpoint = tf.train.Checkpoint(
+        model=model,
+        optimizer=optimizer,
+        scheduler=lr_scheduler,
+    )
+
+    status = checkpoint.restore(
+        checkpoint_prefix
+    )
+
+    status.assert_existing_objects_matched()
+    status.expect_partial()
+
+    restored_iterations = int(
+        optimizer.iterations.numpy()
+    )
+
+    pf(
+        f"[RESUME-CKPT] Restored exact {phase_tag} state "
+        f"after {completed_epochs} completed epochs:"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   checkpoint={checkpoint_prefix}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   optimizer_iterations="
+        f"{restored_iterations}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   learning_rate="
+        f"{lr_scheduler.current_lr:.9e}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   scheduler_best="
+        f"{lr_scheduler.best:.9e}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   scheduler_wait="
+        f"{lr_scheduler.wait}"
+    )
+
+    sys.stdout.flush()
+
+    return True
 # ==============================================================================
 # Progress bar
 # ==============================================================================
@@ -907,46 +1329,175 @@ def training_loop_memoq(
         global_epoch = len(history["phase"])
         pf(f"[RESUME] stage={resume_stage} epoch_in_stage={resume_epoch_in_stage} global_epoch={global_epoch}")
 
-        if os.path.exists(p1_ckpt):
-            float_student.load_weights(p1_ckpt)
-            pf("[RESUME] Loaded P1 weights for float_student")
+        # ------------------------------------------------------------------
+        # Exact-resume policy.
+        #
+        # In-progress phases are NOT restored from their best-validation
+        # checkpoint here. Their exact model + Adam + scheduler checkpoint is
+        # restored only after that phase's optimizer has been constructed.
+        #
+        # At a phase boundary (resume epoch == 0), the next phase starts from
+        # the selected BEST checkpoint of the preceding phase, which matches
+        # the normal non-interrupted stage transition.
+        # ------------------------------------------------------------------
 
-        # Load the checkpoint for the stage we are actually resuming into.
-        _p2_stage_ckpts = {
+        stage_best_ckpts = {
+            "P1": p1_ckpt,
             "P2A": p2a_ckpt,
             "P2B": p2b_ckpt,
             "P2C": p2c_ckpt,
             "P2D": p2d_ckpt,
             "P2E": p2e_ckpt,
             "P2F": p2f_ckpt,
+            "P3": p3_ckpt,
         }
-        _p2_fallback_order = ["P2A", "P2B", "P2C", "P2D", "P2E", "P2F"]
 
-        if resume_stage in _p2_stage_ckpts:
-            target_ckpt = _p2_stage_ckpts[resume_stage]
-            if os.path.exists(target_ckpt):
-                phase2_model.load_weights(target_ckpt)
-                pf(f"[RESUME] Loaded {resume_stage} weights for phase2_model from {target_ckpt}")
+        previous_stage = {
+            "P2A": "P1",
+            "P2B": "P2A",
+            "P2C": "P2B",
+            "P2D": "P2C",
+            "P2E": "P2D",
+            "P2F": "P2E",
+            "P3": "P2F",
+        }
+
+        # P1 best is needed as the transfer baseline if resuming P2A.
+        if (
+            resume_stage == "P2A"
+            and os.path.isfile(p1_ckpt)
+        ):
+            float_student.load_weights(
+                p1_ckpt
+            )
+
+            pf(
+                f"[RESUME] Loaded P1 selected checkpoint for "
+                f"P1->P2A transfer: {p1_ckpt}"
+            )
+
+        # A resume_state written at a phase boundary uses the NEXT stage with
+        # epoch_in_stage=0. Restore the selected best checkpoint from the
+        # preceding phase so the next phase starts from exactly the same model
+        # it would have used without preemption.
+        if (
+            resume_epoch_in_stage == 0
+            and resume_stage in previous_stage
+        ):
+            previous = previous_stage[
+                resume_stage
+            ]
+
+            previous_ckpt = stage_best_ckpts[
+                previous
+            ]
+
+            if not os.path.isfile(
+                previous_ckpt
+            ):
+                raise RuntimeError(
+                    "[RESUME] Phase-boundary checkpoint is missing. "
+                    f"resume_stage={resume_stage}, "
+                    f"required_previous_stage={previous}, "
+                    f"required_checkpoint={previous_ckpt}"
+                )
+
+            if previous == "P1":
+                float_student.load_weights(
+                    previous_ckpt
+                )
+
+            elif previous in (
+                "P2A",
+                "P2B",
+                "P2C",
+                "P2D",
+                "P2E",
+                "P2F",
+            ):
+                phase2_model.load_weights(
+                    previous_ckpt
+                )
+
+            elif previous == "P3":
+                final_qkeras_student.load_weights(
+                    previous_ckpt
+                )
+
             else:
-                # No checkpoint yet for this stage — fall back to the most recent
-                # earlier stage and restart this stage from epoch 0.
-                resume_idx_in_p2 = _p2_fallback_order.index(resume_stage)
-                fallback_ckpt = None
-                for earlier in reversed(_p2_fallback_order[:resume_idx_in_p2]):
-                    cand = _p2_stage_ckpts[earlier]
-                    if os.path.exists(cand):
-                        fallback_ckpt = cand
-                        break
-                if fallback_ckpt is not None:
-                    phase2_model.load_weights(fallback_ckpt)
-                    pf(f"[RESUME] {resume_stage} checkpoint missing — loaded {fallback_ckpt} and restarting {resume_stage} from epoch 0")
-                    resume_epoch_in_stage = 0
+                raise RuntimeError(
+                    f"[RESUME] Unsupported previous stage: {previous}"
+                )
 
-        if resume_stage == "P3" and os.path.exists(p3_ckpt):
-            final_qkeras_student.load_weights(p3_ckpt)
-            pf("[RESUME] Loaded P3 weights for final_qkeras_student")
+            pf(
+                f"[RESUME] Phase-boundary restore: "
+                f"{previous} -> {resume_stage} from {previous_ckpt}"
+            )
+
+        # Defensive recovery for the tiny window between the final epoch of a
+        # stage and the phase-boundary save_resume(next_stage, 0) call.
+        #
+        # In that case resume_state may still name the completed old stage.
+        # The normal uninterrupted code would immediately load that stage's
+        # BEST checkpoint before entering the next stage, so do the same here.
+        resume_stage_max_epochs = int(
+            max_epochs_per_stage[
+                resume_stage
+            ]
+        )
+
+        if (
+            resume_epoch_in_stage
+            >= resume_stage_max_epochs
+            and resume_stage_max_epochs > 0
+        ):
+            completed_stage_ckpt = stage_best_ckpts[
+                resume_stage
+            ]
+
+            if not os.path.isfile(
+                completed_stage_ckpt
+            ):
+                raise RuntimeError(
+                    "[RESUME] Completed-stage best checkpoint is missing. "
+                    f"stage={resume_stage}, "
+                    f"checkpoint={completed_stage_ckpt}"
+                )
+
+            if resume_stage == "P1":
+                float_student.load_weights(
+                    completed_stage_ckpt
+                )
+
+            elif resume_stage in (
+                "P2A",
+                "P2B",
+                "P2C",
+                "P2D",
+                "P2E",
+                "P2F",
+            ):
+                phase2_model.load_weights(
+                    completed_stage_ckpt
+                )
+
+            elif resume_stage == "P3":
+                final_qkeras_student.load_weights(
+                    completed_stage_ckpt
+                )
+
+            pf(
+                f"[RESUME] Stage {resume_stage} was already complete; "
+                f"loaded selected checkpoint {completed_stage_ckpt}"
+            )
+
         sys.stdout.flush()
-
+    # Runtime mapping populated when each phase constructs its optimizer and
+    # checkpointable LR scheduler.
+    #
+    # save_resume() uses this mapping to write an exact epoch-boundary
+    # TensorFlow checkpoint before committing resume_state.json.
+    resume_runtime = {}
     csv_path = os.path.join(job_dir, "training_history.csv")
     if not args.resume or (resume_stage == "P1" and resume_epoch_in_stage == 0):
         with open(csv_path, "w") as f:
@@ -956,20 +1507,131 @@ def training_loop_memoq(
                 "val_mae,lr\n"
             )
 
-    def save_resume(stage_tag, ep_in_stage):
+    def save_resume(
+        stage_tag,
+        ep_in_stage,
+    ):
+        """
+        Persist restart metadata atomically.
+
+        For an in-progress phase (ep_in_stage > 0), write the exact TensorFlow
+        model/optimizer/scheduler checkpoint FIRST. Only after that checkpoint
+        is complete is resume_state.json atomically replaced.
+
+        For a phase boundary (ep_in_stage == 0), no new optimizer checkpoint is
+        required; the next stage is reconstructed from the preceding stage's
+        selected best checkpoint.
+        """
+
+        stage_tag = str(
+            stage_tag
+        )
+
+        ep_in_stage = int(
+            ep_in_stage
+        )
+
+        if ep_in_stage > 0:
+            runtime_entry = resume_runtime.get(
+                stage_tag
+            )
+
+            if runtime_entry is None:
+                raise RuntimeError(
+                    "[RESUME] Runtime checkpoint registration is missing for "
+                    f"stage={stage_tag}. "
+                    "Refusing to write resume_state.json without an exact "
+                    "model/optimizer checkpoint."
+                )
+
+            runtime_model = runtime_entry[
+                "model"
+            ]
+
+            runtime_scheduler = runtime_entry[
+                "scheduler"
+            ]
+
+            save_exact_resume_checkpoint(
+                model=runtime_model,
+                lr_scheduler=runtime_scheduler,
+                phase_tag=stage_tag,
+                completed_epochs=ep_in_stage,
+                job_dir=job_dir,
+                pf=pf,
+            )
+
         state = {
-            "stage":          stage_tag,
+            "stage": stage_tag,
             "epoch_in_stage": ep_in_stage,
-            "best_vals":      {k: float(v) for k, v in best_vals.items()},
-            "patience_cts":   {k: int(v)   for k, v in patience_cts.items()},
-            "history":        {
-                k: ([float(x) for x in v] if k != "phase" else list(v))
+            "best_vals": {
+                k: float(
+                    v
+                )
+                for k, v in best_vals.items()
+            },
+            "patience_cts": {
+                k: int(
+                    v
+                )
+                for k, v in patience_cts.items()
+            },
+            "history": {
+                k: (
+                    [
+                        float(
+                            x
+                        )
+                        for x in v
+                    ]
+                    if k != "phase"
+                    else list(
+                        v
+                    )
+                )
                 for k, v in history.items()
             },
         }
-        with open(resume_path, "w") as f:
-            json.dump(state, f, indent=2)
 
+        tmp_resume_path = (
+            resume_path
+            + ".tmp"
+        )
+
+        with open(
+            tmp_resume_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                state,
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+
+            handle.write(
+                "\n"
+            )
+
+            handle.flush()
+
+            os.fsync(
+                handle.fileno()
+            )
+
+        os.replace(
+            tmp_resume_path,
+            resume_path,
+        )
+
+        pf(
+            f"[RESUME] Saved resume state: "
+            f"stage={stage_tag}, "
+            f"epoch_in_stage={ep_in_stage}"
+        )
+
+        sys.stdout.flush()
     def mark_training_complete():
         with open(completion_path, "w") as f:
             f.write("done\n")
@@ -1007,6 +1669,22 @@ def training_loop_memoq(
             opt_p1, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p1.reset(lr_p1)
+
+        resume_runtime["P1"] = {
+            "model": float_student,
+            "scheduler": sched_p1,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=float_student,
+            lr_scheduler=sched_p1,
+            phase_tag="P1",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         dist_train_p1 = make_dist_phase1_train(
             strategy, float_student, opt_p1, args.alpha, channel_scales,
@@ -1049,10 +1727,27 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        if os.path.exists(p1_ckpt):
-            float_student.load_weights(p1_ckpt)
-            pf(f"[P1] Best weights loaded: {p1_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p1_ckpt
+        ):
+            raise RuntimeError(
+                f"[P1] Selected checkpoint is missing: {p1_ckpt}"
+            )
+
+        float_student.load_weights(
+            p1_ckpt
+        )
+
+        pf(
+            f"[P1] Best weights loaded: {p1_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2A",
+            0,
+        )
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P1...")
@@ -1088,6 +1783,22 @@ def training_loop_memoq(
             opt_p2a, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2a.reset(lr_p2a)
+
+        resume_runtime["P2A"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2a,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2a,
+            phase_tag="P2A",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2a_start = start_ep("P2A")
         innov_active = ep2a_start >= args.memoq_innov_burnin
@@ -1168,10 +1879,27 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        if os.path.exists(p2a_ckpt):
-            phase2_model.load_weights(p2a_ckpt)
-            pf(f"[P2A] Loaded best weights from {p2a_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p2a_ckpt
+        ):
+            raise RuntimeError(
+                f"[P2A] Selected checkpoint is missing: {p2a_ckpt}"
+            )
+
+        phase2_model.load_weights(
+            p2a_ckpt
+        )
+
+        pf(
+            f"[P2A] Loaded best weights from {p2a_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2B",
+            0,
+        )
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P2A...")
@@ -1195,6 +1923,22 @@ def training_loop_memoq(
             opt_p2b, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2b.reset(lr_p2b)
+
+        resume_runtime["P2B"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2b,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2b,
+            phase_tag="P2B",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2b_start = start_ep("P2B")
 
@@ -1260,11 +2004,28 @@ def training_loop_memoq(
             save_resume("P2B", ep_in_phase + 1)
             if early_stop:
                 break
+        if not os.path.isfile(
+            p2b_ckpt
+        ):
+            raise RuntimeError(
+                f"[P2B] Selected checkpoint is missing: {p2b_ckpt}"
+            )
 
-        if os.path.exists(p2b_ckpt):
-            phase2_model.load_weights(p2b_ckpt)
-            pf(f"[P2B] Loaded best weights from {p2b_ckpt}")
-            sys.stdout.flush()
+        phase2_model.load_weights(
+            p2b_ckpt
+        )
+
+        pf(
+            f"[P2B] Loaded best weights from {p2b_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2C",
+            0,
+        )
+
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P2B...")
@@ -1288,6 +2049,22 @@ def training_loop_memoq(
             opt_p2c, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2c.reset(lr_p2c)
+
+        resume_runtime["P2C"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2c,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2c,
+            phase_tag="P2C",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2c_start = start_ep("P2C")
 
@@ -1354,12 +2131,30 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        if os.path.exists(p2c_ckpt):
-            phase2_model.load_weights(p2c_ckpt)
-            pf(f"[P2C] Loaded best weights from {p2c_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p2c_ckpt
+        ):
+            raise RuntimeError(
+                f"[P2C] Selected checkpoint is missing: {p2c_ckpt}"
+            )
+
+        phase2_model.load_weights(
+            p2c_ckpt
+        )
+
+        pf(
+            f"[P2C] Loaded best weights from {p2c_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2D",
+            0,
+        )
 
         if evaluate_fn is not None:
+
             pf("[EVAL] Running per-phase scatter evaluation after P2C...")
             sys.stdout.flush()
             evaluate_fn(phase_tag="P2C")
@@ -1381,6 +2176,22 @@ def training_loop_memoq(
             opt_p2d, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2d.reset(lr_p2d)
+
+        resume_runtime["P2D"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2d,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2d,
+            phase_tag="P2D",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2d_start = start_ep("P2D")
 
@@ -1447,10 +2258,28 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        if os.path.exists(p2d_ckpt):
-            phase2_model.load_weights(p2d_ckpt)
-            pf(f"[P2D] Loaded best weights from {p2d_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p2d_ckpt
+        ):
+            raise RuntimeError(
+                f"[P2D] Selected checkpoint is missing: {p2d_ckpt}"
+            )
+
+        phase2_model.load_weights(
+            p2d_ckpt
+        )
+
+        pf(
+            f"[P2D] Loaded best weights from {p2d_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2E",
+            0,
+        )
+
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P2D...")
@@ -1479,6 +2308,22 @@ def training_loop_memoq(
             opt_p2e, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2e.reset(lr_p2e)
+
+        resume_runtime["P2E"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2e,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2e,
+            phase_tag="P2E",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2e_start = start_ep("P2E")
 
@@ -1521,7 +2366,44 @@ def training_loop_memoq(
             else 0.0
         )
 
-        for ep_in_phase in range(ep2e_start, args.memoq_stage2e_epochs):
+        for ep_in_phase in range(
+            ep2e_start,
+            args.memoq_stage2e_epochs,
+        ):
+            # --------------------------------------------------------------
+            # Checkpoint-selection boundary.
+            #
+            # Epochs before anneal_epochs_2e belong to the soft activation
+            # transition and are retained in history for mechanistic analysis,
+            # but they are NOT eligible to become the selected P2E checkpoint.
+            #
+            # At the first true hard-tail epoch, reset phase-level checkpoint
+            # selection so stage2e_best.weights.h5 is guaranteed to represent
+            # a model trained/evaluated with activation_blend_beta == 1.
+            # --------------------------------------------------------------
+
+            if ep_in_phase == anneal_epochs_2e:
+                best_vals["P2E"] = float(
+                    "inf"
+                )
+
+                patience_cts["P2E"] = 0
+
+                if os.path.isfile(
+                    p2e_ckpt
+                ):
+                    os.remove(
+                        p2e_ckpt
+                    )
+
+                pf(
+                    "[P2E] Entering hard candidate-activation tail. "
+                    "Resetting P2E best-checkpoint selection; soft-anneal "
+                    "epochs are not eligible for stage2e_best.weights.h5."
+                )
+
+                sys.stdout.flush()
+
             # Cosine anneal: beta = 0.5*(1 - cos(pi * frac))
             if ep_in_phase < anneal_epochs_2e:
                 frac = float(ep_in_phase + 1) / float(anneal_epochs_2e)
@@ -1582,10 +2464,29 @@ def training_loop_memoq(
             cell.activation_blend_beta = 1.0
             cell.act_dither_delta      = 0.0
 
-        if os.path.exists(p2e_ckpt):
-            phase2_model.load_weights(p2e_ckpt)
-            pf(f"[P2E] Loaded best weights from {p2e_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p2e_ckpt
+        ):
+            raise RuntimeError(
+                "[P2E] No hard-tail checkpoint was selected. "
+                f"Expected: {p2e_ckpt}"
+            )
+
+        phase2_model.load_weights(
+            p2e_ckpt
+        )
+
+        pf(
+            f"[P2E] Loaded best HARD candidate-activation weights "
+            f"from {p2e_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P2F",
+            0,
+        )
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P2E...")
@@ -1593,19 +2494,31 @@ def training_loop_memoq(
             evaluate_fn(phase_tag="P2E")
 
     # ══════════════════════════════════════════════════════════════════════════
-    # PHASE 2F — Joint activation + state quantizer soft-blend anneal (Fix 2).
-    # Both activation_blend_beta and state_blend_beta are set to 0.0 at entry
-    # by set_phase2_quantizers("P2F") and ramped jointly with a single cosine
-    # schedule over memoq_state_anneal_epochs epochs. Both dithers are active
-    # during the anneal and tapered to 0 before the hard tail.
-    # This eliminates the double-shock where P2E adapted weights to a float
-    # state and P2F then invalidated that by suddenly quantizing the state.
+    # PHASE 2F — Recurrent-state quantizer soft-blend anneal.
+    #
+    # The candidate activation is already fully hard from P2E and remains
+    # fixed at activation_blend_beta=1.0 throughout P2F.
+    #
+    # P2F introduces ONLY the recurrent-state finite-resolution constraint:
+    # state_blend_beta is annealed 0->1 and then held at 1.0 for the hard tail.
+    #
+    # For paper_main, training dither and every auxiliary loss are disabled.
+    # Thus the P2E -> P2F numerical intervention is specifically the addition
+    # of state-on-reentry quantization.
     # ══════════════════════════════════════════════════════════════════════════
     if should_run("P2F"):
         set_phase2_quantizers(args, enc_cell_p2, dec_cell_p2, "P2F")
         pf("=" * 60)
-        pf(f"MEMOQ PHASE 2F — Joint activation+state soft-blend anneal ({args.memoq_stage2f_epochs} epochs)")
-        pf(f"  anneal_epochs={args.memoq_state_anneal_epochs}  both betas 0->1 cosine jointly then hard.")
+        pf(
+            f"MEMOQ PHASE 2F — Recurrent-state soft-blend anneal "
+            f"({args.memoq_stage2f_epochs} epochs)"
+        )
+
+        pf(
+            f"  anneal_epochs={args.memoq_state_anneal_epochs}  "
+            f"activation_blend_beta fixed at 1.0; "
+            f"state_blend_beta 0->1 cosine then hard."
+        )
         pf(f"  innov={args.memoq_lambda_innov_p2f}  mem={args.memoq_lambda_mem_p2f}  "
            f"zsat={args.memoq_lambda_zsat_p2f}  rail={args.memoq_lambda_rail_p2f}")
         pf("=" * 60)
@@ -1617,6 +2530,22 @@ def training_loop_memoq(
             opt_p2f, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p2f.reset(lr_p2f)
+
+        resume_runtime["P2F"] = {
+            "model": phase2_model,
+            "scheduler": sched_p2f,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=phase2_model,
+            lr_scheduler=sched_p2f,
+            phase_tag="P2F",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep2f_start = start_ep("P2F")
 
@@ -1666,6 +2595,39 @@ def training_loop_memoq(
             ep2f_start,
             args.memoq_stage2f_epochs,
         ):
+            # --------------------------------------------------------------
+            # Checkpoint-selection boundary.
+            #
+            # Soft-state annealing epochs are retained as mechanistic
+            # observations but cannot become the selected P2F checkpoint.
+            #
+            # stage2f_best.weights.h5 is reset at the first fully hard-tail
+            # epoch so it necessarily represents state_blend_beta == 1.
+            # --------------------------------------------------------------
+
+            if ep_in_phase == anneal_epochs_2f:
+                best_vals["P2F"] = float(
+                    "inf"
+                )
+
+                patience_cts["P2F"] = 0
+
+                if os.path.isfile(
+                    p2f_ckpt
+                ):
+                    os.remove(
+                        p2f_ckpt
+                    )
+
+                pf(
+                    "[P2F] Entering hard recurrent-state tail. "
+                    "Resetting P2F best-checkpoint selection; soft-state "
+                    "anneal epochs are not eligible for "
+                    "stage2f_best.weights.h5."
+                )
+
+                sys.stdout.flush()
+
             # --------------------------------------------------------------
             # P2F is STATE-ONLY hardening.
             #
@@ -1790,10 +2752,29 @@ def training_loop_memoq(
             cell.act_dither_delta      = 0.0
             cell.state_dither_delta    = 0.0
 
-        if os.path.exists(p2f_ckpt):
-            phase2_model.load_weights(p2f_ckpt)
-            pf(f"[P2F] Loaded best weights from {p2f_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p2f_ckpt
+        ):
+            raise RuntimeError(
+                "[P2F] No hard-state checkpoint was selected. "
+                f"Expected: {p2f_ckpt}"
+            )
+
+        phase2_model.load_weights(
+            p2f_ckpt
+        )
+
+        pf(
+            f"[P2F] Loaded best HARD recurrent-state weights "
+            f"from {p2f_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        save_resume(
+            "P3",
+            0,
+        )
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P2F...")
@@ -1822,10 +2803,14 @@ def training_loop_memoq(
                 return label, ckpt
         return None, None
 
-    entering_p3_fresh = should_run("P3") and not (
+    entering_p3_fresh = should_run(
+        "P3"
+    ) and not (
         args.resume
         and resume_stage == "P3"
-        and os.path.exists(p3_ckpt)
+        and int(
+            resume_epoch_in_stage
+        ) > 0
     )
     if entering_p3_fresh:
         last_p2_label, last_p2_ckpt = _last_completed_p2_ckpt_label()
@@ -1871,6 +2856,22 @@ def training_loop_memoq(
             opt_p3, args.lr_factor, args.effective_lr_patience, args.lr_min, args.min_delta
         )
         sched_p3.reset(lr_p3)
+
+        resume_runtime["P3"] = {
+            "model": final_qkeras_student,
+            "scheduler": sched_p3,
+        }
+
+        restore_exact_resume_checkpoint(
+            model=final_qkeras_student,
+            lr_scheduler=sched_p3,
+            phase_tag="P3",
+            args_resume=args.resume,
+            resume_stage=resume_stage,
+            resume_epoch_in_stage=resume_epoch_in_stage,
+            job_dir=job_dir,
+            pf=pf,
+        )
 
         ep3_start = start_ep("P3")
 
@@ -1930,10 +2931,30 @@ def training_loop_memoq(
             if early_stop:
                 break
 
-        if os.path.exists(p3_ckpt):
-            final_qkeras_student.load_weights(p3_ckpt)
-            pf(f"[P3] Loaded best phase3 weights from {p3_ckpt}")
-            sys.stdout.flush()
+        if not os.path.isfile(
+            p3_ckpt
+        ):
+            raise RuntimeError(
+                f"[P3] Selected checkpoint is missing: {p3_ckpt}"
+            )
+
+        final_qkeras_student.load_weights(
+            p3_ckpt
+        )
+
+        pf(
+            f"[P3] Loaded best phase3 weights from {p3_ckpt}"
+        )
+
+        sys.stdout.flush()
+
+        # Mark P3 logically complete BEFORE the potentially expensive test
+        # evaluation. If SLURM preempts during evaluation, resume will not
+        # restart P3 training.
+        save_resume(
+            "P3",
+            args.memoq_stage3_epochs,
+        )
 
         if evaluate_fn is not None:
             pf("[EVAL] Running per-phase scatter evaluation after P3...")
