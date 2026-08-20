@@ -63,6 +63,7 @@ import os
 import sys
 import time
 import math
+import re
 
 # ── Force GPU visibility BEFORE any TF import ────────────────────────────────
 if "CUDA_VISIBLE_DEVICES" not in os.environ:
@@ -79,6 +80,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
+from scipy.io import savemat
 from scipy.stats import pearsonr
 try:
     from fastdtw import fastdtw
@@ -101,7 +103,101 @@ from tensorflow.keras.models import Model
 from qkeras import QDense, QGRU, quantized_bits, quantized_tanh
 
 
+# ==============================================================================
+# Publication-output helpers
+# ==============================================================================
 
+def save_mat_atomic(path, payload, pf=None):
+    """
+    Save a MATLAB .mat file atomically.
+
+    The file is first written to a temporary path in the same directory and
+    then moved into place with os.replace(). This prevents interrupted SLURM
+    jobs from leaving a partially written .mat file that looks valid.
+
+    The saved files use MATLAB v5 format through scipy.io.savemat. The arrays
+    written by this training script are figure-level data and remain well below
+    the MATLAB v5 per-variable size limit.
+    """
+    path = os.path.abspath(path)
+    parent = os.path.dirname(path)
+
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    tmp_path = path + ".tmp"
+
+    if os.path.exists(tmp_path):
+        os.remove(tmp_path)
+
+    try:
+        savemat(
+            tmp_path,
+            payload,
+            appendmat=False,
+            do_compression=True,
+            long_field_names=True,
+            oned_as="column",
+        )
+
+        os.replace(
+            tmp_path,
+            path,
+        )
+
+    except Exception:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
+        raise
+
+    if pf is not None:
+        pf(
+            f"[MAT] Saved {path}"
+        )
+
+
+def save_figure_outputs(
+    fig,
+    base_path,
+    pf,
+    png_dpi=600,
+):
+    """
+    Save one Matplotlib figure in both publication-quality raster and vector
+    formats.
+
+    base_path must not contain an extension.
+
+    Outputs:
+        <base_path>.png
+        <base_path>.pdf
+    """
+    png_path = base_path + ".png"
+    pdf_path = base_path + ".pdf"
+
+    fig.savefig(
+        png_path,
+        dpi=int(png_dpi),
+        bbox_inches="tight",
+        facecolor="white",
+    )
+
+    fig.savefig(
+        pdf_path,
+        bbox_inches="tight",
+        facecolor="white",
+    )
+
+    pf(
+        f"[FIGURE] Saved {png_path}"
+    )
+
+    pf(
+        f"[FIGURE] Saved {pdf_path}"
+    )
+
+    return png_path, pdf_path
 
 # ==============================================================================
 # File discovery
@@ -396,195 +492,305 @@ def make_dist_phase1_val(strategy, model, alpha, channel_scales, huber_delta, ou
         )
     return step
 
-def set_phase2_quantizers(args, enc_cell, dec_cell, stage):
+def set_phase2_quantizers(
+    args,
+    enc_cell,
+    dec_cell,
+    stage,
+):
     """
-    Assign quantizers to MemoQGRUCell gate variables based on the curriculum
-    stage AND the controlled-experiment quantizer family (args.q_alpha).
+    Assign quantizers to MemoQGRUCell variables for the progressively hardened
+    QKeras-matched recurrent trajectory.
 
-    Stage order (curriculum=True):
-      P2A : h kernel + recurrent + bias only
-      P2B : h + r kernel + recurrent + bias
-      P2C : h + r + z kernel + recurrent  (biases still float)
-      P2D : h + r + z kernel + recurrent + ALL biases
-      P2E : h + r + z kernel + recurrent + ALL biases + activation quantizer
-             activation_blend_beta and act_dither_delta are set to their
-             STARTING values (beta=0, dither=DELTA_A*0.5) here so the training
-             loop can begin the cosine anneal from epoch 0 of P2E.
-      P2F : all of above + state quantizer.
-             Both activation_blend_beta and state_blend_beta are reset to 0.0
-             here so the merged anneal in the training loop starts from 0 for
-             BOTH quantizers simultaneously (Fix 2 — joint anneal).
-             state_dither_delta is set to DELTA_S*0.5 at anneal start.
-      P3  : identical quantizer assignment to P2F. beta and dither are
-             enforced to 1.0 / 0.0 externally by the training loop hard tail.
+    Primary curriculum:
 
-    curriculum=False collapses P2A/P2B/P2C/P2D/P2E/P2F all into P2A
-    (all quantizers on immediately — control run).
+        P2A:
+            candidate-path input/recurrent weights quantized
 
-    Fix 1: LSB noise (old Gaussian) is REPLACED with subtractive uniform dither.
-    DELTA_S = DELTA_A = 0.125 for 4-bit. Half-width = 0.0625.
-    The Gaussian std 1/(2^bits-1) = 0.0667 was 1.85x the physical rounding std
-    and was unbounded. The new dither is bounded in [-DELTA, DELTA] (triangular
-    sum), correct scale, and is applied subtractively inside call() so it
-    linearises the dead-zone without biasing the expected value.
+        P2B:
+            P2A + reset-path input/recurrent weights quantized
 
-    Fix 2: activation_blend_beta mirrors state_blend_beta. Both are set here
-    to their starting values. The training loop ramps both together with a
-    single cosine schedule in the merged P2E+P2F anneal.
+        P2C:
+            P2B + update-path input/recurrent weights quantized
 
-    Dither is tapered to 0.0 over the last 10% of the anneal window by the
-    training loop. This function sets the INITIAL value at anneal start.
-    In P3 / hard tail both deltas are set to 0.0 (exact inference).
+        P2D:
+            P2C + all GRU biases quantized
+
+        P2E:
+            P2D + candidate activation quantizer
+            activation_blend_beta starts at 0 and anneals to 1
+            recurrent state remains unquantized
+
+        P2F:
+            P2E candidate activation REMAINS HARD at beta=1
+            recurrent-state quantizer is introduced
+            state_blend_beta starts at 0 and anneals to 1
+
+        P3:
+            final hard QKeras graph
+
+    This ordering is intentionally designed so P2E -> P2F introduces recurrent
+    state precision as the new numerical constraint. Candidate activation is
+    not re-annealed during P2F.
+
+    Dither is optional and controlled by --memoq-use-dither. It is disabled for
+    the paper_main run.
     """
-    q4k  = quantized_bits(args.bits_kernel,    0, 1, alpha=args.q_alpha)
-    q4r  = quantized_bits(args.bits_recurrent, 0, 1, alpha=args.q_alpha)
-    q4b  = quantized_bits(args.bits_bias,      0, 1, alpha=args.q_alpha)
-    q4s  = quantized_bits(args.bits_state,     0, 1, alpha=1.0)
-    q4a  = quantized_tanh(bits=args.bits_activation, symmetric=True)
 
-    # Fix 1: correct physical half-LSB for 4-bit uniform quantizer.
-    # Replaces the old 1/(2^bits_state - 1) = 0.0667 Gaussian std.
-    DELTA_S = 2.0 ** (-(args.bits_state - 1))       # 0.125 for 4-bit
-    DELTA_A = 2.0 ** (-(args.bits_activation - 1))  # 0.125 for 4-bit
-    dither_half_s = DELTA_S * 0.5                   # 0.0625
-    dither_half_a = DELTA_A * 0.5                   # 0.0625
+    q4k = quantized_bits(
+        args.bits_kernel,
+        0,
+        1,
+        alpha=args.q_alpha,
+    )
 
-    curriculum = args.memoq_gate_curriculum
+    q4r = quantized_bits(
+        args.bits_recurrent,
+        0,
+        1,
+        alpha=args.q_alpha,
+    )
+
+    q4b = quantized_bits(
+        args.bits_bias,
+        0,
+        1,
+        alpha=args.q_alpha,
+    )
+
+    q4s = quantized_bits(
+        args.bits_state,
+        0,
+        1,
+        alpha=1.0,
+    )
+
+    q4a = quantized_tanh(
+        bits=args.bits_activation,
+        symmetric=True,
+    )
+
+    delta_s = 2.0 ** (
+        -(
+            args.bits_state
+            - 1
+        )
+    )
+
+    delta_a = 2.0 ** (
+        -(
+            args.bits_activation
+            - 1
+        )
+    )
+
+    if args.memoq_use_dither:
+        dither_half_s = (
+            delta_s
+            * 0.5
+        )
+
+        dither_half_a = (
+            delta_a
+            * 0.5
+        )
+
+    else:
+        dither_half_s = 0.0
+        dither_half_a = 0.0
+
+    curriculum = bool(
+        args.memoq_gate_curriculum
+    )
 
     if not curriculum:
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = q4k
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = q4r
-        q_bias       = q4b
-        q_a          = q4a
-        q_s          = q4s
-        # No anneal in non-curriculum control run: hard quantizers immediately.
-        # Set betas to 1.0 and dithers to 0.0 so call() is the hard path.
-        act_beta     = 1.0
-        state_beta   = 1.0
-        act_dither   = 0.0
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = q4b
+        q_a = q4a
+        q_s = q4s
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
         state_dither = 0.0
+
     elif stage == "P2A":
-        q_h          = q4k
-        q_r          = None
-        q_z          = None
-        rq_h         = q4r
-        rq_r         = None
-        rq_z         = None
-        q_bias       = None
-        q_a          = None
-        q_s          = None
-        act_beta     = 1.0
-        state_beta   = 1.0
-        act_dither   = 0.0
-        # Fix 1: correct bounded uniform dither on state during P2A.
-        # Old code: state_lsb_noise_std = 1/(2^bits-1) = 0.0667 Gaussian.
-        # New code: subtractive uniform half-width = DELTA_S * 0.5 = 0.0625.
+        q_h = q4k
+        q_r = None
+        q_z = None
+
+        rq_h = q4r
+        rq_r = None
+        rq_z = None
+
+        q_bias = None
+        q_a = None
+        q_s = None
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
         state_dither = dither_half_s
+
     elif stage == "P2B":
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = None
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = None
-        q_bias       = None
-        q_a          = None
-        q_s          = None
-        act_beta     = 1.0
-        state_beta   = 1.0
-        act_dither   = 0.0
+        q_h = q4k
+        q_r = q4k
+        q_z = None
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = None
+
+        q_bias = None
+        q_a = None
+        q_s = None
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
         state_dither = dither_half_s
+
     elif stage == "P2C":
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = q4k
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = q4r
-        q_bias       = None
-        q_a          = None
-        q_s          = None
-        act_beta     = 1.0
-        state_beta   = 1.0
-        act_dither   = 0.0
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = None
+        q_a = None
+        q_s = None
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
         state_dither = dither_half_s
+
     elif stage == "P2D":
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = q4k
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = q4r
-        q_bias       = q4b
-        q_a          = None
-        q_s          = None
-        act_beta     = 1.0
-        state_beta   = 1.0
-        act_dither   = 0.0
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = q4b
+        q_a = None
+        q_s = None
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
         state_dither = dither_half_s
+
     elif stage == "P2E":
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = q4k
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = q4r
-        q_bias       = q4b
-        q_a          = q4a
-        q_s          = None
-        # Fix 0+2: activation quantizer is introduced with beta=0 (fully float)
-        # and dither active. The training loop ramps beta 0->1 with cosine
-        # schedule over memoq_state_anneal_epochs epochs. State still float.
-        act_beta     = 0.0
-        state_beta   = 1.0
-        act_dither   = dither_half_a
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = q4b
+        q_a = q4a
+        q_s = None
+
+        # Candidate activation is progressively introduced.
+        act_beta = 0.0
+
+        # No state quantizer exists in P2E.
+        state_beta = 1.0
+
+        act_dither = dither_half_a
         state_dither = dither_half_s
-    elif stage in ("P2F", "P3"):
-        q_h          = q4k
-        q_r          = q4k
-        q_z          = q4k
-        rq_h         = q4r
-        rq_r         = q4r
-        rq_z         = q4r
-        q_bias       = q4b
-        q_a          = q4a
-        q_s          = q4s
-        # Fix 2: merged joint anneal. Both activation_blend_beta AND
-        # state_blend_beta start at 0.0 here. The training loop drives
-        # both to 1.0 together with a single cosine schedule.
-        # Both dithers are active at the start; the loop tapers them to 0.0
-        # before the hard tail. In P3 the loop enforces beta=1, dither=0.
-        act_beta     = 0.0
-        state_beta   = 0.0
-        act_dither   = dither_half_a
+
+    elif stage == "P2F":
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = q4b
+        q_a = q4a
+        q_s = q4s
+
+        # CRITICAL:
+        # Candidate activation remains fully hard from P2E.
+        act_beta = 1.0
+
+        # Only the recurrent-state quantizer is annealed in P2F.
+        state_beta = 0.0
+
+        act_dither = 0.0
         state_dither = dither_half_s
+
+    elif stage == "P3":
+        q_h = q4k
+        q_r = q4k
+        q_z = q4k
+
+        rq_h = q4r
+        rq_r = q4r
+        rq_z = q4r
+
+        q_bias = q4b
+        q_a = q4a
+        q_s = q4s
+
+        act_beta = 1.0
+        state_beta = 1.0
+
+        act_dither = 0.0
+        state_dither = 0.0
+
     else:
         raise ValueError(
             f"Unknown stage: {stage!r}. "
-            f"Expected one of P2A, P2B, P2C, P2D, P2E, P2F, P3."
+            "Expected one of P2A, P2B, P2C, P2D, P2E, P2F, P3."
         )
 
-    for cell in [enc_cell, dec_cell]:
-        cell.quantizer_h              = q_h
-        cell.quantizer_r              = q_r
-        cell.quantizer_z              = q_z
-        cell.quantizer_recurrent_h    = rq_h
-        cell.quantizer_recurrent_r    = rq_r
-        cell.quantizer_recurrent_z    = rq_z
-        cell.quantizer_state          = q_s
-        cell.quantizer_activation     = q_a
-        cell.quantizer_bias           = q_bias
-        cell.activation_blend_beta    = act_beta
-        cell.state_blend_beta         = state_beta
-        cell.act_dither_delta         = act_dither
-        cell.state_dither_delta       = state_dither
-        # Legacy field kept for external code that still writes it. No-op
-        # inside call() — the new dither fields are what call() reads.
-        cell.state_lsb_noise_std      = 0.0
+    for cell in [
+        enc_cell,
+        dec_cell,
+    ]:
+        cell.quantizer_h = q_h
+        cell.quantizer_r = q_r
+        cell.quantizer_z = q_z
+
+        cell.quantizer_recurrent_h = rq_h
+        cell.quantizer_recurrent_r = rq_r
+        cell.quantizer_recurrent_z = rq_z
+
+        cell.quantizer_state = q_s
+        cell.quantizer_activation = q_a
+        cell.quantizer_bias = q_bias
+
+        cell.activation_blend_beta = act_beta
+        cell.state_blend_beta = state_beta
+
+        cell.act_dither_delta = act_dither
+        cell.state_dither_delta = state_dither
+
+        cell.state_lsb_noise_std = 0.0
 # ==============================================================================
 # Main MemoQ training loop
 # ==============================================================================
@@ -1309,7 +1515,11 @@ def training_loop_memoq(
 
         anneal_epochs_2e = max(1, args.memoq_state_anneal_epochs)
         # DELTA_A for 4-bit activation quantizer half-LSB
-        _DELTA_A_HALF = 2.0 ** (-(args.bits_activation - 1)) * 0.5
+        _DELTA_A_HALF = (
+            2.0 ** (-(args.bits_activation - 1)) * 0.5
+            if args.memoq_use_dither
+            else 0.0
+        )
 
         for ep_in_phase in range(ep2e_start, args.memoq_stage2e_epochs):
             # Cosine anneal: beta = 0.5*(1 - cos(pi * frac))
@@ -1441,41 +1651,105 @@ def training_loop_memoq(
             output_loss=args.output_loss,
         )
 
-        anneal_epochs_2f = max(1, args.memoq_state_anneal_epochs)
-        _DELTA_A_HALF_2F = 2.0 ** (-(args.bits_activation - 1)) * 0.5
-        _DELTA_S_HALF_2F = 2.0 ** (-(args.bits_state - 1)) * 0.5
+        anneal_epochs_2f = max(
+            1,
+            args.memoq_state_anneal_epochs,
+        )
 
-        for ep_in_phase in range(ep2f_start, args.memoq_stage2f_epochs):
-            # Cosine anneal for both betas jointly.
+        _DELTA_S_HALF_2F = (
+            2.0 ** (-(args.bits_state - 1)) * 0.5
+            if args.memoq_use_dither
+            else 0.0
+        )
+
+        for ep_in_phase in range(
+            ep2f_start,
+            args.memoq_stage2f_epochs,
+        ):
+            # --------------------------------------------------------------
+            # P2F is STATE-ONLY hardening.
+            #
+            # Candidate activation remains hard at beta=1.0 throughout P2F.
+            # Only recurrent-state quantization is annealed from 0 -> 1.
+            # --------------------------------------------------------------
+
             if ep_in_phase < anneal_epochs_2f:
-                frac = float(ep_in_phase + 1) / float(anneal_epochs_2f)
-                beta = 0.5 * (1.0 - math.cos(math.pi * frac))
+                frac = (
+                    float(ep_in_phase + 1)
+                    / float(anneal_epochs_2f)
+                )
+
+                beta_s = (
+                    0.5
+                    * (
+                        1.0
+                        - math.cos(
+                            math.pi
+                            * frac
+                        )
+                    )
+                )
+
             else:
-                beta = 1.0
-            # Dither taper: full for first 90% of anneal window, linear taper
-            # to 0.0 over the last 10%. Hard tail = 0.0 for both.
-            if ep_in_phase < anneal_epochs_2f:
+                beta_s = 1.0
+
+            # --------------------------------------------------------------
+            # Optional state dither.
+            #
+            # paper_main runs force --memoq-use-dither false, so this is zero
+            # throughout the primary Nature Communications trajectory.
+            # --------------------------------------------------------------
+
+            if (
+                args.memoq_use_dither
+                and ep_in_phase < anneal_epochs_2f
+            ):
                 taper_start = 0.9
-                frac_raw = float(ep_in_phase + 1) / float(anneal_epochs_2f)
+
+                frac_raw = (
+                    float(ep_in_phase + 1)
+                    / float(anneal_epochs_2f)
+                )
+
                 if frac_raw < taper_start:
-                    act_dither   = _DELTA_A_HALF_2F
                     state_dither = _DELTA_S_HALF_2F
+
                 else:
-                    taper_frac   = (frac_raw - taper_start) / (1.0 - taper_start)
-                    act_dither   = _DELTA_A_HALF_2F * max(0.0, 1.0 - taper_frac)
-                    state_dither = _DELTA_S_HALF_2F * max(0.0, 1.0 - taper_frac)
+                    taper_frac = (
+                        (frac_raw - taper_start)
+                        / (1.0 - taper_start)
+                    )
+
+                    state_dither = (
+                        _DELTA_S_HALF_2F
+                        * max(
+                            0.0,
+                            1.0 - taper_frac,
+                        )
+                    )
+
             else:
-                act_dither   = 0.0
                 state_dither = 0.0
-            for cell in [enc_cell_p2, dec_cell_p2]:
-                cell.activation_blend_beta = beta
-                cell.state_blend_beta      = beta
-                cell.act_dither_delta      = act_dither
-                cell.state_dither_delta    = state_dither
+
+            for cell in [
+                enc_cell_p2,
+                dec_cell_p2,
+            ]:
+                # Candidate activation stays hard.
+                cell.activation_blend_beta = 1.0
+                cell.act_dither_delta = 0.0
+
+                # Only state quantization changes during P2F.
+                cell.state_blend_beta = beta_s
+                cell.state_dither_delta = state_dither
+
             pf(
-                f"  [P2F] ep {ep_in_phase}  beta={beta:.4f}  "
-                f"act_dither={act_dither:.5f}  state_dither={state_dither:.5f}"
+                f"  [P2F] ep {ep_in_phase}  "
+                f"activation_blend_beta=1.0000  "
+                f"state_blend_beta={beta_s:.4f}  "
+                f"state_dither={state_dither:.5f}"
             )
+
             sys.stdout.flush()
 
             history, best_vals["P2F"], patience_cts["P2F"], early_stop = run_epoch(
@@ -1697,9 +1971,11 @@ def training_loop_memoq(
 # Keras/QKeras GRU packed recurrent_kernel shape: (units, 3*units)
 # same column ordering.
 #
-# Keras/QKeras GRU packed bias shape: (2, 3*units) for reset_after=True
-#   bias[0] = input bias [z|r|h]
-#   bias[1] = recurrent bias [z|r|h]
+# Keras/QKeras GRU packed bias shape for the matched reset_after=False graph:
+#   bias shape: (3*units,)
+#   layout: [b_z | b_r | b_h]
+#
+# There is no separate recurrent-bias row.
 # ==============================================================================
 
 def transfer_splitgate_to_qkeras(
@@ -3444,7 +3720,7 @@ def make_dist_memoq_train(
                 l_i = tf.constant(0.0, dtype=tf.float32)
 
             if use_zsat and has_z_logit and z_logits is not None:
-                z_vals = tf.sigmoid(z_logits)
+                z_vals = qkeras_hard_sigmoid(z_logits)
                 l_z = loss_zsat_value(z_vals, rho_z=rho_z_f)
                 total = total + lambda_z_f * l_z
             else:
@@ -3575,7 +3851,7 @@ def make_dist_memoq_val(
             l_i = tf.constant(0.0, dtype=tf.float32)
 
         if use_zsat and has_z_logit and z_logits is not None:
-            z_vals = tf.sigmoid(z_logits)
+            z_vals = qkeras_hard_sigmoid(z_logits)
             l_z = loss_zsat_value(z_vals, rho_z=rho_z_f)
             total = total + lambda_z_f * l_z
         else:
@@ -4664,175 +4940,715 @@ def run_equivalence_checks(
     check_tag,
 ):
     """
-    Numerical equivalence check between float_student and phase2_model
-    (P1->P2) or phase2_model and final_qkeras_student (P2F->P3).
+    Numerical equivalence checks for the architecture-transfer boundaries.
 
-    IMPORTANT: runs on at most 512 samples drawn from equiv_enc_sample to
-    avoid a GPU OOM when equiv_enc_sample is the full validation set
-    (160 000 x T x 1). The original code passed the entire array to
-    model.predict() with batch_size equal to the full array length, which
-    allocated a ~16 GB contiguous tensor and triggered SIGABRT (exit 134).
+    P1 -> P2:
+        Diagnostic only. Phase 2 already uses a quantized QDense head, so a
+        small difference from the float P1 graph is expected.
+
+    P2F -> P3:
+        STRICT. At this boundary both the split-gate model and the packed
+        QKeras model are supposed to implement the same hard inference graph.
+        A mismatch larger than 5e-5 is treated as a fatal implementation error.
     """
-    MAX_EQUIV_SAMPLES = 512
 
-    pf(f"[EQUIV {check_tag}] Running equivalence check...")
+    MAX_EQUIV_SAMPLES = 512
+    EXPORT_MAX_ABS_TOLERANCE = 5e-5
+
+    pf(
+        f"[EQUIV {check_tag}] Running equivalence check..."
+    )
+
     sys.stdout.flush()
 
-    n_available = equiv_enc_sample.shape[0]
-    n_use = min(MAX_EQUIV_SAMPLES, n_available)
-    sample = equiv_enc_sample[:n_use]
-    dec_zeros = np.zeros((n_use, seq_len, 1), dtype=np.float32)
+    n_available = int(
+        equiv_enc_sample.shape[0]
+    )
 
-    try:
-        if check_tag == "P1->P2":
+    n_use = min(
+        MAX_EQUIV_SAMPLES,
+        n_available,
+    )
+
+    if n_use <= 0:
+        raise RuntimeError(
+            f"[EQUIV {check_tag}] No samples available."
+        )
+
+    sample = np.asarray(
+        equiv_enc_sample[:n_use],
+        dtype=np.float32,
+    )
+
+    dec_zeros = np.zeros(
+        (
+            n_use,
+            seq_len,
+            1,
+        ),
+        dtype=np.float32,
+    )
+
+    if check_tag == "P1->P2":
+        try:
             out_float = float_student.predict(
-                [sample, dec_zeros], batch_size=n_use, verbose=0
+                [
+                    sample,
+                    dec_zeros,
+                ],
+                batch_size=n_use,
+                verbose=0,
             )
-            out_p2_raw = phase2_model.predict(
-                [sample, dec_zeros], batch_size=n_use, verbose=0
-            )
-            if isinstance(out_p2_raw, (list, tuple)):
-                out_p2 = out_p2_raw[0]
-            else:
-                out_p2 = out_p2_raw
-            max_diff = float(np.max(np.abs(out_float - out_p2)))
-            mean_diff = float(np.mean(np.abs(out_float - out_p2)))
-            pf(
-                f"[EQUIV {check_tag}] float_student vs phase2_model "
-                f"(n={n_use}): max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}"
-            )
-            if max_diff > 1e-3:
-                pf(
-                    f"[EQUIV {check_tag}] WARNING: max_diff={max_diff:.4e} > 1e-3. "
-                    f"Weight transfer may be imperfect. Training will continue."
-                )
-            else:
-                pf(f"[EQUIV {check_tag}] OK (max_diff < 1e-3)")
 
-        elif check_tag == "P2F->P3":
             out_p2_raw = phase2_model.predict(
-                [sample, dec_zeros], batch_size=n_use, verbose=0
+                [
+                    sample,
+                    dec_zeros,
+                ],
+                batch_size=n_use,
+                verbose=0,
             )
-            if isinstance(out_p2_raw, (list, tuple)):
+
+            if isinstance(
+                out_p2_raw,
+                (
+                    list,
+                    tuple,
+                ),
+            ):
                 out_p2 = out_p2_raw[0]
+
             else:
                 out_p2 = out_p2_raw
-            out_p3 = final_qkeras_student.predict(
-                [sample, dec_zeros], batch_size=n_use, verbose=0
-            )
-            if isinstance(out_p3, (list, tuple)):
-                out_p3 = out_p3[0]
-            max_diff = float(np.max(np.abs(out_p2 - out_p3)))
-            mean_diff = float(np.mean(np.abs(out_p2 - out_p3)))
-            pf(
-                f"[EQUIV {check_tag}] phase2_model vs final_qkeras_student "
-                f"(n={n_use}): max_diff={max_diff:.6e}  mean_diff={mean_diff:.6e}"
-            )
-            if max_diff > 1e-2:
-                pf(
-                    f"[EQUIV {check_tag}] WARNING: max_diff={max_diff:.4e} > 1e-2. "
-                    f"Export transfer may be lossy. Training will continue."
+
+            max_diff = float(
+                np.max(
+                    np.abs(
+                        out_float
+                        - out_p2
+                    )
                 )
-            else:
-                pf(f"[EQUIV {check_tag}] OK (max_diff < 1e-2)")
+            )
+
+            mean_diff = float(
+                np.mean(
+                    np.abs(
+                        out_float
+                        - out_p2
+                    )
+                )
+            )
+
+            pf(
+                f"[EQUIV {check_tag}] "
+                f"float_student vs phase2_model "
+                f"(n={n_use}): "
+                f"max_diff={max_diff:.9e} "
+                f"mean_diff={mean_diff:.9e}"
+            )
+
+            pf(
+                f"[EQUIV {check_tag}] "
+                "Diagnostic only: Phase 2 contains the quantized QDense "
+                "readout, so exact equality with the float P1 model is not "
+                "required."
+            )
+
+        except Exception as exc:
+            pf(
+                f"[EQUIV {check_tag}] "
+                f"Non-fatal diagnostic failed: {exc}"
+            )
+
+        sys.stdout.flush()
+        return
+
+    if check_tag.endswith(
+        "->P3"
+    ):
+        # Force deployment semantics explicitly before checking.
+        for cell in [
+            enc_cell_p2,
+            dec_cell_p2,
+        ]:
+            cell.activation_blend_beta = 1.0
+            cell.state_blend_beta = 1.0
+            cell.act_dither_delta = 0.0
+            cell.state_dither_delta = 0.0
+
+        out_p2_raw = phase2_model.predict(
+            [
+                sample,
+                dec_zeros,
+            ],
+            batch_size=n_use,
+            verbose=0,
+        )
+
+        if isinstance(
+            out_p2_raw,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            out_p2 = out_p2_raw[0]
 
         else:
-            pf(f"[EQUIV {check_tag}] Unknown check_tag — skipping.")
+            out_p2 = out_p2_raw
 
-    except Exception as exc:
-        pf(f"[EQUIV {check_tag}] ERROR during check: {exc}")
-        pf(f"[EQUIV {check_tag}] Skipping equivalence check and continuing training.")
+        out_p3 = final_qkeras_student.predict(
+            [
+                sample,
+                dec_zeros,
+            ],
+            batch_size=n_use,
+            verbose=0,
+        )
 
-    sys.stdout.flush()
+        if isinstance(
+            out_p3,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            out_p3 = out_p3[0]
 
+        out_p2 = np.asarray(
+            out_p2,
+            dtype=np.float32,
+        )
+
+        out_p3 = np.asarray(
+            out_p3,
+            dtype=np.float32,
+        )
+
+        if out_p2.shape != out_p3.shape:
+            raise RuntimeError(
+                f"[EQUIV {check_tag}] Output shape mismatch: "
+                f"phase2={out_p2.shape}, qkeras={out_p3.shape}"
+            )
+
+        abs_diff = np.abs(
+            out_p2
+            - out_p3
+        )
+
+        max_diff = float(
+            np.max(
+                abs_diff
+            )
+        )
+
+        mean_diff = float(
+            np.mean(
+                abs_diff
+            )
+        )
+
+        p99_diff = float(
+            np.percentile(
+                abs_diff,
+                99.0,
+            )
+        )
+
+        pf(
+            f"[EQUIV {check_tag}] "
+            f"phase2_model vs final_qkeras_student "
+            f"(n={n_use}): "
+            f"max_diff={max_diff:.9e} "
+            f"mean_diff={mean_diff:.9e} "
+            f"p99_diff={p99_diff:.9e}"
+        )
+
+        if max_diff > EXPORT_MAX_ABS_TOLERANCE:
+            raise RuntimeError(
+                f"[EQUIV {check_tag}] FAILED: "
+                f"max_diff={max_diff:.9e} exceeds "
+                f"{EXPORT_MAX_ABS_TOLERANCE:.9e}. "
+                "Refusing to start Phase 3 because the split-gate and "
+                "QKeras inference graphs are not numerically equivalent."
+            )
+
+        pf(
+            f"[EQUIV {check_tag}] PASS: "
+            f"max_diff <= {EXPORT_MAX_ABS_TOLERANCE:.1e}"
+        )
+
+        sys.stdout.flush()
+        return
+
+    raise ValueError(
+        f"Unknown equivalence check tag: {check_tag!r}"
+    )
 
 # ==============================================================================
 # save_loss_curves_memoq:
 # Multi-panel PNG with all 7 loss components across all phases.
 # ==============================================================================
 
-def save_loss_curves_memoq(history, best_val_loss, args, job_dir, pf):
-    phases_arr = history.get("phase", [])
-    n_ep = len(history.get("total", []))
+def save_loss_curves_memoq(
+    history,
+    best_val_loss,
+    args,
+    job_dir,
+    pf,
+):
+    """
+    Save complete MemoQ training-history figures and the exact numerical
+    history in MATLAB format.
+
+    Outputs:
+        training_history.png
+        training_history.pdf
+        training_history.mat
+
+    training_history.csv continues to be written by run_epoch().
+    """
+
+    phases_arr = list(
+        history.get(
+            "phase",
+            [],
+        )
+    )
+
+    n_ep = len(
+        history.get(
+            "total",
+            [],
+        )
+    )
 
     if n_ep == 0:
-        pf("[CURVES] history is empty (completion-flag early return) — skipping plot to preserve existing training_history.png")
+        pf(
+            "[CURVES] history is empty. "
+            "Preserving existing training-history outputs."
+        )
+
         sys.stdout.flush()
         return
 
-    epochs_arr = list(range(1, n_ep + 1))
-
-    phase_colors = {
-        "P1":  ("tab:blue",   "tab:cyan"),
-        "P2A": ("tab:orange", "tab:red"),
-        "P2B": ("tab:purple", "tab:pink"),
-        "P2C": ("tab:brown",  "tab:olive"),
-        "P3":  ("tab:green",  "limegreen"),
-    }
-
-    fig, axes = plt.subplots(2, 5, figsize=(36, 8))
-    axes = axes.flatten()
-
-    loss_pairs = [
-        ("total",   "val_total",  "Total Loss"),
-        ("seq",     "val_seq",    "L_seq (HuberCN GT)"),
-        ("kd",      "val_kd",     "L_KD (HuberCN Teacher)"),
-        ("mem",     "val_mem",    "L_mem (Memory Kernel)"),
-        ("innov",   "val_innov",  "L_innov (Innovation)"),
-        ("zsat",    "val_zsat",   "L_zsat (Gate Sat)"),
-        ("rail",    "val_rail",   "L_railpred"),
-        ("val_mae", None,         "Val MAE"),
-    ]
-
-    for ax_idx, (train_key, val_key, title) in enumerate(loss_pairs):
-        if ax_idx >= len(axes) - 2:
-            break
-        ax = axes[ax_idx]
-        for phase_tag, (ctr, cva) in phase_colors.items():
-            mask = [i for i, ph in enumerate(phases_arr) if ph == phase_tag]
-            if not mask:
-                continue
-            ep_ph   = [epochs_arr[i] for i in mask]
-            tr_vals = [history.get(train_key, [0] * n_ep)[i] for i in mask]
-            ax.plot(ep_ph, tr_vals, color=ctr, label=f"{phase_tag} train", linewidth=1.2)
-            if val_key and val_key in history and len(history[val_key]) == n_ep:
-                va_vals = [history[val_key][i] for i in mask]
-                ax.plot(ep_ph, va_vals, color=cva, linestyle="--", label=f"{phase_tag} val", linewidth=1.0)
-        ax.set_title(title, fontsize=9)
-        ax.set_xlabel("Epoch", fontsize=8)
-        ax.legend(fontsize=6)
-        ax.grid(True, alpha=0.3)
-
-    axes[8].axis("off")
-    axes[8].text(
-        0.05, 0.5,
-        f"MemoQ  SEQLEN={args.seq_len}\n"
-        f"alpha={args.alpha}  huber_delta={args.memoq_huber_delta}\n"
-        f"bits: k={args.bits_kernel} r={args.bits_recurrent} "
-        f"b={args.bits_bias} a={args.bits_activation} s={args.bits_state}\n"
-        f"Student QGRU hidden={args.student_units}\n"
-        f"Teacher GRU hidden={args.teacher_units} x {args.teacher_layers}\n"
-        f"P1={args.memoq_stage1_epochs}  2A={args.memoq_stage2a_epochs}  "
-        f"2B={args.memoq_stage2b_epochs}  2C={args.memoq_stage2c_epochs}  "
-        f"P3={args.memoq_stage3_epochs}\n"
-        f"Batch={args.batch_size}  EffLR={args.effective_lr:.2e}\n"
-        f"rho_rail={args.memoq_rho_rail}  mu_rail={args.memoq_mu_rail}\n"
-        f"innov_burnin={args.memoq_innov_burnin}\n"
-        f"Best val (P3)={best_val_loss:.6f}\n"
-        f"Total epochs run={n_ep}",
-        fontsize=8,
-        verticalalignment="center",
-        transform=axes[8].transAxes,
-        bbox=dict(boxstyle="round", facecolor="lightyellow", alpha=0.8),
+    epochs_arr = np.arange(
+        1,
+        n_ep + 1,
+        dtype=np.int32,
     )
 
-    axes[9].axis("off")
+    phase_order = [
+        "P1",
+        "P2A",
+        "P2B",
+        "P2C",
+        "P2D",
+        "P2E",
+        "P2F",
+        "P3",
+    ]
 
-    plt.tight_layout()
-    curves_path = os.path.join(job_dir, "training_history.png")
-    plt.savefig(curves_path, dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    pf(f"Loss curves saved: {curves_path}")
+    phase_colors = {
+        "P1": (
+            "tab:blue",
+            "tab:cyan",
+        ),
+        "P2A": (
+            "tab:orange",
+            "gold",
+        ),
+        "P2B": (
+            "tab:purple",
+            "tab:pink",
+        ),
+        "P2C": (
+            "tab:brown",
+            "peru",
+        ),
+        "P2D": (
+            "tab:olive",
+            "yellowgreen",
+        ),
+        "P2E": (
+            "tab:green",
+            "limegreen",
+        ),
+        "P2F": (
+            "tab:red",
+            "salmon",
+        ),
+        "P3": (
+            "tab:gray",
+            "silver",
+        ),
+    }
+
+    phase_np = np.asarray(
+        phases_arr,
+        dtype=object,
+    )
+
+    series_specs = [
+        (
+            "total",
+            "val_total",
+            "Total loss",
+        ),
+        (
+            "seq",
+            "val_seq",
+            "Sequence loss",
+        ),
+        (
+            "kd",
+            "val_kd",
+            "Knowledge-distillation loss",
+        ),
+        (
+            "mem",
+            "val_mem",
+            "Memory loss",
+        ),
+        (
+            "innov",
+            "val_innov",
+            "Innovation loss",
+        ),
+        (
+            "zsat",
+            "val_zsat",
+            "Gate-saturation loss",
+        ),
+        (
+            "rail",
+            "val_rail",
+            "Rail loss",
+        ),
+        (
+            "shape",
+            "val_shape",
+            "Shape loss",
+        ),
+        (
+            None,
+            "val_mae",
+            "Validation sequence MAE",
+        ),
+    ]
+
+    fig, axes = plt.subplots(
+        2,
+        5,
+        figsize=(
+            28,
+            10,
+        ),
+    )
+
+    axes = axes.flatten()
+
+    for ax_index, (
+        train_key,
+        val_key,
+        title,
+    ) in enumerate(
+        series_specs
+    ):
+        ax = axes[
+            ax_index
+        ]
+
+        plotted_anything = False
+
+        for phase_tag in phase_order:
+            mask = np.flatnonzero(
+                phase_np
+                == phase_tag
+            )
+
+            if mask.size == 0:
+                continue
+
+            train_color, val_color = phase_colors[
+                phase_tag
+            ]
+
+            phase_epochs = epochs_arr[
+                mask
+            ]
+
+            if train_key is not None:
+                train_values_all = history.get(
+                    train_key,
+                    [],
+                )
+
+                if len(train_values_all) == n_ep:
+                    train_values = np.asarray(
+                        train_values_all,
+                        dtype=np.float64,
+                    )[
+                        mask
+                    ]
+
+                    ax.plot(
+                        phase_epochs,
+                        train_values,
+                        color=train_color,
+                        linewidth=1.4,
+                        label=f"{phase_tag} train",
+                    )
+
+                    plotted_anything = True
+
+            if val_key is not None:
+                val_values_all = history.get(
+                    val_key,
+                    [],
+                )
+
+                if len(val_values_all) == n_ep:
+                    val_values = np.asarray(
+                        val_values_all,
+                        dtype=np.float64,
+                    )[
+                        mask
+                    ]
+
+                    ax.plot(
+                        phase_epochs,
+                        val_values,
+                        color=val_color,
+                        linestyle="--",
+                        linewidth=1.2,
+                        label=f"{phase_tag} val",
+                    )
+
+                    plotted_anything = True
+
+        ax.set_title(
+            title,
+            fontsize=10,
+        )
+
+        ax.set_xlabel(
+            "Global epoch",
+            fontsize=9,
+        )
+
+        ax.grid(
+            True,
+            alpha=0.25,
+        )
+
+        if plotted_anything:
+            ax.legend(
+                fontsize=6,
+                ncol=2,
+            )
+
+    info_ax = axes[
+        9
+    ]
+
+    info_ax.axis(
+        "off"
+    )
+
+    info_text = (
+        f"Run tag: {args.run_tag}\n"
+        f"Output loss: {args.output_loss}\n"
+        f"Quantizer alpha: {args.quantizer_alpha}\n"
+        f"Gate curriculum: {args.memoq_gate_curriculum}\n"
+        f"Dither: {args.memoq_use_dither}\n"
+        f"Bits k/b/r/a/s: "
+        f"{args.bits_kernel}/"
+        f"{args.bits_bias}/"
+        f"{args.bits_recurrent}/"
+        f"{args.bits_activation}/"
+        f"{args.bits_state}\n"
+        f"Student units: {args.student_units}\n"
+        f"Teacher: {args.teacher_units} x {args.teacher_layers}\n"
+        f"P1={args.memoq_warmup_epochs}, "
+        f"P2A={args.memoq_stage2a_epochs}, "
+        f"P2B={args.memoq_stage2b_epochs}, "
+        f"P2C={args.memoq_stage2c_epochs}\n"
+        f"P2D={args.memoq_stage2d_epochs}, "
+        f"P2E={args.memoq_stage2e_epochs}, "
+        f"P2F={args.memoq_stage2f_epochs}, "
+        f"P3={args.memoq_stage3_epochs}\n"
+        f"Batch={args.batch_size}\n"
+        f"Effective LR={args.effective_lr:.3e}\n"
+        f"Best validation loss={best_val_loss:.8f}\n"
+        f"Epochs recorded={n_ep}"
+    )
+
+    info_ax.text(
+        0.02,
+        0.98,
+        info_text,
+        fontsize=9,
+        verticalalignment="top",
+        horizontalalignment="left",
+        transform=info_ax.transAxes,
+        bbox=dict(
+            boxstyle="round",
+            facecolor="white",
+            alpha=0.9,
+        ),
+    )
+
+    fig.suptitle(
+        "QKeras-matched progressive recurrent hardening",
+        fontsize=13,
+        fontweight="bold",
+    )
+
+    fig.tight_layout(
+        rect=[
+            0.0,
+            0.0,
+            1.0,
+            0.97,
+        ]
+    )
+
+    figure_base = os.path.join(
+        job_dir,
+        "training_history",
+    )
+
+    save_figure_outputs(
+        fig=fig,
+        base_path=figure_base,
+        pf=pf,
+        png_dpi=400,
+    )
+
+    plt.close(
+        fig
+    )
+
+    phase_code_map = {
+        "P1": 1,
+        "P2A": 2,
+        "P2B": 3,
+        "P2C": 4,
+        "P2D": 5,
+        "P2E": 6,
+        "P2F": 7,
+        "P3": 8,
+    }
+
+    phase_codes = np.asarray(
+        [
+            phase_code_map.get(
+                phase,
+                0,
+            )
+            for phase in phases_arr
+        ],
+        dtype=np.int16,
+    )
+
+    mat_payload = {
+        "epoch": epochs_arr,
+        "phase_name": np.asarray(
+            phases_arr,
+            dtype=object,
+        ),
+        "phase_code": phase_codes,
+        "best_val_loss": np.asarray(
+            [
+                [
+                    float(
+                        best_val_loss
+                    )
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "run_tag": str(
+            args.run_tag
+        ),
+        "output_loss": str(
+            args.output_loss
+        ),
+        "quantizer_alpha": str(
+            args.quantizer_alpha
+        ),
+        "gate_curriculum": np.asarray(
+            [
+                [
+                    int(
+                        bool(
+                            args.memoq_gate_curriculum
+                        )
+                    )
+                ]
+            ],
+            dtype=np.int8,
+        ),
+        "use_dither": np.asarray(
+            [
+                [
+                    int(
+                        bool(
+                            args.memoq_use_dither
+                        )
+                    )
+                ]
+            ],
+            dtype=np.int8,
+        ),
+    }
+
+    numeric_history_keys = [
+        "total",
+        "seq",
+        "kd",
+        "mem",
+        "innov",
+        "zsat",
+        "rail",
+        "shape",
+        "val_total",
+        "val_seq",
+        "val_kd",
+        "val_mem",
+        "val_innov",
+        "val_zsat",
+        "val_rail",
+        "val_shape",
+        "val_mae",
+    ]
+
+    for key in numeric_history_keys:
+        values = history.get(
+            key,
+            [],
+        )
+
+        if len(values) == n_ep:
+            mat_payload[
+                key
+            ] = np.asarray(
+                values,
+                dtype=np.float64,
+            )
+
+    mat_path = os.path.join(
+        job_dir,
+        "training_history.mat",
+    )
+
+    save_mat_atomic(
+        path=mat_path,
+        payload=mat_payload,
+        pf=pf,
+    )
+
     sys.stdout.flush()
 
 # ==============================================================================
@@ -4851,253 +5667,1286 @@ def evaluate_and_save(
     args,
     pf,
     phase_tag=None,
+    test_indices=None,
 ):
     """
-    Run inference on the test split, compute lifetime scatter metrics, and
-    save scatter PNGs in the SAME visual style as train_student_vanilla_kd.py
-    (hexbin, Blues/Greens/Oranges, log count colorbar, y=x line, RMSE/r/cov box).
+    Run inference on the complete test split, compute lifetime/FRET metrics,
+    save publication-quality figures, and save every numerical quantity used
+    by the figures to MATLAB .mat files.
 
-    `model` is whichever Keras model currently holds the trained weights for
-    this phase:
-        P1            -> float_student            (output: preds)
-        P2A/P2B/P2C   -> phase2_model             (output: [preds, hidden, zlogits])
-        P3 / final    -> final_qkeras_student      (output: preds)
+    For each phase the function writes:
 
-    The function auto-detects multi-output models and uses output 0 as the
-    prediction tensor, so all three model types route through one code path.
+        test_scatter_tau1_<phase>.png
+        test_scatter_tau1_<phase>.pdf
 
-    phase_tag : str or None.  When provided (e.g. "P1", "P2A", "P2B", "P2C",
-                "P3", "final") the PNGs are written as
-                test_scatter_tau1_<phase_tag>.png etc in addition to the
-                canonical names (which are always written / overwritten).
+        test_scatter_tau2_<phase>.png
+        test_scatter_tau2_<phase>.pdf
+
+        test_scatter_fret_<phase>.png
+        test_scatter_fret_<phase>.pdf
+
+        test_residuals_<phase>.png
+        test_residuals_<phase>.pdf
+
+        test_metrics_<phase>.json
+        test_plot_data_<phase>.mat
+
+    Canonical untagged files are also overwritten by the most recently
+    evaluated phase, so after the final evaluation they correspond to the
+    final QKeras model.
+
+    The MAT file stores ALL lifetime/FRET scatter points and residuals, plus a
+    deterministic evenly distributed subset of up to 512 complete sequence
+    inputs/targets/predictions for later temporal-curve figure generation.
     """
 
-    TAU1_MAX_PHYS = 3.0   # ns — physical label range, same as vanilla_kd
-    TAU2_MAX_PHYS = 3.0   # ns
+    if n_out < 3:
+        raise ValueError(
+            f"evaluate_and_save requires n_out >= 3, received {n_out}"
+        )
+
+    TAU1_MAX_PHYS = 3.0
+    TAU2_MAX_PHYS = 3.0
     FRET_MAX_PHYS = 1.0
 
-    pf(f"[EVAL] Running evaluate_and_save (phase_tag={phase_tag!r}) ...")
+    phase_label = (
+        str(
+            phase_tag
+        )
+        if phase_tag is not None
+        else "memoq"
+    )
+
+    pf(
+        f"[EVAL] Running evaluate_and_save "
+        f"(phase_tag={phase_label!r}) ..."
+    )
+
     sys.stdout.flush()
 
-    n_test   = enc_test.shape[0]
-    dec_test = np.zeros((n_test, seq_len, 1), dtype=np.float32)
+    n_test = int(
+        enc_test.shape[0]
+    )
 
-    # ── Inference ─────────────────────────────────────────────────────────────
-    pf(f"[EVAL] Inference on {n_test} test samples (batch={infer_batch}) ...")
+    if n_test <= 0:
+        raise RuntimeError(
+            "[EVAL] Test split is empty."
+        )
+
+    if int(tgt_test.shape[0]) != n_test:
+        raise RuntimeError(
+            "[EVAL] enc_test and tgt_test have different sample counts: "
+            f"{enc_test.shape[0]} vs {tgt_test.shape[0]}"
+        )
+
+    if test_indices is None:
+        dataset_indices = np.arange(
+            n_test,
+            dtype=np.int64,
+        )
+
+    else:
+        dataset_indices = np.asarray(
+            test_indices,
+            dtype=np.int64,
+        )
+
+        if dataset_indices.shape[0] != n_test:
+            raise RuntimeError(
+                "[EVAL] test_indices length does not match n_test: "
+                f"{dataset_indices.shape[0]} vs {n_test}"
+            )
+
+    # --------------------------------------------------------------------------
+    # Inference.
+    # --------------------------------------------------------------------------
+
+    pf(
+        f"[EVAL] Inference on {n_test} test samples "
+        f"(batch={infer_batch}) ..."
+    )
+
     sys.stdout.flush()
+
     preds_list = []
-    for s in range(0, n_test, infer_batch):
-        e = min(s + infer_batch, n_test)
-        out = model([enc_test[s:e], dec_test[s:e]], training=False)
-        if isinstance(out, (list, tuple)):
-            batch_pred = out[0]
+
+    for start in range(
+        0,
+        n_test,
+        infer_batch,
+    ):
+        end = min(
+            start + infer_batch,
+            n_test,
+        )
+
+        enc_batch = np.asarray(
+            enc_test[
+                start:end
+            ],
+            dtype=np.float32,
+        )
+
+        dec_batch = np.zeros(
+            (
+                end - start,
+                seq_len,
+                1,
+            ),
+            dtype=np.float32,
+        )
+
+        out = model(
+            [
+                enc_batch,
+                dec_batch,
+            ],
+            training=False,
+        )
+
+        if isinstance(
+            out,
+            (
+                list,
+                tuple,
+            ),
+        ):
+            batch_pred = out[
+                0
+            ]
+
         else:
             batch_pred = out
-        if hasattr(batch_pred, "numpy"):
+
+        if hasattr(
+            batch_pred,
+            "numpy",
+        ):
             batch_pred = batch_pred.numpy()
-        preds_list.append(np.asarray(batch_pred, dtype=np.float32))
-    preds = np.concatenate(preds_list, axis=0).astype(np.float32)
 
-    # ── MAE on raw seq targets ─────────────────────────────────────────────
-    mae_seq = float(np.mean(np.abs(preds - tgt_test)))
-    pf(f"[EVAL] Sequence MAE (test): {mae_seq:.6f}")
+        batch_pred = np.asarray(
+            batch_pred,
+            dtype=np.float32,
+        )
+
+        expected_batch_shape = (
+            end - start,
+            seq_len,
+            n_out,
+        )
+
+        if batch_pred.shape != expected_batch_shape:
+            raise RuntimeError(
+                "[EVAL] Model prediction shape mismatch. "
+                f"Expected {expected_batch_shape}, "
+                f"received {batch_pred.shape}"
+            )
+
+        preds_list.append(
+            batch_pred
+        )
+
+    preds = np.concatenate(
+        preds_list,
+        axis=0,
+    ).astype(
+        np.float32,
+        copy=False,
+    )
+
+    if preds.shape != (
+        n_test,
+        seq_len,
+        n_out,
+    ):
+        raise RuntimeError(
+            "[EVAL] Concatenated prediction shape mismatch: "
+            f"{preds.shape}"
+        )
+
+    # --------------------------------------------------------------------------
+    # Raw sequence error.
+    # --------------------------------------------------------------------------
+
+    target_float = np.asarray(
+        tgt_test,
+        dtype=np.float32,
+    )
+
+    absolute_sequence_error = np.abs(
+        preds
+        - target_float
+    )
+
+    sequence_mae_per_sample = np.mean(
+        absolute_sequence_error,
+        axis=(
+            1,
+            2,
+        ),
+    ).astype(
+        np.float32
+    )
+
+    mae_seq = float(
+        np.mean(
+            sequence_mae_per_sample
+        )
+    )
+
+    pf(
+        f"[EVAL] Sequence MAE (test): {mae_seq:.8f}"
+    )
+
     sys.stdout.flush()
 
-    # ── Lifetime extraction ────────────────────────────────────────────────
-    t_ns = np.arange(seq_len, dtype=np.float32) * float(gate_width_ns)
+    # --------------------------------------------------------------------------
+    # Physical time axis and lifetime extraction.
+    # --------------------------------------------------------------------------
 
-    def extract_lifetimes(seq_arr, t_axis):
-        """
-        Extract tau1, tau2, fret_eff from a (N, T, 3) predicted sequence.
+    t_ns = (
+        np.arange(
+            seq_len,
+            dtype=np.float32,
+        )
+        * float(
+            gate_width_ns
+        )
+    )
 
-        Channel layout (matches vanilla_kd extract_lifetimes):
-          ch0 = full decay (unused for tau/fret)
-          ch1 = short decay  -> tau1
-          ch2 = long decay   -> tau2
+    def extract_lifetimes(
+        seq_arr,
+        t_axis,
+    ):
+        seq_arr = np.asarray(
+            seq_arr,
+            dtype=np.float32,
+        )
 
-        Integration: trapezoidal rule over the physical time axis t_axis (ns),
-        identical to vanilla_kd (np.trapz(ch, t, axis=1)).
-        Amplitude = value at t=0 (first gate).
-        tau = integral / amplitude when amplitude > 1e-6 else 0.0.
-        fret = amp1 / (amp1 + amp2) when denom > 1e-6 else 0.5.
+        if seq_arr.ndim != 3:
+            raise ValueError(
+                "extract_lifetimes expects a rank-3 array, "
+                f"received {seq_arr.shape}"
+            )
 
-        This mirrors vanilla_kd EXACTLY so student and teacher scatters are
-        directly comparable in the paper. No physical clipping, no relative
-        amplitude guard — vanilla does neither.
-        """
-        ch1 = seq_arr[:, :, 1]
-        ch2 = seq_arr[:, :, 2]
+        if seq_arr.shape[2] < 3:
+            raise ValueError(
+                "extract_lifetimes requires at least three output channels, "
+                f"received {seq_arr.shape}"
+            )
 
-        int1 = np.trapz(ch1, t_axis, axis=1)
-        int2 = np.trapz(ch2, t_axis, axis=1)
+        ch1 = seq_arr[
+            :,
+            :,
+            1,
+        ]
 
-        amp1 = ch1[:, 0]
-        amp2 = ch2[:, 0]
+        ch2 = seq_arr[
+            :,
+            :,
+            2,
+        ]
 
-        tau1 = np.where(amp1 > 1e-6, int1 / amp1, 0.0).astype(np.float32)
-        tau2 = np.where(amp2 > 1e-6, int2 / amp2, 0.0).astype(np.float32)
+        int1 = np.trapz(
+            ch1,
+            t_axis,
+            axis=1,
+        )
 
-        denom = amp1 + amp2
-        fret  = np.where(denom > 1e-6, amp1 / denom, 0.5).astype(np.float32)
-        return tau1, tau2, fret
+        int2 = np.trapz(
+            ch2,
+            t_axis,
+            axis=1,
+        )
 
-    tau1_pred, tau2_pred, fret_pred = extract_lifetimes(preds, t_ns)
+        amp1 = ch1[
+            :,
+            0,
+        ]
 
-    # Ground truth = physical scalar labels.
-    if labels_test is not None and labels_test.ndim == 2 and labels_test.shape[1] >= 3:
-        tau1_gt = labels_test[:, 0].astype(np.float32)
-        tau2_gt = labels_test[:, 1].astype(np.float32)
-        fret_gt = labels_test[:, 2].astype(np.float32)
+        amp2 = ch2[
+            :,
+            0,
+        ]
+
+        tau1 = np.where(
+            amp1 > 1e-6,
+            int1 / amp1,
+            0.0,
+        ).astype(
+            np.float32
+        )
+
+        tau2 = np.where(
+            amp2 > 1e-6,
+            int2 / amp2,
+            0.0,
+        ).astype(
+            np.float32
+        )
+
+        denom = (
+            amp1
+            + amp2
+        )
+
+        fret = np.where(
+            denom > 1e-6,
+            amp1 / denom,
+            0.5,
+        ).astype(
+            np.float32
+        )
+
+        return (
+            tau1,
+            tau2,
+            fret,
+        )
+
+    (
+        tau1_pred,
+        tau2_pred,
+        fret_pred,
+    ) = extract_lifetimes(
+        preds,
+        t_ns,
+    )
+
+    # --------------------------------------------------------------------------
+    # Ground-truth scalar labels.
+    # --------------------------------------------------------------------------
+
+    if (
+        labels_test is not None
+        and labels_test.ndim == 2
+        and labels_test.shape[0] == n_test
+        and labels_test.shape[1] >= 3
+    ):
+        tau1_gt = np.asarray(
+            labels_test[
+                :,
+                0,
+            ],
+            dtype=np.float32,
+        )
+
+        tau2_gt = np.asarray(
+            labels_test[
+                :,
+                1,
+            ],
+            dtype=np.float32,
+        )
+
+        fret_gt = np.asarray(
+            labels_test[
+                :,
+                2,
+            ],
+            dtype=np.float32,
+        )
+
     else:
-        pf("[EVAL] WARNING: labels_test missing or !=3ch — falling back to target-derived GT")
-        tau1_gt, tau2_gt, fret_gt = extract_lifetimes(tgt_test, t_ns)
+        pf(
+            "[EVAL] WARNING: physical labels are unavailable or malformed. "
+            "Using target-derived lifetime/FRET values."
+        )
 
-    # ── Metrics: RMSE, Pearson r, 1-sigma coverage (vanilla compute_metrics) ──
-    def compute_metrics(gt, pred):
-        mask = np.isfinite(gt) & np.isfinite(pred)
-        if mask.sum() < 5:
-            return float("nan"), float("nan"), float("nan")
-        gt_m   = gt[mask].astype(float)
-        pred_m = pred[mask].astype(float)
-        rmse = float(np.sqrt(np.mean((gt_m - pred_m) ** 2)))
-        r    = float(pearsonr(gt_m, pred_m)[0])
-        residuals = pred_m - gt_m
-        sigma = residuals.std()
-        cov   = float(np.mean(np.abs(residuals) <= sigma) * 100.0)
-        return rmse, r, cov
+        (
+            tau1_gt,
+            tau2_gt,
+            fret_gt,
+        ) = extract_lifetimes(
+            target_float,
+            t_ns,
+        )
 
-    rmse_tau1, r_tau1, cov_tau1 = compute_metrics(tau1_gt, tau1_pred)
-    rmse_tau2, r_tau2, cov_tau2 = compute_metrics(tau2_gt, tau2_pred)
-    rmse_fret, r_fret, cov_fret = compute_metrics(fret_gt, fret_pred)
+    physical_labels_all = np.stack(
+        [
+            tau1_gt,
+            tau2_gt,
+            fret_gt,
+        ],
+        axis=1,
+    ).astype(
+        np.float32
+    )
 
-    pf(f"[EVAL] tau1  RMSE={rmse_tau1:.4f}  r={r_tau1:.4f}  1σ-cov={cov_tau1:.1f}%")
-    pf(f"[EVAL] tau2  RMSE={rmse_tau2:.4f}  r={r_tau2:.4f}  1σ-cov={cov_tau2:.1f}%")
-    pf(f"[EVAL] fret  RMSE={rmse_fret:.4f}  r={r_fret:.4f}  1σ-cov={cov_fret:.1f}%")
+    # --------------------------------------------------------------------------
+    # Metrics.
+    # --------------------------------------------------------------------------
+
+    def compute_metrics(
+        gt,
+        pred,
+    ):
+        valid_mask = (
+            np.isfinite(
+                gt
+            )
+            & np.isfinite(
+                pred
+            )
+        )
+
+        valid_count = int(
+            np.sum(
+                valid_mask
+            )
+        )
+
+        if valid_count < 5:
+            return (
+                float("nan"),
+                float("nan"),
+                float("nan"),
+                valid_count,
+            )
+
+        gt_valid = np.asarray(
+            gt[
+                valid_mask
+            ],
+            dtype=np.float64,
+        )
+
+        pred_valid = np.asarray(
+            pred[
+                valid_mask
+            ],
+            dtype=np.float64,
+        )
+
+        residual = (
+            pred_valid
+            - gt_valid
+        )
+
+        rmse = float(
+            np.sqrt(
+                np.mean(
+                    residual ** 2
+                )
+            )
+        )
+
+        r_value = float(
+            pearsonr(
+                gt_valid,
+                pred_valid,
+            )[
+                0
+            ]
+        )
+
+        sigma = float(
+            np.std(
+                residual
+            )
+        )
+
+        if sigma > 0.0:
+            coverage = float(
+                np.mean(
+                    np.abs(
+                        residual
+                    )
+                    <= sigma
+                )
+                * 100.0
+            )
+
+        else:
+            coverage = 100.0
+
+        return (
+            rmse,
+            r_value,
+            coverage,
+            valid_count,
+        )
+
+    (
+        rmse_tau1,
+        r_tau1,
+        cov_tau1,
+        n_valid_tau1,
+    ) = compute_metrics(
+        tau1_gt,
+        tau1_pred,
+    )
+
+    (
+        rmse_tau2,
+        r_tau2,
+        cov_tau2,
+        n_valid_tau2,
+    ) = compute_metrics(
+        tau2_gt,
+        tau2_pred,
+    )
+
+    (
+        rmse_fret,
+        r_fret,
+        cov_fret,
+        n_valid_fret,
+    ) = compute_metrics(
+        fret_gt,
+        fret_pred,
+    )
+
+    tau1_residual = (
+        tau1_pred
+        - tau1_gt
+    ).astype(
+        np.float32
+    )
+
+    tau2_residual = (
+        tau2_pred
+        - tau2_gt
+    ).astype(
+        np.float32
+    )
+
+    fret_residual = (
+        fret_pred
+        - fret_gt
+    ).astype(
+        np.float32
+    )
+
+    pf(
+        f"[EVAL] tau1  "
+        f"RMSE={rmse_tau1:.6f}  "
+        f"r={r_tau1:.6f}  "
+        f"1sigma-cov={cov_tau1:.2f}%"
+    )
+
+    pf(
+        f"[EVAL] tau2  "
+        f"RMSE={rmse_tau2:.6f}  "
+        f"r={r_tau2:.6f}  "
+        f"1sigma-cov={cov_tau2:.2f}%"
+    )
+
+    pf(
+        f"[EVAL] fret  "
+        f"RMSE={rmse_fret:.6f}  "
+        f"r={r_fret:.6f}  "
+        f"1sigma-cov={cov_fret:.2f}%"
+    )
+
     sys.stdout.flush()
 
-    title_suffix = f"  [{phase_tag}]" if phase_tag else ""
+    # --------------------------------------------------------------------------
+    # Save the exact numerical data used by every publication plot.
+    # --------------------------------------------------------------------------
 
-    # ── Scatter plots — vanilla style: hexbin, log bins, colored cmap, y=x ────
+    subset_count = min(
+        512,
+        n_test,
+    )
+
+    if subset_count == n_test:
+        subset_positions = np.arange(
+            n_test,
+            dtype=np.int64,
+        )
+
+    else:
+        subset_positions = np.rint(
+            np.linspace(
+                0,
+                n_test - 1,
+                num=subset_count,
+                endpoint=True,
+            )
+        ).astype(
+            np.int64
+        )
+
+        subset_positions = np.unique(
+            subset_positions
+        )
+
+    mat_payload = {
+        "phase_tag": phase_label,
+        "run_tag": str(
+            args.run_tag
+        ),
+        "dataset_index_zero_based": dataset_indices,
+        "test_position_zero_based": np.arange(
+            n_test,
+            dtype=np.int64,
+        ),
+        "test_position_one_based": np.arange(
+            1,
+            n_test + 1,
+            dtype=np.int64,
+        ),
+        "time_ns": t_ns.astype(
+            np.float32
+        ),
+        "gate_width_ns": np.asarray(
+            [
+                [
+                    float(
+                        gate_width_ns
+                    )
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "tau1_true": tau1_gt,
+        "tau1_pred": tau1_pred,
+        "tau1_residual": tau1_residual,
+        "tau2_true": tau2_gt,
+        "tau2_pred": tau2_pred,
+        "tau2_residual": tau2_residual,
+        "fret_true": fret_gt,
+        "fret_pred": fret_pred,
+        "fret_residual": fret_residual,
+        "sequence_mae_per_sample": sequence_mae_per_sample,
+        "mae_seq": np.asarray(
+            [
+                [
+                    mae_seq
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "rmse_tau1": np.asarray(
+            [
+                [
+                    rmse_tau1
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "rmse_tau2": np.asarray(
+            [
+                [
+                    rmse_tau2
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "rmse_fret": np.asarray(
+            [
+                [
+                    rmse_fret
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "r_tau1": np.asarray(
+            [
+                [
+                    r_tau1
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "r_tau2": np.asarray(
+            [
+                [
+                    r_tau2
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "r_fret": np.asarray(
+            [
+                [
+                    r_fret
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "cov1sigma_tau1": np.asarray(
+            [
+                [
+                    cov_tau1
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "cov1sigma_tau2": np.asarray(
+            [
+                [
+                    cov_tau2
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "cov1sigma_fret": np.asarray(
+            [
+                [
+                    cov_fret
+                ]
+            ],
+            dtype=np.float64,
+        ),
+        "n_test": np.asarray(
+            [
+                [
+                    n_test
+                ]
+            ],
+            dtype=np.int64,
+        ),
+        "n_valid_tau1": np.asarray(
+            [
+                [
+                    n_valid_tau1
+                ]
+            ],
+            dtype=np.int64,
+        ),
+        "n_valid_tau2": np.asarray(
+            [
+                [
+                    n_valid_tau2
+                ]
+            ],
+            dtype=np.int64,
+        ),
+        "n_valid_fret": np.asarray(
+            [
+                [
+                    n_valid_fret
+                ]
+            ],
+            dtype=np.int64,
+        ),
+        "sequence_subset_test_position_zero_based": subset_positions,
+        "sequence_subset_dataset_index_zero_based": dataset_indices[
+            subset_positions
+        ],
+        "sequence_subset_input": np.asarray(
+            enc_test[
+                subset_positions
+            ],
+            dtype=np.float32,
+        ),
+        "sequence_subset_target": np.asarray(
+            target_float[
+                subset_positions
+            ],
+            dtype=np.float32,
+        ),
+        "sequence_subset_prediction": np.asarray(
+            preds[
+                subset_positions
+            ],
+            dtype=np.float32,
+        ),
+        "sequence_subset_physical_labels": np.asarray(
+            physical_labels_all[
+                subset_positions
+            ],
+            dtype=np.float32,
+        ),
+    }
+
+    canonical_mat_path = os.path.join(
+        job_dir,
+        "test_plot_data.mat",
+    )
+
+    save_mat_atomic(
+        path=canonical_mat_path,
+        payload=mat_payload,
+        pf=pf,
+    )
+
+    if phase_tag is not None:
+        tagged_mat_path = os.path.join(
+            job_dir,
+            f"test_plot_data_{phase_label}.mat",
+        )
+
+        save_mat_atomic(
+            path=tagged_mat_path,
+            payload=mat_payload,
+            pf=pf,
+        )
+
+    # --------------------------------------------------------------------------
+    # Scatter plots.
+    # --------------------------------------------------------------------------
+
     panels = [
-        (tau1_gt, tau1_pred, rmse_tau1, r_tau1, cov_tau1,
-         "τ₁ (ns)", "GT τ₁ (ns)", "Pred τ₁ (ns)",
-         (0.0, TAU1_MAX_PHYS), "Blues",   "test_scatter_tau1"),
-        (tau2_gt, tau2_pred, rmse_tau2, r_tau2, cov_tau2,
-         "τ₂ (ns)", "GT τ₂ (ns)", "Pred τ₂ (ns)",
-         (0.0, TAU2_MAX_PHYS), "Greens",  "test_scatter_tau2"),
-        (fret_gt, fret_pred, rmse_fret, r_fret, cov_fret,
-         "FRET (f)", "GT FRET (f)", "Pred FRET (f)",
-         (0.0, FRET_MAX_PHYS), "Oranges", "test_scatter_fret"),
+        (
+            tau1_gt,
+            tau1_pred,
+            rmse_tau1,
+            r_tau1,
+            cov_tau1,
+            "τ₁ (ns)",
+            "GT τ₁ (ns)",
+            "Predicted τ₁ (ns)",
+            (
+                0.0,
+                TAU1_MAX_PHYS,
+            ),
+            "Blues",
+            "test_scatter_tau1",
+        ),
+        (
+            tau2_gt,
+            tau2_pred,
+            rmse_tau2,
+            r_tau2,
+            cov_tau2,
+            "τ₂ (ns)",
+            "GT τ₂ (ns)",
+            "Predicted τ₂ (ns)",
+            (
+                0.0,
+                TAU2_MAX_PHYS,
+            ),
+            "Greens",
+            "test_scatter_tau2",
+        ),
+        (
+            fret_gt,
+            fret_pred,
+            rmse_fret,
+            r_fret,
+            cov_fret,
+            "FRET fraction",
+            "GT FRET fraction",
+            "Predicted FRET fraction",
+            (
+                0.0,
+                FRET_MAX_PHYS,
+            ),
+            "Oranges",
+            "test_scatter_fret",
+        ),
     ]
 
-    for (gt_c, pred_c, rmse_v, r_v, cov_v,
-         title, xlabel, ylabel, lims, cmap, base_name) in panels:
-        lo, hi = lims
-        mask = np.isfinite(gt_c) & np.isfinite(pred_c)
-        gt_plot   = gt_c[mask]
-        pred_plot = pred_c[mask]
+    for (
+        gt_values,
+        pred_values,
+        rmse_value,
+        r_value,
+        coverage_value,
+        title,
+        xlabel,
+        ylabel,
+        limits,
+        cmap,
+        base_name,
+    ) in panels:
+        lo, hi = limits
 
-        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-        if len(gt_plot) > 0:
-            hb = ax.hexbin(
-                gt_plot, pred_plot,
-                gridsize=80, bins="log", cmap=cmap,
-                extent=(lo, hi, lo, hi), mincnt=1,
+        valid_mask = (
+            np.isfinite(
+                gt_values
             )
-            fig.colorbar(hb, ax=ax, pad=0.02).set_label("log₁₀(count)", fontsize=9)
-        ax.plot([lo, hi], [lo, hi], "r--", linewidth=1.5, label="y = x")
-        ax.set_xlim(lo, hi)
-        ax.set_ylim(lo, hi)
-        ax.set_xlabel(xlabel, fontsize=11)
-        ax.set_ylabel(ylabel, fontsize=11)
-        phase_title = f"{phase_tag}" if phase_tag else "memoq"
-        ax.set_title(f"{title}  {phase_title}", fontsize=10, fontweight="bold")
-        ax.set_aspect("equal")
-        ax.grid(True, alpha=0.2)
-        ax.text(
-            0.03, 0.97,
-            f"RMSE={rmse_v:.4f}\nr={r_v:.4f}\n1σ-cov={cov_v:.1f}%",
-            transform=ax.transAxes, fontsize=8.5,
-            verticalalignment="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+            & np.isfinite(
+                pred_values
+            )
         )
-        ax.legend(loc="lower right", fontsize=9)
-        plt.tight_layout()
 
-        canonical_path = os.path.join(job_dir, f"{base_name}.png")
-        plt.savefig(canonical_path, dpi=150, bbox_inches="tight")
-        pf(f"[EVAL] Saved {canonical_path}")
+        gt_plot = gt_values[
+            valid_mask
+        ]
+
+        pred_plot = pred_values[
+            valid_mask
+        ]
+
+        fig, ax = plt.subplots(
+            1,
+            1,
+            figsize=(
+                6.5,
+                6.2,
+            ),
+        )
+
+        if gt_plot.size > 0:
+            hb = ax.hexbin(
+                gt_plot,
+                pred_plot,
+                gridsize=90,
+                bins="log",
+                cmap=cmap,
+                extent=(
+                    lo,
+                    hi,
+                    lo,
+                    hi,
+                ),
+                mincnt=1,
+            )
+
+            # Keep PDF text/axes vector while rasterizing the dense hexbin
+            # collection so the publication PDF remains compact.
+            hb.set_rasterized(
+                True
+            )
+
+            colorbar = fig.colorbar(
+                hb,
+                ax=ax,
+                pad=0.02,
+            )
+
+            colorbar.set_label(
+                "Count",
+                fontsize=10,
+            )
+
+        ax.plot(
+            [
+                lo,
+                hi,
+            ],
+            [
+                lo,
+                hi,
+            ],
+            linestyle="--",
+            linewidth=1.4,
+            label="y = x",
+        )
+
+        ax.set_xlim(
+            lo,
+            hi,
+        )
+
+        ax.set_ylim(
+            lo,
+            hi,
+        )
+
+        ax.set_xlabel(
+            xlabel,
+            fontsize=11,
+        )
+
+        ax.set_ylabel(
+            ylabel,
+            fontsize=11,
+        )
+
+        ax.set_title(
+            f"{title} — {phase_label}",
+            fontsize=11,
+            fontweight="bold",
+        )
+
+        ax.set_aspect(
+            "equal",
+            adjustable="box",
+        )
+
+        ax.grid(
+            True,
+            alpha=0.2,
+        )
+
+        ax.text(
+            0.03,
+            0.97,
+            (
+                f"RMSE = {rmse_value:.4f}\n"
+                f"r = {r_value:.4f}\n"
+                f"1σ coverage = {coverage_value:.1f}%"
+            ),
+            transform=ax.transAxes,
+            fontsize=9,
+            verticalalignment="top",
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                facecolor="white",
+                alpha=0.9,
+            ),
+        )
+
+        ax.legend(
+            loc="lower right",
+            fontsize=9,
+        )
+
+        fig.tight_layout()
+
+        canonical_base = os.path.join(
+            job_dir,
+            base_name,
+        )
+
+        save_figure_outputs(
+            fig=fig,
+            base_path=canonical_base,
+            pf=pf,
+            png_dpi=600,
+        )
 
         if phase_tag is not None:
-            tagged_path = os.path.join(job_dir, f"{base_name}_{phase_tag}.png")
-            plt.savefig(tagged_path, dpi=150, bbox_inches="tight")
-            pf(f"[EVAL] Saved {tagged_path}")
+            tagged_base = os.path.join(
+                job_dir,
+                f"{base_name}_{phase_label}",
+            )
 
-        plt.close(fig)
+            save_figure_outputs(
+                fig=fig,
+                base_path=tagged_base,
+                pf=pf,
+                png_dpi=600,
+            )
 
-    sys.stdout.flush()
-
-    # ── Residuals plot — vanilla style (3-panel histogram, mu/sigma box) ──────
-    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
-    for ax, gt_c, pred_c, label, color in zip(
-        axes,
-        [tau1_gt, tau2_gt, fret_gt],
-        [tau1_pred, tau2_pred, fret_pred],
-        ["τ₁ (ns)", "τ₂ (ns)", "FRET (f)"],
-        ["steelblue", "seagreen", "darkorange"],
-    ):
-        mask = np.isfinite(gt_c) & np.isfinite(pred_c)
-        residuals = pred_c[mask] - gt_c[mask]
-        ax.hist(residuals, bins=100, color=color, alpha=0.75, edgecolor="none")
-        ax.axvline(0, color="red", linewidth=1.2, linestyle="--")
-        ax.set_xlabel(f"Residual {label}", fontsize=10)
-        ax.set_ylabel("Count", fontsize=10)
-        ax.set_title(f"Residuals {label}{title_suffix}", fontsize=10, fontweight="bold")
-        ax.grid(True, alpha=0.2)
-        ax.text(
-            0.97, 0.97,
-            f"μ={residuals.mean():.4f}\nσ={residuals.std():.4f}",
-            transform=ax.transAxes, fontsize=8, ha="right", va="top",
-            bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8),
+        plt.close(
+            fig
         )
-    phase_title = f"{phase_tag}" if phase_tag else "memoq"
-    fig.suptitle(f"Residuals  {phase_title}", fontsize=11, fontweight="bold")
-    plt.tight_layout()
-    residuals_path = os.path.join(job_dir, "test_residuals.png")
-    plt.savefig(residuals_path, dpi=150, bbox_inches="tight")
-    if phase_tag is not None:
-        plt.savefig(os.path.join(job_dir, f"test_residuals_{phase_tag}.png"), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    pf(f"[EVAL] Saved {residuals_path}")
-    sys.stdout.flush()
 
-    # ── Metrics JSON ──────────────────────────────────────────────────────
-    metrics = {
-        "mae_seq":          mae_seq,
-        "rmse_tau1":        rmse_tau1,
-        "rmse_tau2":        rmse_tau2,
-        "rmse_fret":        rmse_fret,
-        "r_tau1":           r_tau1,
-        "r_tau2":           r_tau2,
-        "r_fret":           r_fret,
-        "cov1sigma_tau1":   cov_tau1,
-        "cov1sigma_tau2":   cov_tau2,
-        "cov1sigma_fret":   cov_fret,
-        "n_test":           n_test,
-        "n_valid_tau1":     int(np.isfinite(tau1_pred).sum()),
-        "n_valid_tau2":     int(np.isfinite(tau2_pred).sum()),
-        "n_valid_fret":     int(np.isfinite(fret_pred).sum()),
-        "phase_tag":        phase_tag,
-    }
-    metrics_path = os.path.join(job_dir, "test_metrics.json")
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
+    # --------------------------------------------------------------------------
+    # Residual distributions.
+    # --------------------------------------------------------------------------
+
+    fig, axes = plt.subplots(
+        1,
+        3,
+        figsize=(
+            16,
+            4.8,
+        ),
+    )
+
+    residual_panels = [
+        (
+            tau1_residual,
+            "τ₁ (ns)",
+        ),
+        (
+            tau2_residual,
+            "τ₂ (ns)",
+        ),
+        (
+            fret_residual,
+            "FRET fraction",
+        ),
+    ]
+
+    for ax, (
+        residual_values,
+        label,
+    ) in zip(
+        axes,
+        residual_panels,
+    ):
+        valid_residuals = residual_values[
+            np.isfinite(
+                residual_values
+            )
+        ]
+
+        ax.hist(
+            valid_residuals,
+            bins=100,
+            alpha=0.8,
+            edgecolor="none",
+        )
+
+        ax.axvline(
+            0.0,
+            linewidth=1.2,
+            linestyle="--",
+        )
+
+        ax.set_xlabel(
+            f"Residual {label}",
+            fontsize=10,
+        )
+
+        ax.set_ylabel(
+            "Count",
+            fontsize=10,
+        )
+
+        ax.set_title(
+            f"{label} — {phase_label}",
+            fontsize=10,
+            fontweight="bold",
+        )
+
+        ax.grid(
+            True,
+            alpha=0.2,
+        )
+
+        if valid_residuals.size > 0:
+            residual_mean = float(
+                np.mean(
+                    valid_residuals
+                )
+            )
+
+            residual_std = float(
+                np.std(
+                    valid_residuals
+                )
+            )
+
+        else:
+            residual_mean = float(
+                "nan"
+            )
+
+            residual_std = float(
+                "nan"
+            )
+
+        ax.text(
+            0.97,
+            0.97,
+            (
+                f"μ = {residual_mean:.4f}\n"
+                f"σ = {residual_std:.4f}"
+            ),
+            transform=ax.transAxes,
+            fontsize=8.5,
+            horizontalalignment="right",
+            verticalalignment="top",
+            bbox=dict(
+                boxstyle="round,pad=0.3",
+                facecolor="white",
+                alpha=0.9,
+            ),
+        )
+
+    fig.suptitle(
+        f"Test residual distributions — {phase_label}",
+        fontsize=12,
+        fontweight="bold",
+    )
+
+    fig.tight_layout(
+        rect=[
+            0.0,
+            0.0,
+            1.0,
+            0.95,
+        ]
+    )
+
+    canonical_residual_base = os.path.join(
+        job_dir,
+        "test_residuals",
+    )
+
+    save_figure_outputs(
+        fig=fig,
+        base_path=canonical_residual_base,
+        pf=pf,
+        png_dpi=600,
+    )
+
     if phase_tag is not None:
-        phase_metrics_path = os.path.join(job_dir, f"test_metrics_{phase_tag}.json")
-        with open(phase_metrics_path, "w") as f:
-            json.dump(metrics, f, indent=2)
-    pf(f"[EVAL] Metrics: {metrics}")
-    pf(f"[EVAL] Saved {metrics_path}")
+        tagged_residual_base = os.path.join(
+            job_dir,
+            f"test_residuals_{phase_label}",
+        )
+
+        save_figure_outputs(
+            fig=fig,
+            base_path=tagged_residual_base,
+            pf=pf,
+            png_dpi=600,
+        )
+
+    plt.close(
+        fig
+    )
+
+    # --------------------------------------------------------------------------
+    # Metrics JSON.
+    # --------------------------------------------------------------------------
+
+    metrics = {
+        "mae_seq": mae_seq,
+        "rmse_tau1": rmse_tau1,
+        "rmse_tau2": rmse_tau2,
+        "rmse_fret": rmse_fret,
+        "r_tau1": r_tau1,
+        "r_tau2": r_tau2,
+        "r_fret": r_fret,
+        "cov1sigma_tau1": cov_tau1,
+        "cov1sigma_tau2": cov_tau2,
+        "cov1sigma_fret": cov_fret,
+        "n_test": n_test,
+        "n_valid_tau1": n_valid_tau1,
+        "n_valid_tau2": n_valid_tau2,
+        "n_valid_fret": n_valid_fret,
+        "phase_tag": phase_label,
+        "run_tag": str(
+            args.run_tag
+        ),
+    }
+
+    metrics_path = os.path.join(
+        job_dir,
+        "test_metrics.json",
+    )
+
+    with open(
+        metrics_path,
+        "w",
+        encoding="utf-8",
+    ) as handle:
+        json.dump(
+            metrics,
+            handle,
+            indent=2,
+            sort_keys=True,
+        )
+
+        handle.write(
+            "\n"
+        )
+
+    pf(
+        f"[EVAL] Saved {metrics_path}"
+    )
+
+    if phase_tag is not None:
+        phase_metrics_path = os.path.join(
+            job_dir,
+            f"test_metrics_{phase_label}.json",
+        )
+
+        with open(
+            phase_metrics_path,
+            "w",
+            encoding="utf-8",
+        ) as handle:
+            json.dump(
+                metrics,
+                handle,
+                indent=2,
+                sort_keys=True,
+            )
+
+            handle.write(
+                "\n"
+            )
+
+        pf(
+            f"[EVAL] Saved {phase_metrics_path}"
+        )
+
+    pf(
+        f"[EVAL] Metrics: {metrics}"
+    )
+
     sys.stdout.flush()
 
     return metrics
@@ -5107,200 +6956,1000 @@ def evaluate_and_save(
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="MemoQ: memory-preserving 4-bit recurrent quantization KD for QGRU Seq2Seq.",
+        description=(
+            "MemoQ: progressively hardened, QKeras-matched recurrent "
+            "quantization KD for QGRU Seq2Seq."
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    p.add_argument("--data-dir",      type=str, required=True)
-    p.add_argument("--save-dir",      type=str, default=None)
-    p.add_argument("--seq-len",       type=int, default=135)
-    p.add_argument("--n-out",         type=int, default=3)
-    p.add_argument("--gate-width-ns", type=float, default=0.09)
-
-    p.add_argument("--teacher-ckpt",   type=str, required=True)
-    p.add_argument("--teacher-units",  type=int, default=128)
-    p.add_argument("--teacher-layers", type=int, default=2)
-
-    p.add_argument("--temperature", type=float, default=4.0)
-    p.add_argument("--alpha",       type=float, default=0.7)
-
-    p.add_argument("--bits-kernel",     type=int, default=4)
-    p.add_argument("--bits-bias",       type=int, default=4)
-    p.add_argument("--bits-recurrent",  type=int, default=4)
-    p.add_argument("--bits-activation", type=int, default=4)
-    p.add_argument("--bits-state",      type=int, default=4)
-
-    p.add_argument("--student-units", type=int, default=32)
-
-    # ── Quantizer scaling family (CONTROLLED-EXPERIMENT KNOB) ─────────────────
-    # "1.0"      -> vanilla-identical fixed +/-1 scale (use this for the paper).
-    # "auto_po2" -> learned per-tensor power-of-2 scale (raw-performance mode).
-    # This single flag sets the alpha for kernel/recurrent/bias/dense quantizers
-    # in BOTH the Phase 2 split-gate cell and the final QKeras student, so the
-    # two graphs can never disagree and create a P2C->P3 quantisation cliff.
-    p.add_argument("--quantizer-alpha", type=str, default="1.0",
-                   choices=["1.0", "auto_po2"],
-                   help="Weight quantizer scaling family for kernel/recurrent/"
-                        "bias/dense in BOTH Phase 2 and the final QKeras student. "
-                        "Use 1.0 for the vanilla-identical controlled experiment.")
-
-    # ── Output loss type (CONTROLLED-EXPERIMENT KNOB) ─────────────────────────
-    # "mse"     -> exact vanilla KD objective (plain MSE). Use for ladder rung A/B.
-    # "huber_cn"-> channel-normalised Huber (original MemoQ). Confounds vs vanilla.
-    p.add_argument("--output-loss", type=str, default="mse",
-                   choices=["mse", "huber_cn"],
-                   help="Base output KD loss. 'mse' reproduces vanilla exactly; "
-                        "'huber_cn' uses channel-normalised Huber.")
-
     p.add_argument(
-        "--memoq-warmup-epochs", "--memoq-stage1-epochs",
-        dest="memoq_warmup_epochs", type=int, default=40,
-    )
-    p.add_argument("--memoq-stage2a-epochs", type=int, default=30)
-    p.add_argument("--memoq-stage2b-epochs", type=int, default=30)
-    p.add_argument("--memoq-stage2c-epochs", type=int, default=30)
-    p.add_argument("--memoq-stage2d-epochs",    type=int,   default=10,
-                        help="P2D: all biases 4-bit stage epochs")
-    p.add_argument("--memoq-stage2e-epochs",    type=int,   default=10,
-                        help="P2E: activation quantizer stage epochs")
-    p.add_argument("--memoq-stage2f-epochs",    type=int,   default=30,
-                        help="P2F: state quantizer soft-blend stage epochs")
-    p.add_argument("--memoq-state-anneal-epochs", type=int, default=15,
-                        help="Number of P2F epochs over which beta ramps 0->1")
-    p.add_argument("--memoq-lr-mult-p2d",       type=float, default=0.3,
-                        help="LR multiplier for P2D stage")
-    p.add_argument("--memoq-lr-mult-p2e",       type=float, default=0.3,
-                        help="LR multiplier for P2E stage")
-    p.add_argument("--memoq-lr-mult-p2f",       type=float, default=0.3,
-                        help="LR multiplier for P2F state annealing stage")
-    p.add_argument("--memoq-lambda-mem-p2d",    type=float, default=0.0)
-    p.add_argument("--memoq-lambda-mem-p2e",    type=float, default=0.0)
-    p.add_argument("--memoq-lambda-mem-p2f",    type=float, default=0.1)
-    p.add_argument("--memoq-lambda-innov-p2d",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p2e",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p2f",  type=float, default=0.05)
-    p.add_argument("--memoq-lambda-zsat-p2d",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p2e",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p2f",   type=float, default=0.01)
-    p.add_argument("--memoq-lambda-rail-p2d",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p2e",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p2f",   type=float, default=0.01)
-    p.add_argument("--memoq-lambda-shape-p2d",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p2e",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p2f",  type=float, default=0.0)
-    p.add_argument(
-        "--memoq-finetune-epochs", "--memoq-stage3-epochs",
-        dest="memoq_stage3_epochs", type=int, default=170,
+        "--data-dir",
+        type=str,
+        required=True,
     )
 
-    # ── Per-phase auxiliary loss weights (ALL ARGS — set 0.0 to disable) ──────
-    # Each phase has its own lambda for every auxiliary loss. The experimental
-    # ladder is run purely by setting these on the command line; no code edits.
-    #   ladder A/B (vanilla / control): leave every aux lambda at 0.0
-    #   ladder D: set memX > 0 ; ladder E: add innovX ; ladder F: add zsat/rail/shape
-    # P2A
-    p.add_argument("--memoq-lambda-mem-p2a",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p2a", type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p2a",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p2a",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p2a", type=float, default=0.0)
-    # P2B
-    p.add_argument("--memoq-lambda-mem-p2b",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p2b", type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p2b",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p2b",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p2b", type=float, default=0.0)
-    # P2C
-    p.add_argument("--memoq-lambda-mem-p2c",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p2c", type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p2c",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p2c",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p2c", type=float, default=0.0)
-    # P3
-    p.add_argument("--memoq-lambda-mem-p3",    type=float, default=0.0)
-    p.add_argument("--memoq-lambda-innov-p3",  type=float, default=0.0)
-    p.add_argument("--memoq-lambda-zsat-p3",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-rail-p3",   type=float, default=0.0)
-    p.add_argument("--memoq-lambda-shape-p3",  type=float, default=0.0)
+    p.add_argument(
+        "--save-dir",
+        type=str,
+        default=None,
+    )
 
-    # ── Gate-curriculum toggle (ARG) ──────────────────────────────────────────
-    # When False, Phase 2 quantises all gates simultaneously at P2A (no causal
-    # h->r->z curriculum) — this is ladder rung B (MemoQ-control). When True,
-    # gates harden one at a time (rung C onward).
-    p.add_argument("--memoq-gate-curriculum", type=lambda s: s.lower() in ("1", "true", "yes", "y"),
-                   default=True,
-                   help="True: causal h->r->z gate hardening (rung C+). "
-                        "False: all gates 4-bit from P2A (rung B control).")
+    p.add_argument(
+        "--run-tag",
+        type=str,
+        default="default",
+        help=(
+            "Explicit scientific run identifier. "
+            "Use paper_main_qkeras_matched for the primary controlled run."
+        ),
+    )
 
-    # ── Innovation burn-in (ARG) ──────────────────────────────────────────────
-    p.add_argument("--memoq-innov-burnin",   type=int,   default=5)
+    p.add_argument(
+        "--seq-len",
+        type=int,
+        default=135,
+    )
 
-    # ── Loss-shape detail args ────────────────────────────────────────────────
-    p.add_argument("--memoq-huber-delta", type=float, default=0.1)
-    p.add_argument("--memoq-rho-z",       type=float, default=0.98)
-    p.add_argument("--memoq-rho-rail",    type=float, default=0.97)
-    p.add_argument("--memoq-mu-rail",     type=float, default=0.0)
+    p.add_argument(
+        "--n-out",
+        type=int,
+        default=3,
+    )
 
-    # ── Per-phase LR multipliers (ARGS) ───────────────────────────────────────
-    # Phase LR = effective_lr * multiplier (Phase 3 additionally floored, see below).
-    p.add_argument("--memoq-lr-mult-p1",  type=float, default=1.0)
-    p.add_argument("--memoq-lr-mult-p2a", type=float, default=0.5)
-    p.add_argument("--memoq-lr-mult-p2b", type=float, default=0.3)
-    p.add_argument("--memoq-lr-mult-p2c", type=float, default=0.2)
-    p.add_argument("--memoq-lr-mult-p3",  type=float, default=0.1)
+    p.add_argument(
+        "--gate-width-ns",
+        type=float,
+        default=0.09,
+    )
 
-    p.add_argument("--memoq-phase3-lr-floor", type=float, default=1e-5,
-                   help="Lower floor on the Phase 3 LR so the hard graph has "
-                        "enough gradient signal to recover from the transfer.")
+    p.add_argument(
+        "--teacher-ckpt",
+        type=str,
+        required=True,
+    )
 
-    p.add_argument("--batch-size",        type=int,   default=1024)
-    p.add_argument("--epochs",            type=int,   default=330)
-    p.add_argument("--lr",                type=float, default=1e-4)
-    p.add_argument("--ref-batch-size",    type=int,   default=1024)
-    p.add_argument("--no-lr-scaling",     action="store_true", default=False)
-    p.add_argument("--lr-factor",         type=float, default=0.5)
-    p.add_argument("--lr-patience",       type=int,   default=8)
-    p.add_argument("--lr-min",            type=float, default=1e-6)
-    p.add_argument("--patience",          type=int,   default=30)
-    p.add_argument("--min-delta",         type=float, default=1e-5)
-    p.add_argument("--infer-batch",       type=int,   default=8192)
-    p.add_argument("--mixed-precision",   action="store_true", default=False)
-    p.add_argument("--log-interval",      type=int,   default=10)
-    p.add_argument("--prefetch-batches",  type=int,   default=32)
-    p.add_argument("--pipeline-workers",  type=int,   default=4)
-    p.add_argument("--split-seed",        type=int,   default=42)
-    p.add_argument("--warmup-epochs",     type=int,   default=5)
-# Accepted for CLI compatibility but UNUSED — there is no gradient
-    # accumulation in this pipeline. Kept so existing sbatch scripts don't break.
-    p.add_argument("--accumulation-steps", type=int, default=1,
-                   help="UNUSED — accepted for CLI compatibility only.")
-    p.add_argument("--resume",            action="store_true", default=False)
+    p.add_argument(
+        "--teacher-units",
+        type=int,
+        default=128,
+    )
+
+    p.add_argument(
+        "--teacher-layers",
+        type=int,
+        default=2,
+    )
+
+    p.add_argument(
+        "--temperature",
+        type=float,
+        default=4.0,
+    )
+
+    p.add_argument(
+        "--alpha",
+        type=float,
+        default=0.7,
+    )
+
+    p.add_argument(
+        "--bits-kernel",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--bits-bias",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--bits-recurrent",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--bits-activation",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--bits-state",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--student-units",
+        type=int,
+        default=32,
+    )
+
+    # --------------------------------------------------------------------------
+    # Quantizer scaling family.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--quantizer-alpha",
+        type=str,
+        default="1.0",
+        choices=[
+            "1.0",
+            "auto_po2",
+        ],
+        help=(
+            "Weight quantizer scaling family for kernel/recurrent/bias/dense "
+            "in both Phase 2 and the final QKeras student. "
+            "Use 1.0 for the vanilla-matched paper experiment."
+        ),
+    )
+
+    # --------------------------------------------------------------------------
+    # Output objective.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--output-loss",
+        type=str,
+        default="mse",
+        choices=[
+            "mse",
+            "huber_cn",
+        ],
+        help=(
+            "Base output KD loss. mse is the vanilla-matched controlled "
+            "objective. huber_cn is an alternative experimental condition."
+        ),
+    )
+
+    # --------------------------------------------------------------------------
+    # Stage durations.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-warmup-epochs",
+        "--memoq-stage1-epochs",
+        dest="memoq_warmup_epochs",
+        type=int,
+        default=40,
+    )
+
+    p.add_argument(
+        "--memoq-stage2a-epochs",
+        type=int,
+        default=30,
+    )
+
+    p.add_argument(
+        "--memoq-stage2b-epochs",
+        type=int,
+        default=30,
+    )
+
+    p.add_argument(
+        "--memoq-stage2c-epochs",
+        type=int,
+        default=30,
+    )
+
+    p.add_argument(
+        "--memoq-stage2d-epochs",
+        type=int,
+        default=10,
+        help="P2D: all recurrent parameters including biases are quantized.",
+    )
+
+    p.add_argument(
+        "--memoq-stage2e-epochs",
+        type=int,
+        default=10,
+        help="P2E: candidate activation quantizer stage.",
+    )
+
+    p.add_argument(
+        "--memoq-stage2f-epochs",
+        type=int,
+        default=30,
+        help="P2F: recurrent-state quantizer stage.",
+    )
+
+    p.add_argument(
+        "--memoq-state-anneal-epochs",
+        type=int,
+        default=15,
+        help=(
+            "Annealing duration used for activation hardening in P2E and "
+            "state hardening in P2F."
+        ),
+    )
+
+    p.add_argument(
+        "--memoq-finetune-epochs",
+        "--memoq-stage3-epochs",
+        dest="memoq_stage3_epochs",
+        type=int,
+        default=170,
+    )
+
+    # --------------------------------------------------------------------------
+    # Dither.
+    #
+    # Disabled for the primary mechanistic paper run. Keeping the switch in the
+    # code preserves the capability for an explicitly tagged follow-up run.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-use-dither",
+        type=lambda s: s.lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        ),
+        default=False,
+        help=(
+            "Enable training-time quantization dither. "
+            "Must be false for paper_main_qkeras_matched."
+        ),
+    )
+
+    # --------------------------------------------------------------------------
+    # Per-stage learning-rate multipliers.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lr-mult-p1",
+        type=float,
+        default=1.0,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2a",
+        type=float,
+        default=0.5,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2b",
+        type=float,
+        default=0.3,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2c",
+        type=float,
+        default=0.2,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2d",
+        type=float,
+        default=0.3,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2e",
+        type=float,
+        default=0.3,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p2f",
+        type=float,
+        default=0.3,
+    )
+
+    p.add_argument(
+        "--memoq-lr-mult-p3",
+        type=float,
+        default=0.1,
+    )
+
+    p.add_argument(
+        "--memoq-phase3-lr-floor",
+        type=float,
+        default=1e-5,
+        help=(
+            "Lower floor on the Phase 3 learning rate."
+        ),
+    )
+
+    # --------------------------------------------------------------------------
+    # P2A auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2a",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2a",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2a",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2a",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2a",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P2B auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2b",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2b",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2b",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2b",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2b",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P2C auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2c",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2c",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2c",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2c",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2c",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P2D auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2d",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2d",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2d",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2d",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2d",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P2E auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2e",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2e",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2e",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2e",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2e",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P2F auxiliary losses.
+    #
+    # IMPORTANT:
+    # These are deliberately ZERO by default. A non-zero default would make
+    # the P2E -> P2F transition simultaneously introduce recurrent-state
+    # quantization and new loss terms, which is unsuitable for the primary
+    # mechanistic paper trajectory.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p2f",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p2f",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p2f",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p2f",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p2f",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # P3 auxiliary losses.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-lambda-mem-p3",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-innov-p3",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-zsat-p3",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-rail-p3",
+        type=float,
+        default=0.0,
+    )
+
+    p.add_argument(
+        "--memoq-lambda-shape-p3",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # Gate curriculum.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-gate-curriculum",
+        type=lambda s: s.lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        ),
+        default=True,
+        help=(
+            "True: progressive h -> r -> z recurrent-parameter hardening. "
+            "False: all recurrent parameter groups are quantized immediately."
+        ),
+    )
+
+    # --------------------------------------------------------------------------
+    # Auxiliary-loss parameters.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--memoq-innov-burnin",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--memoq-huber-delta",
+        type=float,
+        default=0.1,
+    )
+
+    p.add_argument(
+        "--memoq-rho-z",
+        type=float,
+        default=0.98,
+    )
+
+    p.add_argument(
+        "--memoq-rho-rail",
+        type=float,
+        default=0.97,
+    )
+
+    p.add_argument(
+        "--memoq-mu-rail",
+        type=float,
+        default=0.0,
+    )
+
+    # --------------------------------------------------------------------------
+    # Generic optimization/runtime parameters.
+    # --------------------------------------------------------------------------
+
+    p.add_argument(
+        "--batch-size",
+        type=int,
+        default=1024,
+    )
+
+    p.add_argument(
+        "--epochs",
+        type=int,
+        default=330,
+    )
+
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+    )
+
+    p.add_argument(
+        "--ref-batch-size",
+        type=int,
+        default=1024,
+    )
+
+    p.add_argument(
+        "--no-lr-scaling",
+        action="store_true",
+        default=False,
+    )
+
+    p.add_argument(
+        "--lr-factor",
+        type=float,
+        default=0.5,
+    )
+
+    p.add_argument(
+        "--lr-patience",
+        type=int,
+        default=8,
+    )
+
+    p.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-6,
+    )
+
+    p.add_argument(
+        "--patience",
+        type=int,
+        default=30,
+    )
+
+    p.add_argument(
+        "--min-delta",
+        type=float,
+        default=1e-5,
+    )
+
+    p.add_argument(
+        "--infer-batch",
+        type=int,
+        default=8192,
+    )
+
+    p.add_argument(
+        "--mixed-precision",
+        action="store_true",
+        default=False,
+    )
+
+    p.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+    )
+
+    p.add_argument(
+        "--prefetch-batches",
+        type=int,
+        default=32,
+    )
+
+    p.add_argument(
+        "--pipeline-workers",
+        type=int,
+        default=4,
+    )
+
+    p.add_argument(
+        "--split-seed",
+        type=int,
+        default=42,
+    )
+
+    p.add_argument(
+        "--warmup-epochs",
+        type=int,
+        default=5,
+    )
+
+    p.add_argument(
+        "--accumulation-steps",
+        type=int,
+        default=1,
+        help="UNUSED — accepted for CLI compatibility only.",
+    )
+
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        default=False,
+    )
 
     args = p.parse_args()
 
     if args.save_dir is None:
         args.save_dir = args.data_dir
 
-    args.memoq_stage1_epochs   = args.memoq_warmup_epochs
+    # --------------------------------------------------------------------------
+    # Run-tag validation. The run tag becomes part of a filesystem path.
+    # --------------------------------------------------------------------------
+
+    if re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}",
+        args.run_tag,
+    ) is None:
+        raise ValueError(
+            "--run-tag must contain only letters, digits, underscores, "
+            "and hyphens, must begin with a letter or digit, and must be "
+            "64 characters or fewer."
+        )
+
+    if args.memoq_state_anneal_epochs <= 0:
+        raise ValueError(
+            "--memoq-state-anneal-epochs must be > 0"
+        )
+
+    if (
+        args.memoq_stage2e_epochs > 0
+        and args.memoq_stage2e_epochs < args.memoq_state_anneal_epochs
+    ):
+        raise ValueError(
+            "P2E must contain at least the full activation annealing window. "
+            f"stage2e_epochs={args.memoq_stage2e_epochs}, "
+            f"anneal_epochs={args.memoq_state_anneal_epochs}"
+        )
+
+    if (
+        args.memoq_stage2f_epochs > 0
+        and args.memoq_stage2f_epochs < args.memoq_state_anneal_epochs
+    ):
+        raise ValueError(
+            "P2F must contain at least the full state annealing window. "
+            f"stage2f_epochs={args.memoq_stage2f_epochs}, "
+            f"anneal_epochs={args.memoq_state_anneal_epochs}"
+        )
+
+    args.memoq_stage1_epochs = args.memoq_warmup_epochs
     args.memoq_finetune_epochs = args.memoq_stage3_epochs
 
-    # ── LR + patience scaling — FIXED DIRECTION (task-doc item 5) ─────────────
-    # Vanilla MULTIPLIES patience by the batch ratio. The old MemoQ DIVIDED it,
-    # so at batch 16384 / ref 1024 the scheduler dropped LR after ~1 epoch and
-    # crippled training. Now patience and warmup scale UP with batch size,
-    # exactly like vanilla.
-    scale = float(args.batch_size) / float(args.ref_batch_size)
-    if args.no_lr_scaling:
-        args.effective_lr             = args.lr
-        args.effective_lr_patience    = args.lr_patience
-        args.effective_warmup_epochs  = args.warmup_epochs
-    else:
-        args.effective_lr             = args.lr * scale
-        args.effective_lr_patience    = max(1, int(round(args.lr_patience   * scale)))
-        args.effective_warmup_epochs  = max(0, int(round(args.warmup_epochs * scale)))
+    # --------------------------------------------------------------------------
+    # LR and scheduler scaling.
+    # --------------------------------------------------------------------------
 
-    # Resolve the quantizer alpha into the literal value qkeras expects.
-    args.q_alpha = 1.0 if args.quantizer_alpha == "1.0" else "auto_po2"
+    scale = (
+        float(args.batch_size)
+        / float(args.ref_batch_size)
+    )
+
+    if args.no_lr_scaling:
+        args.effective_lr = args.lr
+        args.effective_lr_patience = args.lr_patience
+        args.effective_warmup_epochs = args.warmup_epochs
+
+    else:
+        args.effective_lr = (
+            args.lr
+            * scale
+        )
+
+        args.effective_lr_patience = max(
+            1,
+            int(
+                round(
+                    args.lr_patience
+                    * scale
+                )
+            ),
+        )
+
+        args.effective_warmup_epochs = max(
+            0,
+            int(
+                round(
+                    args.warmup_epochs
+                    * scale
+                )
+            ),
+        )
+
+    args.q_alpha = (
+        1.0
+        if args.quantizer_alpha == "1.0"
+        else "auto_po2"
+    )
+
+    # --------------------------------------------------------------------------
+    # Fail-closed protection for the PRIMARY PAPER RUN.
+    #
+    # This is intentional. If a future experimental/ablation configuration is
+    # needed, give it a different --run-tag. The paper_main tag is not allowed
+    # to silently become an ablation or an auxiliary-loss experiment.
+    # --------------------------------------------------------------------------
+
+    if args.run_tag.startswith(
+        "paper_main"
+    ):
+        required_stage_epochs = {
+            "P1": args.memoq_warmup_epochs,
+            "P2A": args.memoq_stage2a_epochs,
+            "P2B": args.memoq_stage2b_epochs,
+            "P2C": args.memoq_stage2c_epochs,
+            "P2D": args.memoq_stage2d_epochs,
+            "P2E": args.memoq_stage2e_epochs,
+            "P2F": args.memoq_stage2f_epochs,
+            "P3": args.memoq_stage3_epochs,
+        }
+
+        disabled_stages = [
+            stage
+            for stage, epochs in required_stage_epochs.items()
+            if int(epochs) <= 0
+        ]
+
+        if disabled_stages:
+            raise RuntimeError(
+                "paper_main runs may not skip training stages. "
+                f"Disabled stages: {disabled_stages}"
+            )
+
+        if args.output_loss != "mse":
+            raise RuntimeError(
+                "paper_main requires --output-loss mse"
+            )
+
+        if args.quantizer_alpha != "1.0":
+            raise RuntimeError(
+                "paper_main requires --quantizer-alpha 1.0"
+            )
+
+        if not args.memoq_gate_curriculum:
+            raise RuntimeError(
+                "paper_main requires --memoq-gate-curriculum true"
+            )
+
+        if args.memoq_use_dither:
+            raise RuntimeError(
+                "paper_main requires --memoq-use-dither false"
+            )
+
+        expected_bits = (
+            4,
+            4,
+            4,
+            4,
+            4,
+        )
+
+        actual_bits = (
+            int(args.bits_kernel),
+            int(args.bits_bias),
+            int(args.bits_recurrent),
+            int(args.bits_activation),
+            int(args.bits_state),
+        )
+
+        if actual_bits != expected_bits:
+            raise RuntimeError(
+                "paper_main requires 4-bit kernel/bias/recurrent/"
+                f"activation/state quantization. Received {actual_bits}"
+            )
+
+        if args.student_units != 32:
+            raise RuntimeError(
+                "paper_main requires --student-units 32"
+            )
+
+        if args.teacher_units != 128:
+            raise RuntimeError(
+                "paper_main requires --teacher-units 128"
+            )
+
+        if args.teacher_layers != 2:
+            raise RuntimeError(
+                "paper_main requires --teacher-layers 2"
+            )
+
+        if args.seq_len != 135:
+            raise RuntimeError(
+                "paper_main requires --seq-len 135"
+            )
+
+        if args.n_out != 3:
+            raise RuntimeError(
+                "paper_main requires --n-out 3"
+            )
+
+        if args.batch_size != 1024:
+            raise RuntimeError(
+                "paper_main requires --batch-size 1024"
+            )
+
+        if not math.isclose(
+            float(args.alpha),
+            0.7,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise RuntimeError(
+                "paper_main requires --alpha 0.7"
+            )
+
+        paper_aux_names = [
+            "memoq_lambda_mem_p2a",
+            "memoq_lambda_innov_p2a",
+            "memoq_lambda_zsat_p2a",
+            "memoq_lambda_rail_p2a",
+            "memoq_lambda_shape_p2a",
+            "memoq_lambda_mem_p2b",
+            "memoq_lambda_innov_p2b",
+            "memoq_lambda_zsat_p2b",
+            "memoq_lambda_rail_p2b",
+            "memoq_lambda_shape_p2b",
+            "memoq_lambda_mem_p2c",
+            "memoq_lambda_innov_p2c",
+            "memoq_lambda_zsat_p2c",
+            "memoq_lambda_rail_p2c",
+            "memoq_lambda_shape_p2c",
+            "memoq_lambda_mem_p2d",
+            "memoq_lambda_innov_p2d",
+            "memoq_lambda_zsat_p2d",
+            "memoq_lambda_rail_p2d",
+            "memoq_lambda_shape_p2d",
+            "memoq_lambda_mem_p2e",
+            "memoq_lambda_innov_p2e",
+            "memoq_lambda_zsat_p2e",
+            "memoq_lambda_rail_p2e",
+            "memoq_lambda_shape_p2e",
+            "memoq_lambda_mem_p2f",
+            "memoq_lambda_innov_p2f",
+            "memoq_lambda_zsat_p2f",
+            "memoq_lambda_rail_p2f",
+            "memoq_lambda_shape_p2f",
+            "memoq_lambda_mem_p3",
+            "memoq_lambda_innov_p3",
+            "memoq_lambda_zsat_p3",
+            "memoq_lambda_rail_p3",
+            "memoq_lambda_shape_p3",
+        ]
+
+        nonzero_aux = [
+            (
+                name,
+                float(
+                    getattr(
+                        args,
+                        name,
+                    )
+                ),
+            )
+            for name in paper_aux_names
+            if not math.isclose(
+                float(
+                    getattr(
+                        args,
+                        name,
+                    )
+                ),
+                0.0,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ]
+
+        if nonzero_aux:
+            raise RuntimeError(
+                "paper_main requires every auxiliary-loss coefficient "
+                f"to be zero. Non-zero values: {nonzero_aux}"
+            )
 
     return args
 
@@ -5309,15 +7958,110 @@ def parse_args():
 # ==============================================================================
 
 def make_job_name(args) -> str:
-    effective_batch = args.batch_size
-    micro_batch     = args.batch_size
+    effective_batch = int(
+        args.batch_size
+    )
+
+    micro_batch = int(
+        args.batch_size
+    )
+
     if args.no_lr_scaling:
-        effective_lr = args.lr
+        effective_lr = float(
+            args.lr
+        )
+
     else:
-        effective_lr = args.lr * (args.batch_size / args.ref_batch_size)
+        effective_lr = (
+            float(args.lr)
+            * (
+                float(args.batch_size)
+                / float(args.ref_batch_size)
+            )
+        )
+
     lr_str = f"{effective_lr:.0e}"
+
+    aux_names = [
+        "memoq_lambda_mem_p2a",
+        "memoq_lambda_innov_p2a",
+        "memoq_lambda_zsat_p2a",
+        "memoq_lambda_rail_p2a",
+        "memoq_lambda_shape_p2a",
+        "memoq_lambda_mem_p2b",
+        "memoq_lambda_innov_p2b",
+        "memoq_lambda_zsat_p2b",
+        "memoq_lambda_rail_p2b",
+        "memoq_lambda_shape_p2b",
+        "memoq_lambda_mem_p2c",
+        "memoq_lambda_innov_p2c",
+        "memoq_lambda_zsat_p2c",
+        "memoq_lambda_rail_p2c",
+        "memoq_lambda_shape_p2c",
+        "memoq_lambda_mem_p2d",
+        "memoq_lambda_innov_p2d",
+        "memoq_lambda_zsat_p2d",
+        "memoq_lambda_rail_p2d",
+        "memoq_lambda_shape_p2d",
+        "memoq_lambda_mem_p2e",
+        "memoq_lambda_innov_p2e",
+        "memoq_lambda_zsat_p2e",
+        "memoq_lambda_rail_p2e",
+        "memoq_lambda_shape_p2e",
+        "memoq_lambda_mem_p2f",
+        "memoq_lambda_innov_p2f",
+        "memoq_lambda_zsat_p2f",
+        "memoq_lambda_rail_p2f",
+        "memoq_lambda_shape_p2f",
+        "memoq_lambda_mem_p3",
+        "memoq_lambda_innov_p3",
+        "memoq_lambda_zsat_p3",
+        "memoq_lambda_rail_p3",
+        "memoq_lambda_shape_p3",
+    ]
+
+    auxiliary_enabled = any(
+        not math.isclose(
+            float(
+                getattr(
+                    args,
+                    name,
+                )
+            ),
+            0.0,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        )
+        for name in aux_names
+    )
+
+    aux_tag = (
+        "aux"
+        if auxiliary_enabled
+        else "aux0"
+    )
+
+    gate_tag = (
+        "curr"
+        if args.memoq_gate_curriculum
+        else "allgates"
+    )
+
+    dither_tag = (
+        "dither"
+        if args.memoq_use_dither
+        else "nodither"
+    )
+
+    qalpha_tag = (
+        "q1"
+        if args.quantizer_alpha == "1.0"
+        else "qauto"
+    )
+
     return (
-        f"memoq"
+        f"{args.run_tag}"
+        f"_memoq"
         f"_b{args.bits_kernel}"
         f"k{args.bits_bias}"
         f"r{args.bits_recurrent}"
@@ -5332,7 +8076,15 @@ def make_job_name(args) -> str:
         f"_2a{args.memoq_stage2a_epochs}"
         f"_2b{args.memoq_stage2b_epochs}"
         f"_2c{args.memoq_stage2c_epochs}"
-        f"_p3-{args.memoq_finetune_epochs}"
+        f"_2d{args.memoq_stage2d_epochs}"
+        f"_2e{args.memoq_stage2e_epochs}"
+        f"_2f{args.memoq_stage2f_epochs}"
+        f"_p3-{args.memoq_stage3_epochs}"
+        f"_{args.output_loss}"
+        f"_{qalpha_tag}"
+        f"_{gate_tag}"
+        f"_{dither_tag}"
+        f"_{aux_tag}"
     )
 
 # ==============================================================================
@@ -5825,6 +8577,7 @@ def main():
                 args          = args,
                 pf            = pf,
                 phase_tag     = phase_tag,
+                test_indices  = test_idx,
             )
 
 
@@ -5897,6 +8650,7 @@ def main():
         args          = args,
         pf            = pf,
         phase_tag     = "final",
+        test_indices  = test_idx,
     )
 
     pf(f"[MAIN] best_val={best_val:.6f}")
