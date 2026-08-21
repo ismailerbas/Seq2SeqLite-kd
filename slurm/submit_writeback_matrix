@@ -1,0 +1,822 @@
+#!/bin/bash
+
+set -euo pipefail
+
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+RESULTS_ROOT="${DATA_PATH}/results"
+
+WORKER="${PROJECT_DIR}/slurm/analyze_writeback"
+
+
+MEMOQ_RUN_DIR="${PROJECT_DIR}/results/paper_main_qkeras_matched_memoq_b4k4r4a4s4_gru32_dense3_effbs1024_microbs1024_lr1e-04_p1-40_2a30_2b30_2c10_2d10_2e30_2f30_p3-170_mse_q1_curr_nodither_aux0"
+
+
+if [ ! -d "${PROJECT_DIR}" ]; then
+    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+    exit 1
+fi
+
+
+if [ ! -d "${DATA_PATH}" ]; then
+    echo "FATAL: data directory does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+
+if [ ! -d "${RESULTS_ROOT}" ]; then
+    echo "FATAL: vanilla results root does not exist: ${RESULTS_ROOT}"
+    exit 1
+fi
+
+
+if [ ! -f "${WORKER}" ]; then
+    echo "FATAL: writeback worker does not exist: ${WORKER}"
+    exit 1
+fi
+
+
+bash -n "${WORKER}"
+
+
+python -m py_compile \
+    "${PROJECT_DIR}/eval/analyze_writeback.py"
+
+
+if [ ! -d "${MEMOQ_RUN_DIR}" ]; then
+
+    echo "FATAL: corrected paper_main MemoQ run directory does not exist:"
+    echo "  ${MEMOQ_RUN_DIR}"
+    exit 1
+fi
+
+
+for REQUIRED_FILE in \
+    student_args.json \
+    stage2e_best.weights.h5 \
+    stage2f_best.weights.h5 \
+    student_best.weights.h5 \
+    test_metrics_P2E.json \
+    test_metrics_P2F.json
+
+do
+
+    if [ ! -f "${MEMOQ_RUN_DIR}/${REQUIRED_FILE}" ]; then
+
+        echo "FATAL: corrected MemoQ run is incomplete; missing:"
+        echo "  ${MEMOQ_RUN_DIR}/${REQUIRED_FILE}"
+        exit 1
+    fi
+
+done
+
+
+if [ ! -f "${MEMOQ_RUN_DIR}/test_metrics_P3.json" ] && \
+   [ ! -f "${MEMOQ_RUN_DIR}/test_metrics.json" ]; then
+
+    echo "FATAL: corrected MemoQ run has no P3 saved metrics."
+    exit 1
+fi
+
+
+mapfile -t VANILLA_RUNS < <(
+python - "${RESULTS_ROOT}" <<'PY'
+
+import json
+import math
+import sys
+from pathlib import Path
+
+
+root = Path(
+    sys.argv[1]
+).resolve()
+
+
+targets = {
+    4: (
+        0.3220,
+        0.3275,
+    ),
+    8: (
+        0.2203,
+        0.2229,
+    ),
+}
+
+
+def metric(
+    payload,
+    key,
+):
+    if (
+        key in payload
+        and isinstance(
+            payload[
+                key
+            ],
+            (
+                int,
+                float,
+            ),
+        )
+    ):
+        return float(
+            payload[
+                key
+            ]
+        )
+
+    mapping = {
+        "rmse_tau1": (
+            "tau1",
+            "rmse",
+        ),
+        "rmse_tau2": (
+            "tau2",
+            "rmse",
+        ),
+    }
+
+    outer, inner = mapping[
+        key
+    ]
+
+    if (
+        outer in payload
+        and isinstance(
+            payload[
+                outer
+            ],
+            dict,
+        )
+        and inner
+        in payload[
+            outer
+        ]
+    ):
+        return float(
+            payload[
+                outer
+            ][
+                inner
+            ]
+        )
+
+    return None
+
+
+def valid_config(
+    args,
+    bits,
+):
+    required = {
+        "seq_len": 135,
+        "n_out": 3,
+        "student_units": 32,
+        "bits_kernel": bits,
+        "bits_bias": bits,
+        "bits_recurrent": bits,
+        "bits_activation": bits,
+        "bits_state": bits,
+    }
+
+    for key, expected in (
+        required.items()
+    ):
+        if key not in args:
+            return False
+
+        if (
+            int(
+                args[
+                    key
+                ]
+            )
+            != int(
+                expected
+            )
+        ):
+            return False
+
+    return True
+
+
+for bits in (
+    4,
+    8,
+):
+    candidates = []
+
+    for args_path in root.glob(
+        "*/student_args.json"
+    ):
+        run_dir = (
+            args_path.parent
+        )
+
+        checkpoint = (
+            run_dir
+            / "student_best.weights.h5"
+        )
+
+        metrics_path = (
+            run_dir
+            / "test_metrics.json"
+        )
+
+        if (
+            not checkpoint.is_file()
+            or not metrics_path.is_file()
+        ):
+            continue
+
+        try:
+            args = json.loads(
+                args_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+            metrics = json.loads(
+                metrics_path.read_text(
+                    encoding="utf-8"
+                )
+            )
+
+        except Exception:
+            continue
+
+        if not valid_config(
+            args,
+            bits,
+        ):
+            continue
+
+        r1 = metric(
+            metrics,
+            "rmse_tau1",
+        )
+
+        r2 = metric(
+            metrics,
+            "rmse_tau2",
+        )
+
+        if (
+            r1 is None
+            or r2 is None
+            or not math.isfinite(
+                r1
+            )
+            or not math.isfinite(
+                r2
+            )
+        ):
+            continue
+
+        (
+            target1,
+            target2,
+        ) = targets[
+            bits
+        ]
+
+        d1 = abs(
+            r1
+            - target1
+        )
+
+        d2 = abs(
+            r2
+            - target2
+        )
+
+        if (
+            d1 <= 0.01
+            and d2 <= 0.01
+        ):
+            candidates.append(
+                (
+                    d1
+                    + d2,
+                    run_dir,
+                    r1,
+                    r2,
+                )
+            )
+
+    candidates.sort(
+        key=lambda row: row[0]
+    )
+
+    if len(
+        candidates
+    ) != 1:
+
+        print(
+            (
+                f"FATAL_DISCOVERY_B{bits}: "
+                f"expected exactly one "
+                f"vanilla-{bits} paper baseline "
+                f"within 0.01 ns of target "
+                f"RMSE {targets[bits]}, "
+                f"found {len(candidates)}"
+            ),
+            file=sys.stderr,
+        )
+
+        for (
+            score,
+            run_dir,
+            r1,
+            r2,
+        ) in candidates:
+
+            print(
+                (
+                    f"  candidate "
+                    f"score={score:.6g} "
+                    f"rmse_tau1={r1:.9g} "
+                    f"rmse_tau2={r2:.9g} "
+                    f"path={run_dir}"
+                ),
+                file=sys.stderr,
+            )
+
+        sys.exit(
+            2
+        )
+
+    print(
+        str(
+            candidates[
+                0
+            ][
+                1
+            ]
+        )
+    )
+
+PY
+)
+
+
+if [ "${#VANILLA_RUNS[@]}" -ne 2 ]; then
+
+    echo "FATAL: vanilla baseline discovery did not return exactly two run directories."
+    exit 1
+fi
+
+
+VANILLA4_RUN_DIR="${VANILLA_RUNS[0]}"
+
+VANILLA8_RUN_DIR="${VANILLA_RUNS[1]}"
+
+
+for RUN_DIR in \
+    "${VANILLA4_RUN_DIR}" \
+    "${VANILLA8_RUN_DIR}"
+
+do
+
+    if [ ! -f "${RUN_DIR}/student_args.json" ] || \
+       [ ! -f "${RUN_DIR}/student_best.weights.h5" ] || \
+       [ ! -f "${RUN_DIR}/test_metrics.json" ]; then
+
+        echo "FATAL: discovered vanilla run is missing required artifacts: ${RUN_DIR}"
+        exit 1
+    fi
+
+done
+
+
+echo "================================================================================"
+echo "WRITEBACK EXPERIMENT MATRIX"
+echo "================================================================================"
+
+echo "PROJECT DIR      : ${PROJECT_DIR}"
+
+echo "DATA PATH        : ${DATA_PATH}"
+
+echo "MEMOQ RUN        : ${MEMOQ_RUN_DIR}"
+
+echo "VANILLA 4 RUN    : ${VANILLA4_RUN_DIR}"
+
+echo "VANILLA 8 RUN    : ${VANILLA8_RUN_DIR}"
+
+echo "WORKER           : ${WORKER}"
+
+echo "================================================================================"
+
+
+submit_native() {
+
+    local short_name="$1"
+    local run_dir="$2"
+    local phase="$3"
+    local out_dir="$4"
+    local job_id
+
+    job_id="$(
+        sbatch \
+            --parsable \
+            --job-name="wb_${short_name}_fid" \
+            "${WORKER}" \
+            native_fidelity \
+            "${run_dir}" \
+            "${phase}" \
+            native \
+            -1 \
+            native \
+            -1 \
+            "${out_dir}" \
+            - \
+            5 \
+            1000
+    )"
+
+    echo "Submitted native fidelity ${short_name}: ${job_id}" >&2
+
+    printf '%s\n' \
+        "${job_id}"
+}
+
+
+submit_condition() {
+
+    local dependency="$1"
+    local short_name="$2"
+    local run_dir="$3"
+    local phase="$4"
+    local enc_writeback="$5"
+    local enc_bits="$6"
+    local dec_writeback="$7"
+    local dec_bits="$8"
+    local out_dir="$9"
+    local fidelity_json="${10}"
+    local sr_seeds="${11:-5}"
+    local sr_seed_base="${12:-1000}"
+    local job_id
+
+    job_id="$(
+        sbatch \
+            --parsable \
+            --dependency="afterok:${dependency}" \
+            --job-name="wb_${short_name}" \
+            "${WORKER}" \
+            condition \
+            "${run_dir}" \
+            "${phase}" \
+            "${enc_writeback}" \
+            "${enc_bits}" \
+            "${dec_writeback}" \
+            "${dec_bits}" \
+            "${out_dir}" \
+            "${fidelity_json}" \
+            "${sr_seeds}" \
+            "${sr_seed_base}"
+    )"
+
+    echo "Submitted condition ${short_name}: ${job_id} after ${dependency}" >&2
+
+    printf '%s\n' \
+        "${job_id}"
+}
+
+
+MEMOQ_OUT_ROOT="${MEMOQ_RUN_DIR}/writeback_analysis"
+
+V4_OUT_ROOT="${VANILLA4_RUN_DIR}/writeback_analysis"
+
+V8_OUT_ROOT="${VANILLA8_RUN_DIR}/writeback_analysis"
+
+
+mkdir -p "${MEMOQ_OUT_ROOT}"
+
+mkdir -p "${V4_OUT_ROOT}"
+
+mkdir -p "${V8_OUT_ROOT}"
+
+
+P2E_NATIVE_DIR="${MEMOQ_OUT_ROOT}/P2E_native"
+
+P2F_NATIVE_DIR="${MEMOQ_OUT_ROOT}/P2F_native"
+
+P3_NATIVE_DIR="${MEMOQ_OUT_ROOT}/P3_native"
+
+V4_NATIVE_DIR="${V4_OUT_ROOT}/VANILLA4_native"
+
+V8_NATIVE_DIR="${V8_OUT_ROOT}/VANILLA8_native"
+
+
+P2E_FID_JOB="$(
+    submit_native \
+        p2e \
+        "${MEMOQ_RUN_DIR}" \
+        P2E \
+        "${P2E_NATIVE_DIR}"
+)"
+
+
+P2F_FID_JOB="$(
+    submit_native \
+        p2f \
+        "${MEMOQ_RUN_DIR}" \
+        P2F \
+        "${P2F_NATIVE_DIR}"
+)"
+
+
+P3_FID_JOB="$(
+    submit_native \
+        p3 \
+        "${MEMOQ_RUN_DIR}" \
+        P3 \
+        "${P3_NATIVE_DIR}"
+)"
+
+
+V4_FID_JOB="$(
+    submit_native \
+        v4 \
+        "${VANILLA4_RUN_DIR}" \
+        VANILLA \
+        "${V4_NATIVE_DIR}"
+)"
+
+
+V8_FID_JOB="$(
+    submit_native \
+        v8 \
+        "${VANILLA8_RUN_DIR}" \
+        VANILLA \
+        "${V8_NATIVE_DIR}"
+)"
+
+
+P2E_FID_JSON="${P2E_NATIVE_DIR}/native_fidelity.json"
+
+P2F_FID_JSON="${P2F_NATIVE_DIR}/native_fidelity.json"
+
+P3_FID_JSON="${P3_NATIVE_DIR}/native_fidelity.json"
+
+V4_FID_JSON="${V4_NATIVE_DIR}/native_fidelity.json"
+
+V8_FID_JSON="${V8_NATIVE_DIR}/native_fidelity.json"
+
+
+for B in \
+    3 \
+    4 \
+    5 \
+    6 \
+    7 \
+    8
+
+do
+
+    submit_condition \
+        "${P2E_FID_JOB}" \
+        "p2e_b${B}" \
+        "${MEMOQ_RUN_DIR}" \
+        P2E \
+        deterministic \
+        "${B}" \
+        deterministic \
+        "${B}" \
+        "${MEMOQ_OUT_ROOT}/P2E_sweep_B${B}" \
+        "${P2E_FID_JSON}" \
+        5 \
+        1000 \
+        >/dev/null
+
+done
+
+
+for B in \
+    3 \
+    4 \
+    5 \
+    6 \
+    7 \
+    8
+
+do
+
+    submit_condition \
+        "${V8_FID_JOB}" \
+        "v8_b${B}" \
+        "${VANILLA8_RUN_DIR}" \
+        VANILLA \
+        deterministic \
+        "${B}" \
+        deterministic \
+        "${B}" \
+        "${V8_OUT_ROOT}/VANILLA8_sweep_B${B}" \
+        "${V8_FID_JSON}" \
+        5 \
+        1000 \
+        >/dev/null
+
+done
+
+
+for B in \
+    3 \
+    4 \
+    5 \
+    6 \
+    7 \
+    8
+
+do
+
+    submit_condition \
+        "${V4_FID_JOB}" \
+        "v4_b${B}" \
+        "${VANILLA4_RUN_DIR}" \
+        VANILLA \
+        deterministic \
+        "${B}" \
+        deterministic \
+        "${B}" \
+        "${V4_OUT_ROOT}/VANILLA4_sweep_B${B}" \
+        "${V4_FID_JSON}" \
+        5 \
+        1000 \
+        >/dev/null
+
+done
+
+
+submit_condition \
+    "${V4_FID_JOB}" \
+    v4_float \
+    "${VANILLA4_RUN_DIR}" \
+    VANILLA \
+    none \
+    -1 \
+    none \
+    -1 \
+    "${V4_OUT_ROOT}/VANILLA4_state_float" \
+    "${V4_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+for B in \
+    3 \
+    4 \
+    5 \
+    6 \
+    7 \
+    8
+
+do
+
+    submit_condition \
+        "${P3_FID_JOB}" \
+        "p3_b${B}" \
+        "${MEMOQ_RUN_DIR}" \
+        P3 \
+        deterministic \
+        "${B}" \
+        deterministic \
+        "${B}" \
+        "${MEMOQ_OUT_ROOT}/P3_sweep_B${B}" \
+        "${P3_FID_JSON}" \
+        5 \
+        1000 \
+        >/dev/null
+
+done
+
+
+submit_condition \
+    "${P3_FID_JOB}" \
+    p3_float \
+    "${MEMOQ_RUN_DIR}" \
+    P3 \
+    none \
+    -1 \
+    none \
+    -1 \
+    "${MEMOQ_OUT_ROOT}/P3_state_float" \
+    "${P3_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P2E_FID_JOB}" \
+    p2e_enc4 \
+    "${MEMOQ_RUN_DIR}" \
+    P2E \
+    deterministic \
+    4 \
+    none \
+    -1 \
+    "${MEMOQ_OUT_ROOT}/P2E_location_encoder_only_B4" \
+    "${P2E_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P2E_FID_JOB}" \
+    p2e_dec4 \
+    "${MEMOQ_RUN_DIR}" \
+    P2E \
+    none \
+    -1 \
+    deterministic \
+    4 \
+    "${MEMOQ_OUT_ROOT}/P2E_location_decoder_only_B4" \
+    "${P2E_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P2F_FID_JOB}" \
+    p2f_sr \
+    "${MEMOQ_RUN_DIR}" \
+    P2F \
+    stochastic \
+    4 \
+    stochastic \
+    4 \
+    "${MEMOQ_OUT_ROOT}/P2F_rescue_stochastic_B4" \
+    "${P2F_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P2F_FID_JOB}" \
+    p2f_ef \
+    "${MEMOQ_RUN_DIR}" \
+    P2F \
+    error_feedback \
+    4 \
+    error_feedback \
+    4 \
+    "${MEMOQ_OUT_ROOT}/P2F_rescue_error_feedback_B4" \
+    "${P2F_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P3_FID_JOB}" \
+    p3_sr \
+    "${MEMOQ_RUN_DIR}" \
+    P3 \
+    stochastic \
+    4 \
+    stochastic \
+    4 \
+    "${MEMOQ_OUT_ROOT}/P3_rescue_stochastic_B4" \
+    "${P3_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+submit_condition \
+    "${P3_FID_JOB}" \
+    p3_ef \
+    "${MEMOQ_RUN_DIR}" \
+    P3 \
+    error_feedback \
+    4 \
+    error_feedback \
+    4 \
+    "${MEMOQ_OUT_ROOT}/P3_rescue_error_feedback_B4" \
+    "${P3_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+echo "================================================================================"
+echo "All writeback jobs submitted."
+echo "Native fidelity jobs:"
+echo "  P2E      ${P2E_FID_JOB}"
+echo "  P2F      ${P2F_FID_JOB}"
+echo "  P3       ${P3_FID_JOB}"
+echo "  vanilla4 ${V4_FID_JOB}"
+echo "  vanilla8 ${V8_FID_JOB}"
+echo "Dependent sweep/location/rescue jobs will start only after the matching"
+echo "native fidelity job passes tensor equivalence and saved-metric validation."
+echo "================================================================================"

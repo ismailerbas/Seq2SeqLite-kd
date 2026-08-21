@@ -1,0 +1,430 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=24:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+MODE=${1:-}
+RUN_DIR=${2:-}
+PHASE=${3:-}
+ENCODER_WRITEBACK=${4:-}
+ENCODER_STATE_BITS=${5:-}
+DECODER_WRITEBACK=${6:-}
+DECODER_STATE_BITS=${7:-}
+OUT_DIR=${8:-}
+FIDELITY_JSON=${9:-}
+SR_SEEDS=${10:-5}
+SR_SEED_BASE=${11:-1000}
+
+if [ -z "${MODE}" ] || \
+   [ -z "${RUN_DIR}" ] || \
+   [ -z "${PHASE}" ] || \
+   [ -z "${ENCODER_WRITEBACK}" ] || \
+   [ -z "${ENCODER_STATE_BITS}" ] || \
+   [ -z "${DECODER_WRITEBACK}" ] || \
+   [ -z "${DECODER_STATE_BITS}" ] || \
+   [ -z "${OUT_DIR}" ] || \
+   [ -z "${FIDELITY_JSON}" ]; then
+
+    echo "FATAL: missing required positional arguments."
+    echo "Usage: sbatch slurm/analyze_writeback MODE RUN_DIR PHASE ENCODER_WRITEBACK ENCODER_STATE_BITS DECODER_WRITEBACK DECODER_STATE_BITS OUT_DIR FIDELITY_JSON [SR_SEEDS] [SR_SEED_BASE]"
+    exit 1
+fi
+
+if [ "${MODE}" != "native_fidelity" ] && \
+   [ "${MODE}" != "condition" ]; then
+
+    echo "FATAL: MODE must be native_fidelity or condition. Received: ${MODE}"
+    exit 1
+fi
+
+case "${PHASE}" in
+    P2D|P2E|P2F|P3|VANILLA)
+        ;;
+    *)
+        echo "FATAL: unsupported PHASE: ${PHASE}"
+        exit 1
+        ;;
+esac
+
+case "${ENCODER_WRITEBACK}" in
+    native|none|deterministic|stochastic|error_feedback)
+        ;;
+    *)
+        echo "FATAL: unsupported encoder writeback: ${ENCODER_WRITEBACK}"
+        exit 1
+        ;;
+esac
+
+case "${DECODER_WRITEBACK}" in
+    native|none|deterministic|stochastic|error_feedback)
+        ;;
+    *)
+        echo "FATAL: unsupported decoder writeback: ${DECODER_WRITEBACK}"
+        exit 1
+        ;;
+esac
+
+if [ "${MODE}" = "condition" ]; then
+
+    if [ "${FIDELITY_JSON}" = "-" ]; then
+        echo "FATAL: condition mode requires a real native_fidelity.json path."
+        exit 1
+    fi
+
+    if [ ! -f "${FIDELITY_JSON}" ]; then
+        echo "FATAL: native fidelity JSON does not exist: ${FIDELITY_JSON}"
+        exit 1
+    fi
+fi
+
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+
+PYTHON_SCRIPT="${PROJECT_DIR}/eval/analyze_writeback.py"
+
+TRAIN_MEMOQ_SCRIPT="${PROJECT_DIR}/train_student_memoq.py"
+
+
+if [ ! -d "${PROJECT_DIR}" ]; then
+    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+    exit 1
+fi
+
+if [ ! -d "${DATA_PATH}" ]; then
+    echo "FATAL: data directory does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+if [ ! -d "${RUN_DIR}" ]; then
+    echo "FATAL: run directory does not exist: ${RUN_DIR}"
+    exit 1
+fi
+
+if [ ! -f "${RUN_DIR}/student_args.json" ]; then
+    echo "FATAL: student_args.json missing from run directory: ${RUN_DIR}"
+    exit 1
+fi
+
+if [ ! -f "${PYTHON_SCRIPT}" ]; then
+    echo "FATAL: analysis script does not exist: ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+if [ ! -f "${TRAIN_MEMOQ_SCRIPT}" ]; then
+    echo "FATAL: train_student_memoq.py does not exist: ${TRAIN_MEMOQ_SCRIPT}"
+    exit 1
+fi
+
+
+mkdir -p "${OUT_DIR}"
+
+
+module purge
+
+module load gcc/9.3.0/1
+
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+
+conda activate tf210_qkeras
+
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+export CUDA_VISIBLE_DEVICES=0
+
+export TF_CPP_MIN_LOG_LEVEL=2
+
+export TF_ENABLE_ONEDNN_OPTS=0
+
+export OMP_NUM_THREADS=1
+
+export MKL_NUM_THREADS=1
+
+export OPENBLAS_NUM_THREADS=1
+
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+
+mkdir -p "${TMPDIR}"
+
+mkdir -p "${PIP_CACHE_DIR}"
+
+mkdir -p "${PIP_TMPDIR}"
+
+mkdir -p "${MPLCONFIGDIR}"
+
+mkdir -p "${XDG_CACHE_HOME}"
+
+
+python -m py_compile "${PYTHON_SCRIPT}"
+
+
+GPU_CHECK="$(
+    python -c \
+    "import tensorflow as tf; print(len(tf.config.list_physical_devices('GPU')))" \
+    2>/dev/null
+)"
+
+
+if [ -z "${GPU_CHECK}" ] || \
+   [ "${GPU_CHECK}" = "0" ]; then
+
+    echo "FATAL: TensorFlow found zero GPUs."
+    exit 1
+fi
+
+
+TF_VERSION="$(
+    python -c \
+    'import tensorflow as tf; print(tf.__version__)' \
+    2>/dev/null
+)"
+
+
+QKERAS_VERSION="$(
+    python -c \
+    'import qkeras; print(getattr(qkeras, "__version__", "n/a"))' \
+    2>/dev/null
+)"
+
+
+NUMPY_VERSION="$(
+    python -c \
+    'import numpy as np; print(np.__version__)' \
+    2>/dev/null
+)"
+
+
+ANALYSIS_SHA256="$(
+    sha256sum "${PYTHON_SCRIPT}" |
+    awk '{print $1}'
+)"
+
+
+TRAIN_SHA256="$(
+    sha256sum "${TRAIN_MEMOQ_SCRIPT}" |
+    awk '{print $1}'
+)"
+
+
+ARGS_SHA256="$(
+    sha256sum "${RUN_DIR}/student_args.json" |
+    awk '{print $1}'
+)"
+
+
+case "${PHASE}" in
+    P2D)
+        CHECKPOINT_FILE="stage2d_best.weights.h5"
+        ;;
+    P2E)
+        CHECKPOINT_FILE="stage2e_best.weights.h5"
+        ;;
+    P2F)
+        CHECKPOINT_FILE="stage2f_best.weights.h5"
+        ;;
+    P3)
+        CHECKPOINT_FILE="student_best.weights.h5"
+        ;;
+    VANILLA)
+        CHECKPOINT_FILE="student_best.weights.h5"
+        ;;
+esac
+
+
+CHECKPOINT_PATH="${RUN_DIR}/${CHECKPOINT_FILE}"
+
+
+if [ ! -f "${CHECKPOINT_PATH}" ]; then
+    echo "FATAL: checkpoint does not exist: ${CHECKPOINT_PATH}"
+    exit 1
+fi
+
+
+CHECKPOINT_SHA256="$(
+    sha256sum "${CHECKPOINT_PATH}" |
+    awk '{print $1}'
+)"
+
+
+echo "================================================================================"
+echo "RECURRENT WRITEBACK ANALYSIS"
+echo "================================================================================"
+
+echo "SLURM JOB ID          : ${SLURM_JOB_ID}"
+
+echo "SLURM JOB NAME        : ${SLURM_JOB_NAME}"
+
+echo "NODE                  : $(hostname)"
+
+echo "MODE                  : ${MODE}"
+
+echo "PHASE                 : ${PHASE}"
+
+echo "RUN DIR               : ${RUN_DIR}"
+
+echo "DATA PATH             : ${DATA_PATH}"
+
+echo "OUT DIR               : ${OUT_DIR}"
+
+echo "CHECKPOINT            : ${CHECKPOINT_PATH}"
+
+echo "CHECKPOINT SHA256     : ${CHECKPOINT_SHA256}"
+
+echo "ANALYSIS SHA256       : ${ANALYSIS_SHA256}"
+
+echo "TRAIN SOURCE SHA256   : ${TRAIN_SHA256}"
+
+echo "STUDENT ARGS SHA256   : ${ARGS_SHA256}"
+
+echo "ENCODER WRITEBACK     : ${ENCODER_WRITEBACK}"
+
+echo "ENCODER STATE BITS    : ${ENCODER_STATE_BITS}"
+
+echo "DECODER WRITEBACK     : ${DECODER_WRITEBACK}"
+
+echo "DECODER STATE BITS    : ${DECODER_STATE_BITS}"
+
+echo "FIDELITY JSON         : ${FIDELITY_JSON}"
+
+echo "SR SEEDS              : ${SR_SEEDS}"
+
+echo "SR SEED BASE          : ${SR_SEED_BASE}"
+
+echo "PYTHON                : $(which python)"
+
+echo "TF VERSION            : ${TF_VERSION}"
+
+echo "QKERAS VERSION        : ${QKERAS_VERSION}"
+
+echo "NUMPY VERSION         : ${NUMPY_VERSION}"
+
+echo "GPU                   : $(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)"
+
+echo "================================================================================"
+
+
+CMD=(
+    python
+    "${PYTHON_SCRIPT}"
+
+    --mode
+    "${MODE}"
+
+    --run-dir
+    "${RUN_DIR}"
+
+    --data-dir
+    "${DATA_PATH}"
+
+    --out-dir
+    "${OUT_DIR}"
+
+    --phase
+    "${PHASE}"
+
+    --encoder-writeback
+    "${ENCODER_WRITEBACK}"
+
+    --encoder-state-bits
+    "${ENCODER_STATE_BITS}"
+
+    --decoder-writeback
+    "${DECODER_WRITEBACK}"
+
+    --decoder-state-bits
+    "${DECODER_STATE_BITS}"
+
+    --equivalence-samples
+    512
+
+    --tensor-tolerance
+    5e-5
+
+    --mae-tolerance
+    5e-5
+
+    --rmse-tolerance
+    1e-3
+
+    --infer-batch
+    2048
+
+    --hist-bins
+    4096
+
+    --gate-hist-bins
+    256
+
+    --bootstrap-reps
+    2000
+
+    --bootstrap-seed
+    42
+
+    --bootstrap-batch-reps
+    64
+
+    --sr-seeds
+    "${SR_SEEDS}"
+
+    --sr-seed-base
+    "${SR_SEED_BASE}"
+
+    --gate-width-ns
+    0.09
+)
+
+
+if [ "${MODE}" = "condition" ]; then
+
+    CMD+=(
+        --fidelity-json
+        "${FIDELITY_JSON}"
+    )
+fi
+
+
+"${CMD[@]}"
+
+
+if [ ! -f "${OUT_DIR}/writeback_complete.flag" ]; then
+    echo "FATAL: analysis exited without writeback_complete.flag"
+    exit 1
+fi
+
+
+if [ "${MODE}" = "native_fidelity" ] && \
+   [ ! -f "${OUT_DIR}/native_fidelity.json" ]; then
+
+    echo "FATAL: native_fidelity mode exited without native_fidelity.json"
+    exit 1
+fi
+
+
+echo "================================================================================"
+echo "WRITEBACK ANALYSIS COMPLETE"
+echo "OUT DIR: ${OUT_DIR}"
+echo "================================================================================"
