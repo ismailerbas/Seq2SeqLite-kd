@@ -682,8 +682,8 @@ def save_exact_resume_checkpoint(
 
     return saved_path
 
-
 def restore_exact_resume_checkpoint(
+    strategy,
     model,
     lr_scheduler,
     phase_tag,
@@ -696,11 +696,26 @@ def restore_exact_resume_checkpoint(
     """
     Restore an exact epoch-boundary phase checkpoint.
 
-    This function is intentionally fail-closed. If resume_state.json says that
-    N epochs of the current phase were completed, the matching TensorFlow
-    checkpoint ckpt-N must exist. The code will NOT silently fall back to a
-    best-validation checkpoint because doing so would roll the optimization
-    trajectory backward while keeping the later epoch counter.
+    The model variables were created inside the supplied tf.distribute.Strategy,
+    so optimizer slot variables must also be created inside that same strategy
+    scope before TensorFlow restores the optimizer checkpoint.
+
+    This function is intentionally fail-closed.
+
+    If resume_state.json says that N epochs of the current phase were completed,
+    the matching TensorFlow checkpoint ckpt-N must exist. The code will not
+    silently fall back to a best-validation checkpoint because doing so would
+    roll the optimization trajectory backward while retaining the later epoch
+    counter.
+
+    Restored state includes:
+        - model parameters,
+        - optimizer iteration counter,
+        - Adam first-moment slot variables,
+        - Adam second-moment slot variables,
+        - ReduceLROnPlateau best value,
+        - ReduceLROnPlateau wait counter,
+        - current learning rate.
     """
 
     if not bool(
@@ -721,6 +736,13 @@ def restore_exact_resume_checkpoint(
 
     if completed_epochs <= 0:
         return False
+
+    if strategy is None:
+        raise RuntimeError(
+            "[RESUME-CKPT] Distribution strategy is None. "
+            "Exact checkpoint restoration requires the same strategy scope "
+            "used to create the model variables."
+        )
 
     checkpoint_prefix = _resume_checkpoint_prefix(
         job_dir=job_dir,
@@ -744,36 +766,107 @@ def restore_exact_resume_checkpoint(
             "Refusing to roll back to a best-validation checkpoint."
         )
 
-    optimizer = lr_scheduler.optimizer
-
-    create_optimizer_slots = getattr(
-        optimizer,
-        "_create_all_weights",
-        None,
+    data_files = glob.glob(
+        checkpoint_prefix
+        + ".data-*"
     )
 
-    if callable(
-        create_optimizer_slots
-    ):
+    if not data_files:
+        raise RuntimeError(
+            "[RESUME-CKPT] Exact resume checkpoint index exists but no "
+            "checkpoint data shard was found. "
+            f"checkpoint_prefix={checkpoint_prefix}"
+        )
+
+    optimizer = lr_scheduler.optimizer
+
+    if optimizer is None:
+        raise RuntimeError(
+            "[RESUME-CKPT] Scheduler does not contain an optimizer."
+        )
+
+    pf(
+        f"[RESUME-CKPT] Preparing exact restore for {phase_tag}:"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   completed_epochs={completed_epochs}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   checkpoint={checkpoint_prefix}"
+    )
+
+    pf(
+        f"[RESUME-CKPT]   replicas={strategy.num_replicas_in_sync}"
+    )
+
+    sys.stdout.flush()
+
+    # ----------------------------------------------------------------------
+    # CRITICAL:
+    #
+    # Model variables were created under strategy.scope() in main().
+    # Adam slot variables therefore MUST be created under the SAME strategy.
+    #
+    # Calling optimizer._create_all_weights() outside this scope produces:
+    #
+    #   ValueError: Trying to create optimizer slot variable under the scope
+    #   for _DefaultDistributionStrategy, which is different from the scope
+    #   used for the original MirroredVariable.
+    #
+    # Keep checkpoint creation and restoration inside the same scope as well
+    # so all distribution-sensitive TensorFlow objects are handled consistently.
+    # ----------------------------------------------------------------------
+
+    with strategy.scope():
+        create_optimizer_slots = getattr(
+            optimizer,
+            "_create_all_weights",
+            None,
+        )
+
+        if not callable(
+            create_optimizer_slots
+        ):
+            raise RuntimeError(
+                "[RESUME-CKPT] The active TensorFlow/Keras optimizer does not "
+                "expose _create_all_weights(). This run requires TensorFlow "
+                "2.10-compatible exact Adam slot restoration."
+            )
+
         create_optimizer_slots(
             model.trainable_variables
         )
 
-    checkpoint = tf.train.Checkpoint(
-        model=model,
-        optimizer=optimizer,
-        scheduler=lr_scheduler,
-    )
+        checkpoint = tf.train.Checkpoint(
+            model=model,
+            optimizer=optimizer,
+            scheduler=lr_scheduler,
+        )
 
-    status = checkpoint.restore(
-        checkpoint_prefix
-    )
+        status = checkpoint.restore(
+            checkpoint_prefix
+        )
 
-    status.assert_existing_objects_matched()
-    status.expect_partial()
+        status.assert_existing_objects_matched()
+
+        status.expect_partial()
 
     restored_iterations = int(
         optimizer.iterations.numpy()
+    )
+
+    restored_lr = float(
+        lr_scheduler.current_lr
+    )
+
+    restored_scheduler_best = float(
+        lr_scheduler.best
+    )
+
+    restored_scheduler_wait = int(
+        lr_scheduler.wait
     )
 
     pf(
@@ -792,22 +885,23 @@ def restore_exact_resume_checkpoint(
 
     pf(
         f"[RESUME-CKPT]   learning_rate="
-        f"{lr_scheduler.current_lr:.9e}"
+        f"{restored_lr:.9e}"
     )
 
     pf(
         f"[RESUME-CKPT]   scheduler_best="
-        f"{lr_scheduler.best:.9e}"
+        f"{restored_scheduler_best:.9e}"
     )
 
     pf(
         f"[RESUME-CKPT]   scheduler_wait="
-        f"{lr_scheduler.wait}"
+        f"{restored_scheduler_wait}"
     )
 
     sys.stdout.flush()
 
     return True
+
 # ==============================================================================
 # Progress bar
 # ==============================================================================
@@ -1676,6 +1770,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=float_student,
             lr_scheduler=sched_p1,
             phase_tag="P1",
@@ -1790,6 +1885,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2a,
             phase_tag="P2A",
@@ -1930,6 +2026,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2b,
             phase_tag="P2B",
@@ -2056,6 +2153,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2c,
             phase_tag="P2C",
@@ -2182,7 +2280,9 @@ def training_loop_memoq(
             "scheduler": sched_p2d,
         }
 
+
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2d,
             phase_tag="P2D",
@@ -2314,7 +2414,9 @@ def training_loop_memoq(
             "scheduler": sched_p2e,
         }
 
+
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2e,
             phase_tag="P2E",
@@ -2537,6 +2639,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=phase2_model,
             lr_scheduler=sched_p2f,
             phase_tag="P2F",
@@ -2863,6 +2966,7 @@ def training_loop_memoq(
         }
 
         restore_exact_resume_checkpoint(
+            strategy=strategy,
             model=final_qkeras_student,
             lr_scheduler=sched_p3,
             phase_tag="P3",

@@ -16,7 +16,7 @@ set -u
 # ==============================================================================
 # QKeras-matched primary MemoQ paper trajectory
 #
-# PRIMARY mechanistic training run:
+# Primary sequence:
 #
 #   P1
 #   -> P2A
@@ -27,14 +27,13 @@ set -u
 #   -> P2F
 #   -> P3
 #
-# Scientific controls:
+# Numerical configuration:
 #
-#   QKeras-matched recurrent architecture
 #   hard_sigmoid
 #   implementation=1
 #   reset_after=False
 #
-#   output loss        = MSE
+#   output loss        = mse
 #   quantizer alpha    = 1.0
 #   gate curriculum    = true
 #   training dither    = false
@@ -44,31 +43,16 @@ set -u
 #   candidate activation hardening
 #
 # P2F:
-#   candidate remains fully hard
+#   candidate activation remains hard
 #   recurrent-state quantization is introduced
 #
-# Auto-resubmission:
+# Auto-resume:
 #
 #   SLURM sends SIGUSR1 120 seconds before wall time.
-#   The shell terminates the active Python process.
-#   Python resumes from the last fully completed epoch using the exact
-#   model/optimizer/scheduler checkpoint written by train_student_memoq.py.
-#
-#   training_complete.flag prevents further resubmission after successful
-#   completion.
-#
-# Fresh run:
-#
-#   sbatch --job-name=memoq_paper_main slurm/studentmemoq \
-#       4 4 4 4 4 32 128 2 135 3 0.09 1024 \
-#       /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5
-#
-# Manual resume:
-#
-#   sbatch --job-name=memoq_paper_main slurm/studentmemoq \
-#       4 4 4 4 4 32 128 2 135 3 0.09 1024 \
-#       /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5 \
-#       --resume
+#   The active Python process is stopped.
+#   A continuation job is submitted with --resume.
+#   Python restores the last fully completed epoch using the exact
+#   model/optimizer/scheduler checkpoint.
 # ==============================================================================
 
 
@@ -108,16 +92,23 @@ if [ -z "${BITS_KERNEL}" ] || \
 
     echo "FATAL: Missing required positional arguments."
     echo
-    echo "Usage:"
-    echo "  sbatch --job-name=memoq_paper_main slurm/studentmemoq \\"
-    echo "      BITS_KERNEL BITS_BIAS BITS_RECURRENT BITS_ACTIVATION BITS_STATE \\"
-    echo "      STUDENT_UNITS TEACHER_UNITS TEACHER_LAYERS \\"
-    echo "      SEQ_LEN N_OUT GATE_WIDTH_NS BATCH_SIZE TEACHER_CKPT [--resume]"
+    echo "Required arguments:"
+    echo "  BITS_KERNEL"
+    echo "  BITS_BIAS"
+    echo "  BITS_RECURRENT"
+    echo "  BITS_ACTIVATION"
+    echo "  BITS_STATE"
+    echo "  STUDENT_UNITS"
+    echo "  TEACHER_UNITS"
+    echo "  TEACHER_LAYERS"
+    echo "  SEQ_LEN"
+    echo "  N_OUT"
+    echo "  GATE_WIDTH_NS"
+    echo "  BATCH_SIZE"
+    echo "  TEACHER_CKPT"
     echo
-    echo "Primary paper run:"
-    echo "  sbatch --job-name=memoq_paper_main slurm/studentmemoq \\"
-    echo "      4 4 4 4 4 32 128 2 135 3 0.09 1024 \\"
-    echo "      /gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacher_best.weights.h5"
+    echo "Optional:"
+    echo "  --resume"
     exit 1
 fi
 
@@ -139,7 +130,7 @@ fi
 
 
 # ==============================================================================
-# Fail-closed primary-paper configuration
+# Fail-closed paper configuration
 # ==============================================================================
 
 if [ "${BITS_KERNEL}" != "4" ]; then
@@ -204,7 +195,7 @@ fi
 
 
 # ==============================================================================
-# Fixed primary-paper configuration
+# Fixed scientific configuration
 # ==============================================================================
 
 RUN_TAG="paper_main_qkeras_matched"
@@ -219,62 +210,60 @@ P2A_EPOCHS=30
 P2B_EPOCHS=30
 P2C_EPOCHS=10
 P2D_EPOCHS=10
-
 P2E_EPOCHS=30
 P2F_EPOCHS=30
-
 P3_EPOCHS=170
 
 STATE_ANNEAL_EPOCHS=15
 
 
 if [ "${P1_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P1 may not be skipped in the paper main run."
+    echo "FATAL: P1 may not be skipped."
     exit 1
 fi
 
 if [ "${P2A_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2A may not be skipped in the paper main run."
+    echo "FATAL: P2A may not be skipped."
     exit 1
 fi
 
 if [ "${P2B_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2B may not be skipped in the paper main run."
+    echo "FATAL: P2B may not be skipped."
     exit 1
 fi
 
 if [ "${P2C_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2C may not be skipped in the paper main run."
+    echo "FATAL: P2C may not be skipped."
     exit 1
 fi
 
 if [ "${P2D_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2D may not be skipped in the paper main run."
+    echo "FATAL: P2D may not be skipped."
     exit 1
 fi
 
 if [ "${P2E_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2E may not be skipped in the paper main run."
+    echo "FATAL: P2E may not be skipped."
     exit 1
 fi
 
 if [ "${P2F_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P2F may not be skipped in the paper main run."
+    echo "FATAL: P2F may not be skipped."
     exit 1
 fi
 
 if [ "${P3_EPOCHS}" -le 0 ]; then
-    echo "FATAL: P3 may not be skipped in the paper main run."
+    echo "FATAL: P3 may not be skipped."
     exit 1
 fi
 
 if [ "${P2E_EPOCHS}" -lt "${STATE_ANNEAL_EPOCHS}" ]; then
-    echo "FATAL: P2E epochs must be >= activation annealing epochs."
+    echo "FATAL: P2E epochs must be >= annealing epochs."
     exit 1
 fi
 
 if [ "${P2F_EPOCHS}" -lt "${STATE_ANNEAL_EPOCHS}" ]; then
-    echo "FATAL: P2F epochs must be >= state annealing epochs."
+    echo "FATAL: P2F epochs must be >= annealing epochs."
     exit 1
 fi
 
@@ -288,10 +277,11 @@ module load gcc/9.3.0/1
 
 
 # ==============================================================================
-# Conda
+# Conda environment
 # ==============================================================================
 
 eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+
 conda activate tf210_qkeras
 
 
@@ -314,31 +304,40 @@ export OPENBLAS_NUM_THREADS=1
 
 
 # ==============================================================================
-# Paths
+# Absolute project paths
+#
+# Do not derive these paths from the batch script filename.
+# SLURM executes a spooled copy of the script.
 # ==============================================================================
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+
+TRAIN_SCRIPT="${PROJECT_DIR}/train_student_memoq.py"
+
+SLURM_SCRIPT="${PROJECT_DIR}/slurm/studentmemoq"
+
+SAVE_DIR="${PROJECT_DIR}"
 
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 
 DATA_PATH="${SCRATCH_BASE}/nmi"
 
-SCRIPT_DIR="$(
-    cd "$(dirname "${BASH_SOURCE[0]}")"
-    pwd
-)"
 
-REPO_ROOT="$(
-    cd "${SCRIPT_DIR}/.."
-    pwd
-)"
-
-TRAIN_SCRIPT="${REPO_ROOT}/train_student_memoq.py"
-
-SAVE_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
-
+if [ ! -d "${PROJECT_DIR}" ]; then
+    echo "FATAL: project directory not found:"
+    echo "  ${PROJECT_DIR}"
+    exit 1
+fi
 
 if [ ! -f "${TRAIN_SCRIPT}" ]; then
-    echo "FATAL: train_student_memoq.py not found:"
+    echo "FATAL: training script not found:"
     echo "  ${TRAIN_SCRIPT}"
+    exit 1
+fi
+
+if [ ! -f "${SLURM_SCRIPT}" ]; then
+    echo "FATAL: SLURM continuation script not found:"
+    echo "  ${SLURM_SCRIPT}"
     exit 1
 fi
 
@@ -350,9 +349,9 @@ fi
 
 
 # ==============================================================================
-# Result-directory name
+# Result directory
 #
-# Must match make_job_name() in train_student_memoq.py for this exact launcher.
+# Must exactly match make_job_name() in train_student_memoq.py.
 # ==============================================================================
 
 REF_BATCH_SIZE=1024
@@ -360,6 +359,7 @@ REF_BATCH_SIZE=1024
 EFFECTIVE_LR="$(
     python -c "print(f'{1e-4 * ${BATCH_SIZE} / ${REF_BATCH_SIZE}:.0e}')"
 )"
+
 
 if [ -z "${EFFECTIVE_LR}" ]; then
     echo "FATAL: failed to calculate EFFECTIVE_LR."
@@ -392,17 +392,19 @@ mkdir -p "${XDG_CACHE_HOME}"
 
 
 # ==============================================================================
-# Runtime package sanity checks
+# Runtime package checks
 # ==============================================================================
 
 GPU_CHECK="$(
     python -c "import tensorflow as tf; print(len(tf.config.list_physical_devices('GPU')))" 2>/dev/null
 )"
 
+
 if [ -z "${GPU_CHECK}" ]; then
     echo "FATAL: TensorFlow GPU sanity check failed."
     exit 1
 fi
+
 
 if [ "${GPU_CHECK}" = "0" ]; then
     echo "FATAL: TensorFlow found zero GPUs."
@@ -462,8 +464,9 @@ echo "SLURM JOB NAME      : ${SLURM_JOB_NAME:-unknown}"
 echo "NODE                : $(hostname)"
 echo "RUN TAG             : ${RUN_TAG}"
 echo "JOB TAG             : ${JOB_TAG}"
-echo "REPO ROOT           : ${REPO_ROOT}"
+echo "PROJECT DIR         : ${PROJECT_DIR}"
 echo "TRAIN SCRIPT        : ${TRAIN_SCRIPT}"
+echo "SLURM SCRIPT        : ${SLURM_SCRIPT}"
 echo "DATA PATH           : ${DATA_PATH}"
 echo "RESULTS             : ${JOB_RESULTS_DIR}"
 echo "TEACHER CKPT        : ${TEACHER_CKPT}"
@@ -499,21 +502,27 @@ echo "======================================================================"
 
 
 # ==============================================================================
-# Resume preflight
+# Resume paths
 # ==============================================================================
 
 RESUME_STATE_FILE="${JOB_RESULTS_DIR}/resume_state.json"
+
 COMPLETION_FLAG="${JOB_RESULTS_DIR}/training_complete.flag"
 
 
+# ==============================================================================
+# Resume preflight
+# ==============================================================================
+
 if [ "${RESUME_FLAG}" = "--resume" ]; then
+
     echo "======================================================================"
     echo "RESUME MODE"
     echo "======================================================================"
 
     if [ -f "${COMPLETION_FLAG}" ]; then
         echo "training_complete.flag already exists."
-        echo "Python will load the final selected checkpoint and perform evaluation."
+        echo "Python will load the final selected checkpoint and evaluate."
     fi
 
     if [ -f "${RESUME_STATE_FILE}" ]; then
@@ -533,10 +542,12 @@ fi
 # ==============================================================================
 
 RESUBMIT=0
+
 PYTHON_PID=""
 
 
 resubmit_handler() {
+
     echo
     echo "======================================================================"
     echo "SIGUSR1 received."
@@ -548,11 +559,17 @@ resubmit_handler() {
     RESUBMIT=1
 
     if [ -n "${PYTHON_PID}" ]; then
+
         if kill -0 "${PYTHON_PID}" 2>/dev/null; then
+
             echo "Sending SIGTERM to Python PID ${PYTHON_PID}."
+
             kill -TERM "${PYTHON_PID}" 2>/dev/null || true
+
         else
+
             echo "Python process is already stopped."
+
         fi
     fi
 }
@@ -562,138 +579,166 @@ trap resubmit_handler SIGUSR1
 
 
 # ==============================================================================
+# Construct Python command
+# ==============================================================================
+
+PYTHON_ARGS=(
+    "${TRAIN_SCRIPT}"
+    --data-dir "${DATA_PATH}"
+    --teacher-ckpt "${TEACHER_CKPT}"
+    --save-dir "${SAVE_DIR}"
+    --run-tag "${RUN_TAG}"
+    --bits-kernel "${BITS_KERNEL}"
+    --bits-bias "${BITS_BIAS}"
+    --bits-recurrent "${BITS_RECURRENT}"
+    --bits-activation "${BITS_ACTIVATION}"
+    --bits-state "${BITS_STATE}"
+    --student-units "${STUDENT_UNITS}"
+    --teacher-units "${TEACHER_UNITS}"
+    --teacher-layers "${TEACHER_LAYERS}"
+    --seq-len "${SEQ_LEN}"
+    --n-out "${N_OUT}"
+    --gate-width-ns "${GATE_WIDTH_NS}"
+    --batch-size "${BATCH_SIZE}"
+    --lr 1e-4
+    --ref-batch-size 1024
+    --lr-factor 0.5
+    --lr-patience 8
+    --lr-min 1e-6
+    --patience 30
+    --min-delta 1e-5
+    --warmup-epochs 5
+    --temperature 4.0
+    --alpha 0.7
+    --output-loss mse
+    --quantizer-alpha 1.0
+    --memoq-gate-curriculum true
+    --memoq-use-dither false
+    --memoq-warmup-epochs "${P1_EPOCHS}"
+    --memoq-stage2a-epochs "${P2A_EPOCHS}"
+    --memoq-stage2b-epochs "${P2B_EPOCHS}"
+    --memoq-stage2c-epochs "${P2C_EPOCHS}"
+    --memoq-stage2d-epochs "${P2D_EPOCHS}"
+    --memoq-stage2e-epochs "${P2E_EPOCHS}"
+    --memoq-stage2f-epochs "${P2F_EPOCHS}"
+    --memoq-state-anneal-epochs "${STATE_ANNEAL_EPOCHS}"
+    --memoq-finetune-epochs "${P3_EPOCHS}"
+    --memoq-lr-mult-p1 1.0
+    --memoq-lr-mult-p2a 0.5
+    --memoq-lr-mult-p2b 0.5
+    --memoq-lr-mult-p2c 0.5
+    --memoq-lr-mult-p2d 0.3
+    --memoq-lr-mult-p2e 0.3
+    --memoq-lr-mult-p2f 0.3
+    --memoq-lr-mult-p3 0.1
+    --memoq-phase3-lr-floor 5e-6
+    --memoq-huber-delta 0.1
+    --memoq-rho-z 0.98
+    --memoq-rho-rail 0.90
+    --memoq-mu-rail 0.0
+    --memoq-innov-burnin 5
+    --memoq-lambda-mem-p2a 0.0
+    --memoq-lambda-innov-p2a 0.0
+    --memoq-lambda-zsat-p2a 0.0
+    --memoq-lambda-rail-p2a 0.0
+    --memoq-lambda-shape-p2a 0.0
+    --memoq-lambda-mem-p2b 0.0
+    --memoq-lambda-innov-p2b 0.0
+    --memoq-lambda-zsat-p2b 0.0
+    --memoq-lambda-rail-p2b 0.0
+    --memoq-lambda-shape-p2b 0.0
+    --memoq-lambda-mem-p2c 0.0
+    --memoq-lambda-innov-p2c 0.0
+    --memoq-lambda-zsat-p2c 0.0
+    --memoq-lambda-rail-p2c 0.0
+    --memoq-lambda-shape-p2c 0.0
+    --memoq-lambda-mem-p2d 0.0
+    --memoq-lambda-innov-p2d 0.0
+    --memoq-lambda-zsat-p2d 0.0
+    --memoq-lambda-rail-p2d 0.0
+    --memoq-lambda-shape-p2d 0.0
+    --memoq-lambda-mem-p2e 0.0
+    --memoq-lambda-innov-p2e 0.0
+    --memoq-lambda-zsat-p2e 0.0
+    --memoq-lambda-rail-p2e 0.0
+    --memoq-lambda-shape-p2e 0.0
+    --memoq-lambda-mem-p2f 0.0
+    --memoq-lambda-innov-p2f 0.0
+    --memoq-lambda-zsat-p2f 0.0
+    --memoq-lambda-rail-p2f 0.0
+    --memoq-lambda-shape-p2f 0.0
+    --memoq-lambda-mem-p3 0.0
+    --memoq-lambda-innov-p3 0.0
+    --memoq-lambda-zsat-p3 0.0
+    --memoq-lambda-rail-p3 0.0
+    --memoq-lambda-shape-p3 0.0
+    --log-interval 10
+    --infer-batch 8192
+    --prefetch-batches 32
+    --pipeline-workers 4
+    --split-seed 42
+)
+
+
+if [ "${RESUME_FLAG}" = "--resume" ]; then
+
+    PYTHON_ARGS+=(
+        --resume
+    )
+
+fi
+
+
+# ==============================================================================
 # Launch training
 # ==============================================================================
 
-python "${TRAIN_SCRIPT}" \
-    --data-dir "${DATA_PATH}" \
-    --teacher-ckpt "${TEACHER_CKPT}" \
-    --save-dir "${SAVE_DIR}" \
-    --run-tag "${RUN_TAG}" \
-    --bits-kernel "${BITS_KERNEL}" \
-    --bits-bias "${BITS_BIAS}" \
-    --bits-recurrent "${BITS_RECURRENT}" \
-    --bits-activation "${BITS_ACTIVATION}" \
-    --bits-state "${BITS_STATE}" \
-    --student-units "${STUDENT_UNITS}" \
-    --teacher-units "${TEACHER_UNITS}" \
-    --teacher-layers "${TEACHER_LAYERS}" \
-    --seq-len "${SEQ_LEN}" \
-    --n-out "${N_OUT}" \
-    --gate-width-ns "${GATE_WIDTH_NS}" \
-    --batch-size "${BATCH_SIZE}" \
-    --lr 1e-4 \
-    --ref-batch-size 1024 \
-    --lr-factor 0.5 \
-    --lr-patience 8 \
-    --lr-min 1e-6 \
-    --patience 30 \
-    --min-delta 1e-5 \
-    --warmup-epochs 5 \
-    --temperature 4.0 \
-    --alpha 0.7 \
-    --output-loss mse \
-    --quantizer-alpha 1.0 \
-    --memoq-gate-curriculum true \
-    --memoq-use-dither false \
-    --memoq-warmup-epochs "${P1_EPOCHS}" \
-    --memoq-stage2a-epochs "${P2A_EPOCHS}" \
-    --memoq-stage2b-epochs "${P2B_EPOCHS}" \
-    --memoq-stage2c-epochs "${P2C_EPOCHS}" \
-    --memoq-stage2d-epochs "${P2D_EPOCHS}" \
-    --memoq-stage2e-epochs "${P2E_EPOCHS}" \
-    --memoq-stage2f-epochs "${P2F_EPOCHS}" \
-    --memoq-state-anneal-epochs "${STATE_ANNEAL_EPOCHS}" \
-    --memoq-finetune-epochs "${P3_EPOCHS}" \
-    --memoq-lr-mult-p1 1.0 \
-    --memoq-lr-mult-p2a 0.5 \
-    --memoq-lr-mult-p2b 0.5 \
-    --memoq-lr-mult-p2c 0.5 \
-    --memoq-lr-mult-p2d 0.3 \
-    --memoq-lr-mult-p2e 0.3 \
-    --memoq-lr-mult-p2f 0.3 \
-    --memoq-lr-mult-p3 0.1 \
-    --memoq-phase3-lr-floor 5e-6 \
-    --memoq-huber-delta 0.1 \
-    --memoq-rho-z 0.98 \
-    --memoq-rho-rail 0.90 \
-    --memoq-mu-rail 0.0 \
-    --memoq-innov-burnin 5 \
-    --memoq-lambda-mem-p2a 0.0 \
-    --memoq-lambda-innov-p2a 0.0 \
-    --memoq-lambda-zsat-p2a 0.0 \
-    --memoq-lambda-rail-p2a 0.0 \
-    --memoq-lambda-shape-p2a 0.0 \
-    --memoq-lambda-mem-p2b 0.0 \
-    --memoq-lambda-innov-p2b 0.0 \
-    --memoq-lambda-zsat-p2b 0.0 \
-    --memoq-lambda-rail-p2b 0.0 \
-    --memoq-lambda-shape-p2b 0.0 \
-    --memoq-lambda-mem-p2c 0.0 \
-    --memoq-lambda-innov-p2c 0.0 \
-    --memoq-lambda-zsat-p2c 0.0 \
-    --memoq-lambda-rail-p2c 0.0 \
-    --memoq-lambda-shape-p2c 0.0 \
-    --memoq-lambda-mem-p2d 0.0 \
-    --memoq-lambda-innov-p2d 0.0 \
-    --memoq-lambda-zsat-p2d 0.0 \
-    --memoq-lambda-rail-p2d 0.0 \
-    --memoq-lambda-shape-p2d 0.0 \
-    --memoq-lambda-mem-p2e 0.0 \
-    --memoq-lambda-innov-p2e 0.0 \
-    --memoq-lambda-zsat-p2e 0.0 \
-    --memoq-lambda-rail-p2e 0.0 \
-    --memoq-lambda-shape-p2e 0.0 \
-    --memoq-lambda-mem-p2f 0.0 \
-    --memoq-lambda-innov-p2f 0.0 \
-    --memoq-lambda-zsat-p2f 0.0 \
-    --memoq-lambda-rail-p2f 0.0 \
-    --memoq-lambda-shape-p2f 0.0 \
-    --memoq-lambda-mem-p3 0.0 \
-    --memoq-lambda-innov-p3 0.0 \
-    --memoq-lambda-zsat-p3 0.0 \
-    --memoq-lambda-rail-p3 0.0 \
-    --memoq-lambda-shape-p3 0.0 \
-    --log-interval 10 \
-    --infer-batch 8192 \
-    --prefetch-batches 32 \
-    --pipeline-workers 4 \
-    --split-seed 42 \
-    ${RESUME_FLAG} \
-    &
-
+python "${PYTHON_ARGS[@]}" &
 
 PYTHON_PID=$!
 
+
 echo "Python PID: ${PYTHON_PID}"
+
 echo "Waiting for training process..."
 
 
 # ==============================================================================
 # Wait for Python
 #
-# wait can itself be interrupted when SIGUSR1 is delivered to this shell.
-# If that happens while the child still exists, wait again until the Python
-# process has actually terminated.
+# wait can be interrupted by SIGUSR1. If the child is still alive after the
+# signal handler runs, wait again until Python has actually terminated.
 # ==============================================================================
 
 EXIT_CODE=0
 
 
 while true; do
+
     wait "${PYTHON_PID}"
+
     WAIT_RC=$?
 
+
     if [ "${RESUBMIT}" = "1" ]; then
+
         if kill -0 "${PYTHON_PID}" 2>/dev/null; then
+
             echo "Python is still terminating after SIGUSR1."
+
             sleep 1
+
             continue
+
         fi
+
     fi
 
+
     EXIT_CODE="${WAIT_RC}"
+
     break
+
 done
 
 
@@ -702,24 +747,22 @@ echo "Python exit code: ${EXIT_CODE}"
 
 # ==============================================================================
 # SIGTERM fallback
-#
-# If Python was killed by SIGTERM before the SIGUSR1 handler was observed,
-# interpret exit 143 as scheduler preemption and continue from the last fully
-# completed epoch.
 # ==============================================================================
 
 if [ "${EXIT_CODE}" = "143" ] && \
    [ "${RESUBMIT}" = "0" ]; then
 
     echo "Python received SIGTERM before completion."
+
     echo "Treating this as wall-time preemption."
 
     RESUBMIT=1
+
 fi
 
 
 # ==============================================================================
-# Decide whether another SLURM job is required
+# Decide whether continuation is required
 # ==============================================================================
 
 DO_RESUBMIT=0
@@ -728,54 +771,82 @@ DO_RESUBMIT=0
 if [ "${RESUBMIT}" = "1" ]; then
 
     if [ -f "${COMPLETION_FLAG}" ]; then
+
         echo "Training completed before preemption."
+
         DO_RESUBMIT=0
+
     else
+
         echo "Preemption detected and training is incomplete."
+
         DO_RESUBMIT=1
+
     fi
+
 
 elif [ "${EXIT_CODE}" = "0" ]; then
 
     if [ -f "${COMPLETION_FLAG}" ]; then
+
         echo "training_complete.flag found."
+
         echo "Training is complete."
+
         DO_RESUBMIT=0
+
 
     elif [ -f "${RESUME_STATE_FILE}" ]; then
+
         echo "Python exited cleanly without training_complete.flag."
+
         echo "resume_state.json exists."
+
         echo "Submitting continuation."
+
         DO_RESUBMIT=1
 
+
     else
+
         echo "Python exited cleanly but neither completion nor resume state exists."
+
         echo "Not resubmitting automatically."
+
         DO_RESUBMIT=0
+
     fi
+
 
 else
 
     echo "Python failed with exit code ${EXIT_CODE}."
+
     echo "Not automatically resubmitting a failed scientific run."
+
     DO_RESUBMIT=0
+
 fi
 
 
 # ==============================================================================
-# Resubmit continuation
+# Submit continuation
 # ==============================================================================
 
 if [ "${DO_RESUBMIT}" = "1" ]; then
+
     echo "======================================================================"
+
     echo "Submitting continuation job..."
+
     echo "======================================================================"
+
 
     NEW_JOB_ID="$(
         sbatch \
             --parsable \
             --job-name="${SLURM_JOB_NAME:-memoq_paper_main}" \
-            "${SCRIPT_DIR}/studentmemoq" \
+            "${SLURM_SCRIPT}" \
             "${BITS_KERNEL}" \
             "${BITS_BIAS}" \
             "${BITS_RECURRENT}" \
@@ -794,19 +865,31 @@ if [ "${DO_RESUBMIT}" = "1" ]; then
 
     SBATCH_RC=$?
 
+
     if [ "${SBATCH_RC}" = "0" ]; then
+
         echo "Continuation submitted successfully."
+
         echo "New SLURM job ID: ${NEW_JOB_ID}"
 
+
         if [ "${RESUBMIT}" = "1" ]; then
+
             EXIT_CODE=0
+
         fi
 
+
     else
+
         echo "ERROR: continuation submission failed."
+
         echo "sbatch exit code: ${SBATCH_RC}"
+
         exit "${SBATCH_RC}"
+
     fi
+
 fi
 
 
@@ -815,18 +898,31 @@ fi
 # ==============================================================================
 
 echo "======================================================================"
+
 echo "RUN SUMMARY"
+
 echo "======================================================================"
+
 echo "Exit code        : ${EXIT_CODE}"
+
 echo "Results          : ${JOB_RESULTS_DIR}"
+
 echo "Completion flag  : ${COMPLETION_FLAG}"
+
 echo "Resume state     : ${RESUME_STATE_FILE}"
+
 echo "H5 files         : $(find "${JOB_RESULTS_DIR}" -name "*.h5" 2>/dev/null | wc -l)"
+
 echo "MAT files        : $(find "${JOB_RESULTS_DIR}" -name "*.mat" 2>/dev/null | wc -l)"
+
 echo "PNG files        : $(find "${JOB_RESULTS_DIR}" -name "*.png" 2>/dev/null | wc -l)"
+
 echo "PDF files        : $(find "${JOB_RESULTS_DIR}" -name "*.pdf" 2>/dev/null | wc -l)"
+
 echo "JSON files       : $(find "${JOB_RESULTS_DIR}" -name "*.json" 2>/dev/null | wc -l)"
+
 echo "CSV files        : $(find "${JOB_RESULTS_DIR}" -name "*.csv" 2>/dev/null | wc -l)"
+
 echo "======================================================================"
 
 
