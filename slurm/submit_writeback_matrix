@@ -1,4 +1,14 @@
 #!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
 
 set -euo pipefail
 
@@ -9,7 +19,7 @@ DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 
 RESULTS_ROOT="${DATA_PATH}/results"
 
-WORKER="${PROJECT_DIR}/slurm/analyze_writeback"
+WORKER="${PROJECT_DIR}/analyze_writeback"
 
 
 MEMOQ_RUN_DIR="${PROJECT_DIR}/results/paper_main_qkeras_matched_memoq_b4k4r4a4s4_gru32_dense3_effbs1024_microbs1024_lr1e-04_p1-40_2a30_2b30_2c10_2d10_2e30_2f30_p3-170_mse_q1_curr_nodither_aux0"
@@ -81,301 +91,21 @@ if [ ! -f "${MEMOQ_RUN_DIR}/test_metrics_P3.json" ] && \
     exit 1
 fi
 
+VANILLA4_RUN_DIR="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b4k4r4a4_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
 
-mapfile -t VANILLA_RUNS < <(
-python - "${RESULTS_ROOT}" <<'PY'
-
-import json
-import math
-import sys
-from pathlib import Path
+VANILLA8_RUN_DIR="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b8k8r8a8_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
 
 
-root = Path(
-    sys.argv[1]
-).resolve()
-
-
-targets = {
-    4: (
-        0.3220,
-        0.3275,
-    ),
-    8: (
-        0.2203,
-        0.2229,
-    ),
-}
-
-
-def metric(
-    payload,
-    key,
-):
-    if (
-        key in payload
-        and isinstance(
-            payload[
-                key
-            ],
-            (
-                int,
-                float,
-            ),
-        )
-    ):
-        return float(
-            payload[
-                key
-            ]
-        )
-
-    mapping = {
-        "rmse_tau1": (
-            "tau1",
-            "rmse",
-        ),
-        "rmse_tau2": (
-            "tau2",
-            "rmse",
-        ),
-    }
-
-    outer, inner = mapping[
-        key
-    ]
-
-    if (
-        outer in payload
-        and isinstance(
-            payload[
-                outer
-            ],
-            dict,
-        )
-        and inner
-        in payload[
-            outer
-        ]
-    ):
-        return float(
-            payload[
-                outer
-            ][
-                inner
-            ]
-        )
-
-    return None
-
-
-def valid_config(
-    args,
-    bits,
-):
-    required = {
-        "seq_len": 135,
-        "n_out": 3,
-        "student_units": 32,
-        "bits_kernel": bits,
-        "bits_bias": bits,
-        "bits_recurrent": bits,
-        "bits_activation": bits,
-        "bits_state": bits,
-    }
-
-    for key, expected in (
-        required.items()
-    ):
-        if key not in args:
-            return False
-
-        if (
-            int(
-                args[
-                    key
-                ]
-            )
-            != int(
-                expected
-            )
-        ):
-            return False
-
-    return True
-
-
-for bits in (
-    4,
-    8,
-):
-    candidates = []
-
-    for args_path in root.glob(
-        "*/student_args.json"
-    ):
-        run_dir = (
-            args_path.parent
-        )
-
-        checkpoint = (
-            run_dir
-            / "student_best.weights.h5"
-        )
-
-        metrics_path = (
-            run_dir
-            / "test_metrics.json"
-        )
-
-        if (
-            not checkpoint.is_file()
-            or not metrics_path.is_file()
-        ):
-            continue
-
-        try:
-            args = json.loads(
-                args_path.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-            metrics = json.loads(
-                metrics_path.read_text(
-                    encoding="utf-8"
-                )
-            )
-
-        except Exception:
-            continue
-
-        if not valid_config(
-            args,
-            bits,
-        ):
-            continue
-
-        r1 = metric(
-            metrics,
-            "rmse_tau1",
-        )
-
-        r2 = metric(
-            metrics,
-            "rmse_tau2",
-        )
-
-        if (
-            r1 is None
-            or r2 is None
-            or not math.isfinite(
-                r1
-            )
-            or not math.isfinite(
-                r2
-            )
-        ):
-            continue
-
-        (
-            target1,
-            target2,
-        ) = targets[
-            bits
-        ]
-
-        d1 = abs(
-            r1
-            - target1
-        )
-
-        d2 = abs(
-            r2
-            - target2
-        )
-
-        if (
-            d1 <= 0.01
-            and d2 <= 0.01
-        ):
-            candidates.append(
-                (
-                    d1
-                    + d2,
-                    run_dir,
-                    r1,
-                    r2,
-                )
-            )
-
-    candidates.sort(
-        key=lambda row: row[0]
-    )
-
-    if len(
-        candidates
-    ) != 1:
-
-        print(
-            (
-                f"FATAL_DISCOVERY_B{bits}: "
-                f"expected exactly one "
-                f"vanilla-{bits} paper baseline "
-                f"within 0.01 ns of target "
-                f"RMSE {targets[bits]}, "
-                f"found {len(candidates)}"
-            ),
-            file=sys.stderr,
-        )
-
-        for (
-            score,
-            run_dir,
-            r1,
-            r2,
-        ) in candidates:
-
-            print(
-                (
-                    f"  candidate "
-                    f"score={score:.6g} "
-                    f"rmse_tau1={r1:.9g} "
-                    f"rmse_tau2={r2:.9g} "
-                    f"path={run_dir}"
-                ),
-                file=sys.stderr,
-            )
-
-        sys.exit(
-            2
-        )
-
-    print(
-        str(
-            candidates[
-                0
-            ][
-                1
-            ]
-        )
-    )
-
-PY
-)
-
-
-if [ "${#VANILLA_RUNS[@]}" -ne 2 ]; then
-
-    echo "FATAL: vanilla baseline discovery did not return exactly two run directories."
+if [ ! -d "${VANILLA4_RUN_DIR}" ]; then
+    echo "FATAL: vanilla 4-bit run directory does not exist: ${VANILLA4_RUN_DIR}"
     exit 1
 fi
 
 
-VANILLA4_RUN_DIR="${VANILLA_RUNS[0]}"
-
-VANILLA8_RUN_DIR="${VANILLA_RUNS[1]}"
-
+if [ ! -d "${VANILLA8_RUN_DIR}" ]; then
+    echo "FATAL: vanilla 8-bit run directory does not exist: ${VANILLA8_RUN_DIR}"
+    exit 1
+fi
 
 for RUN_DIR in \
     "${VANILLA4_RUN_DIR}" \
