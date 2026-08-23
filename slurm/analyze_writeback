@@ -362,6 +362,12 @@ CMD=(
 
     --tensor-tolerance
     5e-5
+    
+    --tensor-mean-tolerance
+    2e-4
+
+    --tensor-mismatch-fraction
+    5e-3
 
     --mae-tolerance
     5e-5

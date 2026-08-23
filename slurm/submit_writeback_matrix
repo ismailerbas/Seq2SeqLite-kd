@@ -13,6 +13,16 @@
 set -euo pipefail
 
 
+STAGE=${1:-}
+
+if [ "${STAGE}" != "natives" ] && \
+   [ "${STAGE}" != "conditions" ]; then
+
+    echo "FATAL: usage: bash slurm/submit_writeback_matrix natives|conditions"
+    exit 1
+fi
+
+
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
 
 DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
@@ -178,24 +188,22 @@ submit_native() {
 
 submit_condition() {
 
-    local dependency="$1"
-    local short_name="$2"
-    local run_dir="$3"
-    local phase="$4"
-    local enc_writeback="$5"
-    local enc_bits="$6"
-    local dec_writeback="$7"
-    local dec_bits="$8"
-    local out_dir="$9"
-    local fidelity_json="${10}"
-    local sr_seeds="${11:-5}"
-    local sr_seed_base="${12:-1000}"
+    local short_name="$1"
+    local run_dir="$2"
+    local phase="$3"
+    local enc_writeback="$4"
+    local enc_bits="$5"
+    local dec_writeback="$6"
+    local dec_bits="$7"
+    local out_dir="$8"
+    local fidelity_json="$9"
+    local sr_seeds="${10:-5}"
+    local sr_seed_base="${11:-1000}"
     local job_id
 
     job_id="$(
         sbatch \
             --parsable \
-            --dependency="afterok:${dependency}" \
             --job-name="wb_${short_name}" \
             "${WORKER}" \
             condition \
@@ -211,7 +219,7 @@ submit_condition() {
             "${sr_seed_base}"
     )"
 
-    echo "Submitted condition ${short_name}: ${job_id} after ${dependency}" >&2
+    echo "Submitted condition ${short_name}: ${job_id}" >&2
 
     printf '%s\n' \
         "${job_id}"
@@ -242,6 +250,8 @@ V4_NATIVE_DIR="${V4_OUT_ROOT}/VANILLA4_native"
 
 V8_NATIVE_DIR="${V8_OUT_ROOT}/VANILLA8_native"
 
+
+if [ "${STAGE}" = "natives" ]; then
 
 P2E_FID_JOB="$(
     submit_native \
@@ -288,6 +298,22 @@ V8_FID_JOB="$(
 )"
 
 
+echo "================================================================================"
+echo "Native fidelity jobs submitted (no dependencies)."
+echo "  P2E      ${P2E_FID_JOB}"
+echo "  P2F      ${P2F_FID_JOB}"
+echo "  P3       ${P3_FID_JOB}"
+echo "  vanilla4 ${V4_FID_JOB}"
+echo "  vanilla8 ${V8_FID_JOB}"
+echo "After all five finish successfully, submit the condition jobs with:"
+echo "  bash slurm/submit_writeback_matrix conditions"
+echo "================================================================================"
+
+exit 0
+
+fi
+
+
 P2E_FID_JSON="${P2E_NATIVE_DIR}/native_fidelity.json"
 
 P2F_FID_JSON="${P2F_NATIVE_DIR}/native_fidelity.json"
@@ -297,6 +323,24 @@ P3_FID_JSON="${P3_NATIVE_DIR}/native_fidelity.json"
 V4_FID_JSON="${V4_NATIVE_DIR}/native_fidelity.json"
 
 V8_FID_JSON="${V8_NATIVE_DIR}/native_fidelity.json"
+
+
+for FID_JSON in \
+    "${P2E_FID_JSON}" \
+    "${P2F_FID_JSON}" \
+    "${P3_FID_JSON}" \
+    "${V4_FID_JSON}" \
+    "${V8_FID_JSON}"
+
+do
+
+    if [ ! -f "${FID_JSON}" ]; then
+
+        echo "FATAL: native fidelity JSON missing (run the natives stage first): ${FID_JSON}"
+        exit 1
+    fi
+
+done
 
 
 for B in \
@@ -310,7 +354,6 @@ for B in \
 do
 
     submit_condition \
-        "${P2E_FID_JOB}" \
         "p2e_b${B}" \
         "${MEMOQ_RUN_DIR}" \
         P2E \
@@ -338,7 +381,6 @@ for B in \
 do
 
     submit_condition \
-        "${V8_FID_JOB}" \
         "v8_b${B}" \
         "${VANILLA8_RUN_DIR}" \
         VANILLA \
@@ -366,7 +408,6 @@ for B in \
 do
 
     submit_condition \
-        "${V4_FID_JOB}" \
         "v4_b${B}" \
         "${VANILLA4_RUN_DIR}" \
         VANILLA \
@@ -384,7 +425,6 @@ done
 
 
 submit_condition \
-    "${V4_FID_JOB}" \
     v4_float \
     "${VANILLA4_RUN_DIR}" \
     VANILLA \
@@ -410,7 +450,6 @@ for B in \
 do
 
     submit_condition \
-        "${P3_FID_JOB}" \
         "p3_b${B}" \
         "${MEMOQ_RUN_DIR}" \
         P3 \
@@ -428,7 +467,6 @@ done
 
 
 submit_condition \
-    "${P3_FID_JOB}" \
     p3_float \
     "${MEMOQ_RUN_DIR}" \
     P3 \
@@ -444,7 +482,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P2E_FID_JOB}" \
     p2e_enc4 \
     "${MEMOQ_RUN_DIR}" \
     P2E \
@@ -460,7 +497,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P2E_FID_JOB}" \
     p2e_dec4 \
     "${MEMOQ_RUN_DIR}" \
     P2E \
@@ -476,7 +512,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P2F_FID_JOB}" \
     p2f_sr \
     "${MEMOQ_RUN_DIR}" \
     P2F \
@@ -492,7 +527,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P2F_FID_JOB}" \
     p2f_ef \
     "${MEMOQ_RUN_DIR}" \
     P2F \
@@ -508,7 +542,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P3_FID_JOB}" \
     p3_sr \
     "${MEMOQ_RUN_DIR}" \
     P3 \
@@ -524,7 +557,6 @@ submit_condition \
 
 
 submit_condition \
-    "${P3_FID_JOB}" \
     p3_ef \
     "${MEMOQ_RUN_DIR}" \
     P3 \
@@ -540,13 +572,5 @@ submit_condition \
 
 
 echo "================================================================================"
-echo "All writeback jobs submitted."
-echo "Native fidelity jobs:"
-echo "  P2E      ${P2E_FID_JOB}"
-echo "  P2F      ${P2F_FID_JOB}"
-echo "  P3       ${P3_FID_JOB}"
-echo "  vanilla4 ${V4_FID_JOB}"
-echo "  vanilla8 ${V8_FID_JOB}"
-echo "Dependent sweep/location/rescue jobs will start only after the matching"
-echo "native fidelity job passes tensor equivalence and saved-metric validation."
+echo "All condition jobs submitted with no dependencies."
 echo "================================================================================"

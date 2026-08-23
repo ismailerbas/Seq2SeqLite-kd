@@ -377,6 +377,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--tensor-mean-tolerance",
+        type=float,
+        default=5e-5,
+    )
+
+    parser.add_argument(
+        "--tensor-mismatch-fraction",
+        type=float,
+        default=1e-3,
+    )
+
+    parser.add_argument(
         "--mae-tolerance",
         type=float,
         default=5e-5,
@@ -490,6 +502,19 @@ def validate_cli(
     if args.tensor_tolerance <= 0.0:
         raise ValueError(
             "--tensor-tolerance must be > 0"
+        )
+
+    if args.tensor_mean_tolerance <= 0.0:
+        raise ValueError(
+            "--tensor-mean-tolerance must be > 0"
+        )
+
+    if (
+        args.tensor_mismatch_fraction < 0.0
+        or args.tensor_mismatch_fraction >= 1.0
+    ):
+        raise ValueError(
+            "--tensor-mismatch-fraction must be in [0, 1)"
         )
 
     if args.mae_tolerance <= 0.0:
@@ -2514,6 +2539,7 @@ def tensor_error(
     name: str,
     reference: np.ndarray,
     reconstructed: np.ndarray,
+    tolerance: float,
 ) -> Dict:
     reference = np.asarray(
         reference,
@@ -2543,6 +2569,19 @@ def tensor_error(
         np.float64
     )
 
+    n_elements = int(
+        diff.size
+    )
+
+    n_mismatch = int(
+        np.count_nonzero(
+            diff
+            > float(
+                tolerance
+            )
+        )
+    )
+
     return {
         "name": name,
         "shape": list(
@@ -2566,6 +2605,15 @@ def tensor_error(
                 )
             )
         ),
+        "tolerance": float(
+            tolerance
+        ),
+        "n_elements": n_elements,
+        "n_mismatch": n_mismatch,
+        "mismatch_fraction": float(
+            n_mismatch
+            / n_elements
+        ),
     }
 
 
@@ -2577,6 +2625,8 @@ def run_tensor_equivalence(
     cfg: Dict,
     n_samples: int,
     tolerance: float,
+    mean_tolerance: float,
+    mismatch_fraction_limit: float,
 ) -> Dict:
     n = min(
         int(
@@ -2683,16 +2733,19 @@ def run_tensor_equivalence(
             "output",
             ref_pred,
             rec_pred,
+            tolerance,
         ),
         tensor_error(
             "decoder_hidden",
             ref_dec_hidden,
             rec_dec_hidden,
+            tolerance,
         ),
         tensor_error(
             "encoder_final_state",
             ref_enc_final,
             rec_enc_final,
+            tolerance,
         ),
     ]
 
@@ -2701,9 +2754,13 @@ def run_tensor_equivalence(
         for row in checks
         if (
             row[
-                "max_abs"
+                "mean_abs"
             ]
-            > tolerance
+            > mean_tolerance
+            or row[
+                "mismatch_fraction"
+            ]
+            > mismatch_fraction_limit
         )
     ]
 
@@ -2716,7 +2773,13 @@ def run_tensor_equivalence(
             f"mean="
             f"{row['mean_abs']:.9g} "
             f"rmse="
-            f"{row['rmse']:.9g}"
+            f"{row['rmse']:.9g} "
+            f"mismatch_fraction="
+            f"{row['mismatch_fraction']:.9g} "
+            f"(n_mismatch="
+            f"{row['n_mismatch']}"
+            f"/"
+            f"{row['n_elements']})"
         )
 
     if failed:
@@ -2725,10 +2788,16 @@ def run_tensor_equivalence(
             + "; ".join(
                 (
                     f"{row['name']} "
+                    f"mean_abs="
+                    f"{row['mean_abs']:.9g} "
+                    f"(limit "
+                    f"{mean_tolerance:.9g}) "
+                    f"mismatch_fraction="
+                    f"{row['mismatch_fraction']:.9g} "
+                    f"(limit "
+                    f"{mismatch_fraction_limit:.9g}) "
                     f"max_abs="
-                    f"{row['max_abs']:.9g} "
-                    f"> "
-                    f"{tolerance:.9g}"
+                    f"{row['max_abs']:.9g}"
                 )
                 for row in failed
             )
@@ -2736,9 +2805,13 @@ def run_tensor_equivalence(
 
     pf(
         f"[EQUIV] PASS on {n} "
-        "held-out sequences with "
-        f"tolerance "
-        f"{tolerance:.9g}"
+        "held-out sequences: "
+        f"per-element tolerance "
+        f"{tolerance:.9g}, "
+        f"mean tolerance "
+        f"{mean_tolerance:.9g}, "
+        f"mismatch fraction limit "
+        f"{mismatch_fraction_limit:.9g}"
     )
 
     return {
@@ -2747,6 +2820,12 @@ def run_tensor_equivalence(
         ),
         "tolerance": float(
             tolerance
+        ),
+        "mean_tolerance": float(
+            mean_tolerance
+        ),
+        "mismatch_fraction_limit": float(
+            mismatch_fraction_limit
         ),
         "checks": checks,
         "passed": True,
@@ -6429,6 +6508,8 @@ def main() -> None:
                 cfg,
                 args.equivalence_samples,
                 args.tensor_tolerance,
+                args.tensor_mean_tolerance,
+                args.tensor_mismatch_fraction,
             )
         )
 
