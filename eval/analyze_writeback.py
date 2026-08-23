@@ -1191,19 +1191,25 @@ def load_checkpoint_weights_by_name(
 
     Keras's positional ``load_weights`` fails with "Layer count mismatch"
     whenever the checkpoint was saved from a training graph that carried
-    extra weight-bearing layers.  This loader instead:
+    extra weight-bearing layers.  MemoQ checkpoints carry exactly one such
+    extra layer, ``teacher_hidden_seq2seq``, because the trainer assigns the
+    teacher model onto the student model as an attribute and Keras
+    auto-tracks it as a sublayer.
 
-      1. prints a full inventory of every layer saved in the checkpoint
-         (name, weight names, weight shapes), so the log always documents
-         exactly what the file contains;
-      2. matches saved layers to model layers by name;
-      3. matches weights inside each layer by their leaf variable name
+    This loader:
+
+      1. inventories every layer saved in the checkpoint WITHOUT resolving
+         leaf names, so that nested sub-models (whose weight paths legally
+         repeat leaves such as ``kernel`` across their internal layers)
+         never trigger a false ambiguity error;
+      2. resolves leaf names only for the layers the model actually needs;
+      3. matches weights inside each needed layer by leaf variable name
          (e.g. ``kernel``, ``recurrent_kernel``, ``bias``, ``W_z``),
          verifying shapes exactly;
       4. raises RuntimeError if any model layer that owns weights has no
-         saved counterpart, if any leaf name is missing or ambiguous, or
-         if any shape differs — silent partial loads are impossible;
-      5. explicitly reports saved layers that the model does not use.
+         saved counterpart, if a needed leaf is missing or ambiguous, or if
+         any shape differs, so silent partial loads are impossible;
+      5. reports saved layers the model does not use.
     """
     checkpoint_path = Path(
         checkpoint_path
@@ -1277,55 +1283,31 @@ def load_checkpoint_weights_by_name(
                 )
             ]
 
-            weights = {}
+            entries = []
 
             for weight_name in weight_names:
-                leaf = (
-                    weight_name.split(
-                        "/"
-                    )[-1]
-                    .split(
-                        ":"
-                    )[0]
-                )
-
-                if leaf in weights:
-                    raise RuntimeError(
-                        "Ambiguous saved weight "
-                        f"leaf {leaf!r} in "
-                        f"checkpoint layer "
-                        f"{layer_name!r} of "
-                        f"{checkpoint_path}"
+                entries.append(
+                    (
+                        weight_name,
+                        np.asarray(
+                            layer_group[
+                                weight_name
+                            ][
+                                ...
+                            ],
+                            dtype=np.float32,
+                        ),
                     )
-
-                weights[
-                    leaf
-                ] = np.asarray(
-                    layer_group[
-                        weight_name
-                    ][
-                        ...
-                    ],
-                    dtype=np.float32,
                 )
 
             saved[
                 layer_name
-            ] = weights
+            ] = entries
 
             pf(
                 f"[CKPT] saved layer "
                 f"{layer_name!r}: "
-                + (
-                    ", ".join(
-                        f"{leaf}="
-                        f"{tuple(array.shape)}"
-                        for leaf, array
-                        in weights.items()
-                    )
-                    if weights
-                    else "(no weights)"
-                )
+                f"{len(entries)} weights"
             )
 
     consumed = set()
@@ -1344,9 +1326,36 @@ def load_checkpoint_weights_by_name(
                 f"{sorted(saved)}"
             )
 
-        layer_saved = saved[
+        entries = saved[
             layer.name
         ]
+
+        by_leaf = {}
+
+        for weight_name, array in entries:
+            leaf = (
+                weight_name.split(
+                    "/"
+                )[-1]
+                .split(
+                    ":"
+                )[0]
+            )
+
+            if leaf in by_leaf:
+                raise RuntimeError(
+                    "Ambiguous saved weight "
+                    f"leaf {leaf!r} in "
+                    f"checkpoint layer "
+                    f"{layer.name!r} of "
+                    f"{checkpoint_path}; "
+                    "saved weight paths: "
+                    f"{[name for name, _ in entries]}"
+                )
+
+            by_leaf[
+                leaf
+            ] = array
 
         new_values = []
 
@@ -1362,7 +1371,7 @@ def load_checkpoint_weights_by_name(
                 )[0]
             )
 
-            if leaf not in layer_saved:
+            if leaf not in by_leaf:
                 raise RuntimeError(
                     f"Weight {leaf!r} of "
                     f"model layer "
@@ -1371,7 +1380,7 @@ def load_checkpoint_weights_by_name(
                     "checkpoint. Saved "
                     "weights for this "
                     "layer: "
-                    f"{sorted(layer_saved)}"
+                    f"{sorted(by_leaf)}"
                 )
 
             if leaf in used_leaves:
@@ -1385,7 +1394,7 @@ def load_checkpoint_weights_by_name(
                 leaf
             )
 
-            array = layer_saved[
+            array = by_leaf[
                 leaf
             ]
 
@@ -1418,7 +1427,7 @@ def load_checkpoint_weights_by_name(
 
         unused_leaves = sorted(
             set(
-                layer_saved
+                by_leaf
             )
             - used_leaves
         )
@@ -1447,30 +1456,21 @@ def load_checkpoint_weights_by_name(
             "weights) by name"
         )
 
-    ignored = [
-        name
-        for name in saved
-        if name not in consumed
-        and saved[
-            name
-        ]
-    ]
-
-    for name in ignored:
-        pf(
-            f"[CKPT] ignoring saved "
-            f"layer {name!r} "
-            "(not part of the "
-            "reference model): "
-            + ", ".join(
-                f"{leaf}="
-                f"{tuple(array.shape)}"
-                for leaf, array
-                in saved[
-                    name
-                ].items()
+    for name in saved:
+        if (
+            name not in consumed
+            and saved[
+                name
+            ]
+        ):
+            pf(
+                f"[CKPT] ignoring saved "
+                f"layer {name!r} "
+                "(not part of the "
+                "reference model): "
+                f"{len(saved[name])} "
+                "weights"
             )
-        )
 
 
 def build_original_reference(
@@ -1921,102 +1921,247 @@ def extract_raw_weights(
     return weights
 
 
+def _require_quantizer(
+    owner: str,
+    name: str,
+    quantizer,
+):
+    if quantizer is None:
+        raise RuntimeError(
+            f"{owner} has no {name} "
+            "quantizer; the reference "
+            "model is not configured as "
+            "this analysis expects"
+        )
+
+    return quantizer
+
+
 def build_parameter_quantizers(
+    model,
     cfg: Dict,
     phase: str,
+    enc_cell=None,
+    dec_cell=None,
 ) -> Dict:
-    alpha = (
-        1.0
-        if phase == "VANILLA"
-        else cfg[
-            "q_alpha"
-        ]
-    )
+    """
+    Return the ACTUAL quantizer objects the reference model applies.
 
-    q_kernel = quantized_bits(
-        cfg["bits_kernel"],
-        0,
-        1,
-        alpha=alpha,
-    )
-
-    q_recurrent = (
-        quantized_bits(
-            cfg[
-                "bits_recurrent"
-            ],
-            0,
-            1,
-            alpha=alpha,
-        )
-    )
-
-    q_bias = quantized_bits(
-        cfg["bits_bias"],
-        0,
-        1,
-        alpha=alpha,
-    )
-
-    q_activation = None
-
+    These are read off the loaded layers rather than reconstructed from the
+    run configuration.  Reconstruction is unsafe: QKeras mutates quantizers
+    at layer-construction time.  ``QDense.__init__`` calls
+    ``_set_trainable_parameter()`` on its kernel quantizer, and
+    ``quantized_bits._set_trainable_parameter`` rewrites ``alpha`` from
+    ``None`` to ``"auto_po2"`` and sets ``symmetric = True``.  A separately
+    constructed ``quantized_bits(bits, 0)`` therefore quantizes with a plain
+    unit scale while the layer itself quantizes with per-channel
+    power-of-two scaling, which silently changes the effective dense
+    weights.  Reading the layer's own objects makes that class of mismatch
+    impossible for every quantizer, now and for any future QKeras change.
+    """
     if phase in (
+        "P2D",
         "P2E",
         "P2F",
-        "P3",
-        "VANILLA",
     ):
-        q_activation = (
-            quantized_tanh(
-                bits=cfg[
-                    "bits_activation"
-                ],
-                symmetric=True,
+        if (
+            enc_cell is None
+            or dec_cell is None
+        ):
+            raise RuntimeError(
+                "Phase-2 quantizer "
+                "extraction requires "
+                "encoder/decoder MemoQ "
+                "cells"
             )
+
+        enc_kernel = _require_quantizer(
+            "memoq encoder cell",
+            "kernel",
+            enc_cell.quantizer_h,
         )
 
-    if alpha == 1.0:
-        q_dense = quantized_bits(
-            cfg["bits_kernel"],
-            0,
+        enc_recurrent = _require_quantizer(
+            "memoq encoder cell",
+            "recurrent",
+            enc_cell.quantizer_recurrent_h,
+        )
+
+        enc_bias = _require_quantizer(
+            "memoq encoder cell",
+            "bias",
+            enc_cell.quantizer_bias,
+        )
+
+        dec_kernel = _require_quantizer(
+            "memoq decoder cell",
+            "kernel",
+            dec_cell.quantizer_h,
+        )
+
+        dec_recurrent = _require_quantizer(
+            "memoq decoder cell",
+            "recurrent",
+            dec_cell.quantizer_recurrent_h,
+        )
+
+        dec_bias = _require_quantizer(
+            "memoq decoder cell",
+            "bias",
+            dec_cell.quantizer_bias,
+        )
+
+        enc_activation = (
+            enc_cell.quantizer_activation
+        )
+
+        dec_activation = (
+            dec_cell.quantizer_activation
         )
 
     else:
-        q_dense = quantized_bits(
-            cfg["bits_kernel"],
-            0,
-            1,
-            alpha=alpha,
+        enc_layer = model.get_layer(
+            "sencgru"
         )
 
-    return {
-        "kernel": q_kernel,
-        "recurrent": q_recurrent,
-        "bias": q_bias,
-        "activation": q_activation,
-        "dense": q_dense,
+        dec_layer = model.get_layer(
+            "sdecgru"
+        )
+
+        enc_kernel = _require_quantizer(
+            "sencgru",
+            "kernel",
+            enc_layer.cell.kernel_quantizer_internal,
+        )
+
+        enc_recurrent = _require_quantizer(
+            "sencgru",
+            "recurrent",
+            enc_layer.cell.recurrent_quantizer_internal,
+        )
+
+        enc_bias = _require_quantizer(
+            "sencgru",
+            "bias",
+            enc_layer.cell.bias_quantizer_internal,
+        )
+
+        dec_kernel = _require_quantizer(
+            "sdecgru",
+            "kernel",
+            dec_layer.cell.kernel_quantizer_internal,
+        )
+
+        dec_recurrent = _require_quantizer(
+            "sdecgru",
+            "recurrent",
+            dec_layer.cell.recurrent_quantizer_internal,
+        )
+
+        dec_bias = _require_quantizer(
+            "sdecgru",
+            "bias",
+            dec_layer.cell.bias_quantizer_internal,
+        )
+
+        enc_activation = (
+            enc_layer.cell.activation
+        )
+
+        dec_activation = (
+            dec_layer.cell.activation
+        )
+
+    if (
+        str(
+            enc_activation
+        )
+        != str(
+            dec_activation
+        )
+    ):
+        raise RuntimeError(
+            "Encoder and decoder "
+            "candidate activations "
+            "differ: "
+            f"{enc_activation} vs "
+            f"{dec_activation}. The "
+            "unrolled forward pass "
+            "applies a single "
+            "activation to both."
+        )
+
+    dense_layer = model.get_layer(
+        "sdec_dense"
+    )
+
+    dense_kernel = _require_quantizer(
+        "sdec_dense",
+        "kernel",
+        dense_layer.kernel_quantizer_internal,
+    )
+
+    dense_bias = _require_quantizer(
+        "sdec_dense",
+        "bias",
+        dense_layer.bias_quantizer_internal,
+    )
+
+    quantizers = {
+        "enc_kernel": enc_kernel,
+        "enc_recurrent": enc_recurrent,
+        "enc_bias": enc_bias,
+        "dec_kernel": dec_kernel,
+        "dec_recurrent": dec_recurrent,
+        "dec_bias": dec_bias,
+        "dense_kernel": dense_kernel,
+        "dense_bias": dense_bias,
+        "activation": enc_activation,
     }
+
+    for name, quantizer in (
+        quantizers.items()
+    ):
+        pf(
+            f"[QUANT] {name}: "
+            f"{quantizer}"
+        )
+
+    return quantizers
 
 
 def quantize_effective_weights(
     raw: Dict[str, np.ndarray],
     quantizers: Dict,
 ) -> Dict[str, np.ndarray]:
+    """
+    Apply each region's OWN quantizer to that region's raw weights.
+
+    Every tensor is handed to the quantizer in exactly the shape the layer
+    itself passes, so scale-bearing quantizers such as ``auto_po2`` compute
+    identical scales to the reference model.
+    """
     result = {}
 
-    for prefix in (
-        "enc",
-        "dec",
+    for name in (
+        "enc_kernel",
+        "enc_recurrent",
+        "enc_bias",
+        "dec_kernel",
+        "dec_recurrent",
+        "dec_bias",
+        "dense_kernel",
+        "dense_bias",
     ):
         result[
-            f"{prefix}_kernel"
+            name
         ] = np.asarray(
             quantizers[
-                "kernel"
+                name
             ](
                 tf.convert_to_tensor(
                     raw[
-                        f"{prefix}_kernel"
+                        name
                     ],
                     tf.float32,
                 )
@@ -2024,69 +2169,15 @@ def quantize_effective_weights(
             dtype=np.float32,
         )
 
-        result[
-            f"{prefix}_recurrent"
-        ] = np.asarray(
-            quantizers[
-                "recurrent"
-            ](
-                tf.convert_to_tensor(
-                    raw[
-                        f"{prefix}_recurrent"
-                    ],
-                    tf.float32,
-                )
-            ).numpy(),
-            dtype=np.float32,
+        pf(
+            f"[QUANT] effective {name}: "
+            f"shape="
+            f"{result[name].shape} "
+            f"min="
+            f"{result[name].min():.6g} "
+            f"max="
+            f"{result[name].max():.6g}"
         )
-
-        result[
-            f"{prefix}_bias"
-        ] = np.asarray(
-            quantizers[
-                "bias"
-            ](
-                tf.convert_to_tensor(
-                    raw[
-                        f"{prefix}_bias"
-                    ],
-                    tf.float32,
-                )
-            ).numpy(),
-            dtype=np.float32,
-        )
-
-    result[
-        "dense_kernel"
-    ] = np.asarray(
-        quantizers[
-            "dense"
-        ](
-            tf.convert_to_tensor(
-                raw[
-                    "dense_kernel"
-                ],
-                tf.float32,
-            )
-        ).numpy(),
-        dtype=np.float32,
-    )
-
-    result[
-        "dense_bias"
-    ] = np.asarray(
-        quantizers[
-            "dense"
-        ](
-            tf.convert_to_tensor(
-                raw[
-                    "dense_bias"
-                ],
-                tf.float32,
-            )
-        ).numpy(),
-        dtype=np.float32,
-    )
 
     return result
 
@@ -3066,11 +3157,11 @@ def run_tensor_equivalence(
         "factor)"
     )
 
-    gated_checks = [
+    checks = [
         tensor_error(
-            "dense_semantics_probe",
+            "output",
             ref_pred,
-            dense_probe,
+            rec_pred,
             tolerance,
         ),
         tensor_error(
@@ -3085,52 +3176,34 @@ def run_tensor_equivalence(
             rec_enc_final,
             tolerance,
         ),
-    ]
-
-    report_checks = [
         tensor_error(
-            "output",
+            "dense_semantics_probe",
             ref_pred,
-            rec_pred,
+            dense_probe,
             tolerance,
         ),
     ]
 
-    for row in gated_checks:
+    for row in checks:
         row[
             "gated"
         ] = True
 
-    for row in report_checks:
-        row[
-            "gated"
-        ] = False
-
-    checks = (
-        gated_checks
-        + report_checks
-    )
-
     failed = [
         row
-        for row in gated_checks
+        for row in checks
         if (
             row[
-                "mean_abs"
+                "max_abs"
             ]
-            > mean_tolerance
-            or row[
-                "mismatch_fraction"
-            ]
-            > mismatch_fraction_limit
+            > tolerance
         )
     ]
 
     for row in checks:
         pf(
             f"[EQUIV] "
-            f"{row['name']}"
-            f"{'' if row['gated'] else ' (report only)'}: "
+            f"{row['name']}: "
             f"max="
             f"{row['max_abs']:.9g} "
             f"mean="
@@ -3151,16 +3224,14 @@ def run_tensor_equivalence(
             + "; ".join(
                 (
                     f"{row['name']} "
-                    f"mean_abs="
-                    f"{row['mean_abs']:.9g} "
-                    f"(limit "
-                    f"{mean_tolerance:.9g}) "
-                    f"mismatch_fraction="
-                    f"{row['mismatch_fraction']:.9g} "
-                    f"(limit "
-                    f"{mismatch_fraction_limit:.9g}) "
                     f"max_abs="
-                    f"{row['max_abs']:.9g}"
+                    f"{row['max_abs']:.9g} "
+                    f"> "
+                    f"{tolerance:.9g} "
+                    f"(mean_abs="
+                    f"{row['mean_abs']:.9g}, "
+                    f"mismatch_fraction="
+                    f"{row['mismatch_fraction']:.9g})"
                 )
                 for row in failed
             )
@@ -3168,20 +3239,12 @@ def run_tensor_equivalence(
 
     pf(
         f"[EQUIV] PASS on {n} "
-        "held-out sequences: "
-        "recurrent trajectories and "
-        "dense head certified with "
-        f"per-element tolerance "
-        f"{tolerance:.9g}, "
-        f"mean tolerance "
-        f"{mean_tolerance:.9g}, "
-        f"mismatch fraction limit "
-        f"{mismatch_fraction_limit:.9g}; "
-        "raw output discrepancy is "
-        "reported above and bounded "
-        "by the certified hidden "
-        "discrepancy times the dense "
-        "L1 gain"
+        "held-out sequences with "
+        f"maximum absolute tolerance "
+        f"{tolerance:.9g} on output, "
+        "decoder hidden sequence, "
+        "encoder final state and the "
+        "dense semantics probe"
     )
 
     return {
@@ -6796,8 +6859,11 @@ def main() -> None:
 
     quantizers = (
         build_parameter_quantizers(
+            original_model,
             cfg,
             args.phase,
+            enc_cell,
+            dec_cell,
         )
     )
 
