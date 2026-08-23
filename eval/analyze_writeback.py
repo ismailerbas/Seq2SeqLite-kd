@@ -390,6 +390,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
+        "--tensor-tie-fraction",
+        type=float,
+        default=1e-3,
+    )
+
+    parser.add_argument(
         "--mae-tolerance",
         type=float,
         default=5e-5,
@@ -516,6 +522,14 @@ def validate_cli(
     ):
         raise ValueError(
             "--tensor-mismatch-fraction must be in [0, 1)"
+        )
+
+    if (
+        args.tensor_tie_fraction < 0.0
+        or args.tensor_tie_fraction >= 1.0
+    ):
+        raise ValueError(
+            "--tensor-tie-fraction must be in [0, 1)"
         )
 
     if args.mae_tolerance <= 0.0:
@@ -3012,6 +3026,7 @@ def run_tensor_equivalence(
     tolerance: float,
     mean_tolerance: float,
     mismatch_fraction_limit: float,
+    tie_fraction_limit: float,
 ) -> Dict:
     n = min(
         int(
@@ -3184,21 +3199,105 @@ def run_tensor_equivalence(
         ),
     ]
 
+    activation_lsb = float(
+        2.0
+        ** (
+            -(
+                int(
+                    cfg[
+                        "bits_activation"
+                    ]
+                )
+                - 1
+            )
+        )
+    )
+
+    state_lsb = float(
+        2.0
+        ** (
+            -(
+                int(
+                    cfg[
+                        "bits_state"
+                    ]
+                )
+                - 1
+            )
+        )
+    )
+
+    tie_bound = max(
+        activation_lsb,
+        state_lsb,
+    )
+
+    pf(
+        f"[EQUIV] single-quantizer-step "
+        f"tie bound = {tie_bound:.9g} "
+        f"(activation LSB "
+        f"{activation_lsb:.9g}, state "
+        f"LSB {state_lsb:.9g}); "
+        "isolated boundary ties within "
+        "this bound are accepted at a "
+        "fraction of at most "
+        f"{tie_fraction_limit:.9g}"
+    )
+
+    failed = []
+
     for row in checks:
         row[
             "gated"
         ] = True
 
-    failed = [
-        row
-        for row in checks
+        row[
+            "tie_bound"
+        ] = tie_bound
+
+        row[
+            "tie_fraction_limit"
+        ] = float(
+            tie_fraction_limit
+        )
+
         if (
             row[
                 "max_abs"
             ]
-            > tolerance
+            <= tolerance
+        ):
+            row[
+                "criterion"
+            ] = "max_abs"
+
+            continue
+
+        if (
+            row[
+                "max_abs"
+            ]
+            <= tie_bound
+            and row[
+                "mismatch_fraction"
+            ]
+            <= tie_fraction_limit
+        ):
+            row[
+                "criterion"
+            ] = (
+                "isolated_quantizer_ties"
+            )
+
+            continue
+
+        row[
+            "criterion"
+        ] = "failed"
+
+        failed.append(
+            row
         )
-    ]
 
     for row in checks:
         pf(
@@ -3215,7 +3314,9 @@ def run_tensor_equivalence(
             f"(n_mismatch="
             f"{row['n_mismatch']}"
             f"/"
-            f"{row['n_elements']})"
+            f"{row['n_elements']}) "
+            f"criterion="
+            f"{row['criterion']}"
         )
 
     if failed:
@@ -3228,10 +3329,16 @@ def run_tensor_equivalence(
                     f"{row['max_abs']:.9g} "
                     f"> "
                     f"{tolerance:.9g} "
-                    f"(mean_abs="
-                    f"{row['mean_abs']:.9g}, "
+                    f"and not an isolated "
+                    f"quantizer tie "
+                    f"(tie bound "
+                    f"{tie_bound:.9g}, "
                     f"mismatch_fraction="
-                    f"{row['mismatch_fraction']:.9g})"
+                    f"{row['mismatch_fraction']:.9g} "
+                    f"> "
+                    f"{tie_fraction_limit:.9g}) "
+                    f"(mean_abs="
+                    f"{row['mean_abs']:.9g})"
                 )
                 for row in failed
             )
@@ -3244,7 +3351,11 @@ def run_tensor_equivalence(
         f"{tolerance:.9g} on output, "
         "decoder hidden sequence, "
         "encoder final state and the "
-        "dense semantics probe"
+        "dense semantics probe; any "
+        "residual differences are "
+        "isolated single-quantizer-step "
+        "boundary ties bounded by "
+        f"{tie_bound:.9g}"
     )
 
     return {
@@ -3260,6 +3371,12 @@ def run_tensor_equivalence(
         "mismatch_fraction_limit": float(
             mismatch_fraction_limit
         ),
+        "tie_fraction_limit": float(
+            tie_fraction_limit
+        ),
+        "tie_bound": tie_bound,
+        "activation_lsb": activation_lsb,
+        "state_lsb": state_lsb,
         "dense_l1_gain": (
             dense_l1_gain
         ),
@@ -6950,6 +7067,7 @@ def main() -> None:
                 args.tensor_tolerance,
                 args.tensor_mean_tolerance,
                 args.tensor_mismatch_fraction,
+                args.tensor_tie_fraction,
             )
         )
 

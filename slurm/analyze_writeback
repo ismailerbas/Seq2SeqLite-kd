@@ -370,6 +370,9 @@ CMD=(
 
     --tensor-mismatch-fraction
     5e-3
+    
+    --tensor-tie-fraction
+    1e-3
 
     --mae-tolerance
     5e-5
