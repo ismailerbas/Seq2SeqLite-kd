@@ -264,7 +264,7 @@ def make_job_name(args) -> str:
         f"vanilla_kd"
         f"_T{args.temperature}"
         f"_a{args.alpha}"
-        f"_b{args.bits_kernel}k{args.bits_bias}r{args.bits_recurrent}a{args.bits_activation}"
+        f"_b{args.bits_kernel}k{args.bits_bias}r{args.bits_recurrent}a{args.bits_activation}s{args.bits_state}"
         f"_gru{args.student_units}x1"
         f"_dense{args.n_out}"
         f"_effbs{effective_batch}"

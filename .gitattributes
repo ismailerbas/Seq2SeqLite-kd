@@ -1,3 +1,13 @@
 slurm/analyze_memoq_deadzone text eol=lf
 .gitattributes text eol=lf
 eval/analyze_memoq_deadzone.py text eol=lf
+slurm/analyze_writeback text eol=lf
+slurm/submit_writeback_matrix text eol=lf
+eval/analyze_writeback.py text eol=lf
+train_student_vanilla_kd.py text eol=lf
+train_student_memoq.py text eol=lf
+slurm/studentvanilla text eol=lf
+slurm/studentmemoq text eol=lf
+slurm/student text eol=lf
+eval/eval_student_vanilla_sdf.py text eol=lf
+slurm/eval_student_vanilla_sdf text eol=lf

@@ -105,6 +105,8 @@ VANILLA4_RUN_DIR="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b4k4r4a4_gru32x1_d
 
 VANILLA8_RUN_DIR="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b8k8r8a8_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
 
+VANILLA4S4_RUN_DIR="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b4k4r4a4s4_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+
 
 if [ ! -d "${VANILLA4_RUN_DIR}" ]; then
     echo "FATAL: vanilla 4-bit run directory does not exist: ${VANILLA4_RUN_DIR}"
@@ -119,7 +121,8 @@ fi
 
 for RUN_DIR in \
     "${VANILLA4_RUN_DIR}" \
-    "${VANILLA8_RUN_DIR}"
+    "${VANILLA8_RUN_DIR}" \
+    "${VANILLA4S4_RUN_DIR}"
 
 do
 
@@ -232,12 +235,16 @@ V4_OUT_ROOT="${VANILLA4_RUN_DIR}/writeback_analysis"
 
 V8_OUT_ROOT="${VANILLA8_RUN_DIR}/writeback_analysis"
 
+V4S4_OUT_ROOT="${VANILLA4S4_RUN_DIR}/writeback_analysis"
+
 
 mkdir -p "${MEMOQ_OUT_ROOT}"
 
 mkdir -p "${V4_OUT_ROOT}"
 
 mkdir -p "${V8_OUT_ROOT}"
+
+mkdir -p "${V4S4_OUT_ROOT}"
 
 
 P2E_NATIVE_DIR="${MEMOQ_OUT_ROOT}/P2E_native"
@@ -249,6 +256,8 @@ P3_NATIVE_DIR="${MEMOQ_OUT_ROOT}/P3_native"
 V4_NATIVE_DIR="${V4_OUT_ROOT}/VANILLA4_native"
 
 V8_NATIVE_DIR="${V8_OUT_ROOT}/VANILLA8_native"
+
+V4S4_NATIVE_DIR="${V4S4_OUT_ROOT}/VANILLA4S4_native"
 
 
 if [ "${STAGE}" = "natives" ]; then
@@ -298,6 +307,15 @@ V8_FID_JOB="$(
 )"
 
 
+V4S4_FID_JOB="$(
+    submit_native \
+        v4s4 \
+        "${VANILLA4S4_RUN_DIR}" \
+        VANILLA \
+        "${V4S4_NATIVE_DIR}"
+)"
+
+
 echo "================================================================================"
 echo "Native fidelity jobs submitted (no dependencies)."
 echo "  P2E      ${P2E_FID_JOB}"
@@ -305,7 +323,8 @@ echo "  P2F      ${P2F_FID_JOB}"
 echo "  P3       ${P3_FID_JOB}"
 echo "  vanilla4 ${V4_FID_JOB}"
 echo "  vanilla8 ${V8_FID_JOB}"
-echo "After all five finish successfully, submit the condition jobs with:"
+echo "  vanilla4s4 ${V4S4_FID_JOB}"
+echo "After all six finish successfully, submit the condition jobs with:"
 echo "  bash slurm/submit_writeback_matrix conditions"
 echo "================================================================================"
 
@@ -324,13 +343,16 @@ V4_FID_JSON="${V4_NATIVE_DIR}/native_fidelity.json"
 
 V8_FID_JSON="${V8_NATIVE_DIR}/native_fidelity.json"
 
+V4S4_FID_JSON="${V4S4_NATIVE_DIR}/native_fidelity.json"
+
 
 for FID_JSON in \
     "${P2E_FID_JSON}" \
     "${P2F_FID_JSON}" \
     "${P3_FID_JSON}" \
     "${V4_FID_JSON}" \
-    "${V8_FID_JSON}"
+    "${V8_FID_JSON}" \
+    "${V4S4_FID_JSON}"
 
 do
 
@@ -434,6 +456,48 @@ submit_condition \
     -1 \
     "${V4_OUT_ROOT}/VANILLA4_state_float" \
     "${V4_FID_JSON}" \
+    5 \
+    1000 \
+    >/dev/null
+
+
+for B in \
+    3 \
+    4 \
+    5 \
+    6 \
+    7 \
+    8
+
+do
+
+    submit_condition \
+        "v4s4_b${B}" \
+        "${VANILLA4S4_RUN_DIR}" \
+        VANILLA \
+        deterministic \
+        "${B}" \
+        deterministic \
+        "${B}" \
+        "${V4S4_OUT_ROOT}/VANILLA4S4_sweep_B${B}" \
+        "${V4S4_FID_JSON}" \
+        5 \
+        1000 \
+        >/dev/null
+
+done
+
+
+submit_condition \
+    v4s4_float \
+    "${VANILLA4S4_RUN_DIR}" \
+    VANILLA \
+    none \
+    -1 \
+    none \
+    -1 \
+    "${V4S4_OUT_ROOT}/VANILLA4S4_state_float" \
+    "${V4S4_FID_JSON}" \
     5 \
     1000 \
     >/dev/null
