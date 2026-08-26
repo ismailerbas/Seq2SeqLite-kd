@@ -1,0 +1,143 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:30:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
+
+set -euo pipefail
+
+RUN_DIR=${1:-}
+PHASE=${2:-}
+CONDITION_NAME=${3:-}
+METHOD=${4:-}
+STATE_BITS=${5:-}
+RESIDUAL_BITS=${6:--1}
+COUNTER_BITS=${7:--1}
+SCW_DEADZONE_FRACTION=${8:-0}
+OUT_DIR=${9:-}
+FIDELITY_JSON=${10:-}
+
+if [ -z "${RUN_DIR}" ] || \
+   [ -z "${PHASE}" ] || \
+   [ -z "${CONDITION_NAME}" ] || \
+   [ -z "${METHOD}" ] || \
+   [ -z "${STATE_BITS}" ] || \
+   [ -z "${OUT_DIR}" ] || \
+   [ -z "${FIDELITY_JSON}" ]; then
+
+    echo "FATAL: missing required positional arguments."
+    echo "Usage: sbatch slurm/analyze_recurrent_memory RUN_DIR PHASE CONDITION_NAME METHOD STATE_BITS RESIDUAL_BITS COUNTER_BITS SCW_DEADZONE_FRACTION OUT_DIR FIDELITY_JSON"
+    exit 1
+fi
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+
+PYTHON_SCRIPT="${PROJECT_DIR}/eval/analyze_recurrent_memory.py"
+BASE_SCRIPT="${PROJECT_DIR}/eval/analyze_writeback.py"
+
+for REQUIRED_DIR in \
+    "${PROJECT_DIR}" \
+    "${DATA_PATH}" \
+    "${RUN_DIR}"
+do
+    if [ ! -d "${REQUIRED_DIR}" ]; then
+        echo "FATAL: required directory does not exist: ${REQUIRED_DIR}"
+        exit 1
+    fi
+done
+
+for REQUIRED_FILE in \
+    "${PYTHON_SCRIPT}" \
+    "${BASE_SCRIPT}" \
+    "${RUN_DIR}/student_args.json" \
+    "${FIDELITY_JSON}"
+do
+    if [ ! -f "${REQUIRED_FILE}" ]; then
+        echo "FATAL: required file does not exist: ${REQUIRED_FILE}"
+        exit 1
+    fi
+done
+
+mkdir -p "${OUT_DIR}"
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${PIP_TMPDIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+
+python -m py_compile "${PYTHON_SCRIPT}"
+python -m py_compile "${BASE_SCRIPT}"
+
+GPU_CHECK="$(
+    python -c \
+    'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' \
+    2>/dev/null
+)"
+
+if [ -z "${GPU_CHECK}" ] || \
+   [ "${GPU_CHECK}" = "0" ]; then
+
+    echo "FATAL: TensorFlow found zero GPUs."
+    exit 1
+fi
+
+python "${PYTHON_SCRIPT}" \
+    --run-dir "${RUN_DIR}" \
+    --data-dir "${DATA_PATH}" \
+    --out-dir "${OUT_DIR}" \
+    --phase "${PHASE}" \
+    --condition-name "${CONDITION_NAME}" \
+    --method "${METHOD}" \
+    --state-bits "${STATE_BITS}" \
+    --residual-bits "${RESIDUAL_BITS}" \
+    --counter-bits "${COUNTER_BITS}" \
+    --scw-deadzone-fraction "${SCW_DEADZONE_FRACTION}" \
+    --fidelity-json "${FIDELITY_JSON}" \
+    --infer-batch 2048 \
+    --hist-bins 4096 \
+    --gate-hist-bins 256 \
+    --mechanism-hist-bins 2048 \
+    --bootstrap-reps 2000 \
+    --bootstrap-seed 42 \
+    --bootstrap-batch-reps 64 \
+    --sr-seeds 5 \
+    --sr-seed-base 1000 \
+    --gate-width-ns 0.09 \
+    --equivalence-samples 512 \
+    --adapter-tolerance 1e-6 \
+    --decomposition-tolerance 5e-6 \
+    --margin-tie-tolerance 1e-4 \
+    --criterion-mismatch-fraction 1e-6 \
+    --native-tensor-tolerance 5e-5 \
+    --native-tensor-mean-tolerance 5e-5 \
+    --native-tensor-mismatch-fraction 1e-3 \
+    --native-tensor-tie-fraction 1e-3
