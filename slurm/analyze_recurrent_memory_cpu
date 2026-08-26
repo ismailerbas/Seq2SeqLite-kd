@@ -4,7 +4,7 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --time=00:45:00
+#SBATCH --time=04:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
 
@@ -15,9 +15,7 @@ MODE=${1:-}
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 
-if [ "${MODE}" != "lifetime" ] && \
-   [ "${MODE}" != "aggregate" ]; then
-
+if [[ "${MODE}" != "lifetime" && "${MODE}" != "aggregate" ]]; then
     echo "FATAL: MODE must be lifetime or aggregate."
     exit 1
 fi
@@ -44,81 +42,126 @@ mkdir -p "${PIP_TMPDIR}"
 mkdir -p "${MPLCONFIGDIR}"
 mkdir -p "${XDG_CACHE_HOME}"
 
-if [ "${MODE}" = "lifetime" ]; then
-
+if [[ "${MODE}" == "lifetime" ]]; then
     REFERENCE_NPZ=${2:-}
     CONDITION_NPZ=${3:-}
     REFERENCE_MANIFEST=${4:-}
     CONDITION_MANIFEST=${5:-}
-    OUT_DIR=${6:-}
+    REFERENCE_NAME=${6:-}
+    CONDITION_NAME=${7:-}
+    OUT_DIR=${8:-}
 
     PYTHON_SCRIPT="${PROJECT_DIR}/eval/analyze_lifetime_binned_error.py"
+    STATS_SCRIPT="${PROJECT_DIR}/eval/recurrent_memory_stats.py"
 
-    for REQUIRED_FILE in \
-        "${REFERENCE_NPZ}" \
-        "${CONDITION_NPZ}" \
-        "${REFERENCE_MANIFEST}" \
-        "${CONDITION_MANIFEST}" \
+    required_files=(
+        "${REFERENCE_NPZ}"
+        "${CONDITION_NPZ}"
+        "${REFERENCE_MANIFEST}"
+        "${CONDITION_MANIFEST}"
         "${PYTHON_SCRIPT}"
-    do
-        if [ ! -f "${REQUIRED_FILE}" ]; then
-            echo "FATAL: required file does not exist: ${REQUIRED_FILE}"
+        "${STATS_SCRIPT}"
+    )
+
+    for required_file in "${required_files[@]}"; do
+        if [[ ! -f "${required_file}" ]]; then
+            echo "FATAL: required file does not exist: ${required_file}"
             exit 1
         fi
     done
 
+    if [[ -z "${REFERENCE_NAME}" || -z "${CONDITION_NAME}" || -z "${OUT_DIR}" ]]; then
+        echo "FATAL: lifetime mode requires reference name, condition name, and output directory."
+        exit 1
+    fi
+
     mkdir -p "${OUT_DIR}"
 
     python -m py_compile "${PYTHON_SCRIPT}"
+    python -m py_compile "${STATS_SCRIPT}"
 
-    python "${PYTHON_SCRIPT}" \
-        --reference-npz "${REFERENCE_NPZ}" \
-        --condition-npz "${CONDITION_NPZ}" \
-        --reference-manifest "${REFERENCE_MANIFEST}" \
-        --condition-manifest "${CONDITION_MANIFEST}" \
-        --reference-name P2E_identity \
-        --condition-name P2F_det_B4 \
-        --out-dir "${OUT_DIR}" \
-        --n-bins 10 \
-        --bootstrap-reps 2000 \
-        --bootstrap-seed 42 \
-        --bootstrap-batch-reps 32
+    cmd=(
+        python
+        "${PYTHON_SCRIPT}"
+        --reference-npz "${REFERENCE_NPZ}"
+        --condition-npz "${CONDITION_NPZ}"
+        --reference-manifest "${REFERENCE_MANIFEST}"
+        --condition-manifest "${CONDITION_MANIFEST}"
+        --reference-name "${REFERENCE_NAME}"
+        --condition-name "${CONDITION_NAME}"
+        --out-dir "${OUT_DIR}"
+        --n-bins 10
+        --bootstrap-reps 2000
+        --bootstrap-seed 42
+        --bootstrap-batch-reps 16
+    )
 
+    "${cmd[@]}"
     exit 0
 fi
 
 MEMOQ_RUN_DIR=${2:-}
 VANILLA4_RUN_DIR=${3:-}
 VANILLA8_RUN_DIR=${4:-}
-LIFETIME_DIR=${5:-}
-OUT_DIR=${6:-}
+LIFETIME_P2E_DIR=${5:-}
+LIFETIME_P2F_DIR=${6:-}
+SMOKE_VALIDATION_DIR=${7:-}
+OUT_DIR=${8:-}
 
 PYTHON_SCRIPT="${PROJECT_DIR}/eval/build_recurrent_memory_results.py"
+STATS_SCRIPT="${PROJECT_DIR}/eval/recurrent_memory_stats.py"
 
-for REQUIRED_DIR in \
-    "${MEMOQ_RUN_DIR}" \
-    "${VANILLA4_RUN_DIR}" \
-    "${VANILLA8_RUN_DIR}" \
-    "${LIFETIME_DIR}"
-do
-    if [ ! -d "${REQUIRED_DIR}" ]; then
-        echo "FATAL: required directory does not exist: ${REQUIRED_DIR}"
+required_dirs=(
+    "${MEMOQ_RUN_DIR}"
+    "${VANILLA4_RUN_DIR}"
+    "${VANILLA8_RUN_DIR}"
+    "${LIFETIME_P2E_DIR}"
+    "${LIFETIME_P2F_DIR}"
+    "${SMOKE_VALIDATION_DIR}"
+)
+
+for required_dir in "${required_dirs[@]}"; do
+    if [[ ! -d "${required_dir}" ]]; then
+        echo "FATAL: required directory does not exist: ${required_dir}"
         exit 1
     fi
 done
 
-if [ ! -f "${PYTHON_SCRIPT}" ]; then
-    echo "FATAL: aggregation script does not exist: ${PYTHON_SCRIPT}"
+required_files=(
+    "${PYTHON_SCRIPT}"
+    "${STATS_SCRIPT}"
+)
+
+for required_file in "${required_files[@]}"; do
+    if [[ ! -f "${required_file}" ]]; then
+        echo "FATAL: required file does not exist: ${required_file}"
+        exit 1
+    fi
+done
+
+if [[ -z "${OUT_DIR}" ]]; then
+    echo "FATAL: aggregate mode requires an output directory."
     exit 1
 fi
 
 mkdir -p "${OUT_DIR}"
 
 python -m py_compile "${PYTHON_SCRIPT}"
+python -m py_compile "${STATS_SCRIPT}"
 
-python "${PYTHON_SCRIPT}" \
-    --memoq-run-dir "${MEMOQ_RUN_DIR}" \
-    --vanilla4-run-dir "${VANILLA4_RUN_DIR}" \
-    --vanilla8-run-dir "${VANILLA8_RUN_DIR}" \
-    --lifetime-analysis-dir "${LIFETIME_DIR}" \
+cmd=(
+    python
+    "${PYTHON_SCRIPT}"
+    --memoq-run-dir "${MEMOQ_RUN_DIR}"
+    --vanilla4-run-dir "${VANILLA4_RUN_DIR}"
+    --vanilla8-run-dir "${VANILLA8_RUN_DIR}"
+    --lifetime-p2e-dir "${LIFETIME_P2E_DIR}"
+    --lifetime-p2f-dir "${LIFETIME_P2F_DIR}"
+    --smoke-validation-dir "${SMOKE_VALIDATION_DIR}"
     --out-dir "${OUT_DIR}"
+    --paired-bootstrap-reps 2000
+    --paired-bootstrap-seed 7000
+    --paired-bootstrap-batch-reps 8
+)
+
+"${cmd[@]}"

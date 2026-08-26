@@ -2,33 +2,46 @@
 """
 eval/submit_recurrent_memory_matrix.py
 
-SLURM submission controller for the recurrent-memory study.
+SLURM submission controller for the frozen recurrent-memory study.
 
 Stages
 ------
+smoke
+    Submit only V4_det_B4. This is the mandatory end-to-end reconstruction
+    smoke test.
+
+smoke-check
+    Compare the completed V4_det_B4 result against the repository's already
+    validated VANILLA4S4_native writeback analysis. The full matrix is blocked
+    until this check passes.
+
 conditions
-    Submit every frozen-checkpoint GPU condition required for the mechanism,
-    residual-family, SCW, and equal-storage analyses. Completed conditions are
-    skipped safely.
+    Submit the complete frozen-checkpoint condition matrix. Completed
+    conditions are skipped safely. This stage requires a passed smoke check.
 
 lifetime
-    Submit the paired P2E-vs-P2F lifetime-binned excess-error analysis after
-    both prerequisite conditions have completed.
+    Submit two same-checkpoint paired lifetime analyses:
+        P2E_identity vs P2E_det_B4
+        P2F_identity vs P2F_det_B4
 
 aggregate
-    Submit the final fail-closed aggregation after all condition and lifetime
-    outputs exist.
+    Submit the final fail-closed aggregation after every required condition,
+    both lifetime analyses, and the smoke validation are complete.
 
-This file never trains a model and never changes a checkpoint.
+No stage trains or modifies a model.
 """
 
 import argparse
 import shlex
 import subprocess
 import sys
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import (
+    List,
+    Sequence,
+)
 
 
 PROJECT_DIR = Path(
@@ -39,23 +52,36 @@ DATA_DIR = Path(
     "/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 )
 
-MEMOQ_RUN_DIR = PROJECT_DIR / (
-    "results/"
-    "paper_main_qkeras_matched_memoq_b4k4r4a4s4_gru32_dense3_"
-    "effbs1024_microbs1024_lr1e-04_p1-40_2a30_2b30_2c10_2d10_"
-    "2e30_2f30_p3-170_mse_q1_curr_nodither_aux0"
+MEMOQ_RUN_DIR = (
+    PROJECT_DIR
+    / (
+        "results/"
+        "paper_main_qkeras_matched_memoq_"
+        "b4k4r4a4s4_gru32_dense3_effbs1024_"
+        "microbs1024_lr1e-04_p1-40_2a30_"
+        "2b30_2c10_2d10_2e30_2f30_p3-170_"
+        "mse_q1_curr_nodither_aux0"
+    )
 )
 
-VANILLA4_RUN_DIR = PROJECT_DIR / (
-    "results/"
-    "vanilla_kd_T4.0_a0.6_b4k4r4a4s4_gru32x1_dense3_"
-    "effbs1024_microbs1024_lr1e-04"
+VANILLA4_RUN_DIR = (
+    PROJECT_DIR
+    / (
+        "results/"
+        "vanilla_kd_T4.0_a0.6_"
+        "b4k4r4a4s4_gru32x1_dense3_"
+        "effbs1024_microbs1024_lr1e-04"
+    )
 )
 
-VANILLA8_RUN_DIR = PROJECT_DIR / (
-    "results/"
-    "vanilla_kd_T4.0_a0.6_b8k8r8a8_gru32x1_dense3_"
-    "effbs1024_microbs1024_lr1e-04"
+VANILLA8_RUN_DIR = (
+    PROJECT_DIR
+    / (
+        "results/"
+        "vanilla_kd_T4.0_a0.6_"
+        "b8k8r8a8_gru32x1_dense3_"
+        "effbs1024_microbs1024_lr1e-04"
+    )
 )
 
 GPU_WORKER = (
@@ -85,32 +111,75 @@ V8_ROOT = (
 
 P2E_FIDELITY = (
     MEMOQ_RUN_DIR
-    / "writeback_analysis/P2E_native/native_fidelity.json"
+    / (
+        "writeback_analysis/"
+        "P2E_native/"
+        "native_fidelity.json"
+    )
 )
 
 P2F_FIDELITY = (
     MEMOQ_RUN_DIR
-    / "writeback_analysis/P2F_native/native_fidelity.json"
+    / (
+        "writeback_analysis/"
+        "P2F_native/"
+        "native_fidelity.json"
+    )
 )
 
 P3_FIDELITY = (
     MEMOQ_RUN_DIR
-    / "writeback_analysis/P3_native/native_fidelity.json"
+    / (
+        "writeback_analysis/"
+        "P3_native/"
+        "native_fidelity.json"
+    )
 )
 
 V4_FIDELITY = (
     VANILLA4_RUN_DIR
-    / "writeback_analysis/VANILLA4S4_native/native_fidelity.json"
+    / (
+        "writeback_analysis/"
+        "VANILLA4S4_native/"
+        "native_fidelity.json"
+    )
 )
 
 V8_FIDELITY = (
     VANILLA8_RUN_DIR
-    / "writeback_analysis/VANILLA8_native/native_fidelity.json"
+    / (
+        "writeback_analysis/"
+        "VANILLA8_native/"
+        "native_fidelity.json"
+    )
 )
 
-LIFETIME_DIR = (
+V4_NATIVE_REFERENCE_DIR = (
+    VANILLA4_RUN_DIR
+    / (
+        "writeback_analysis/"
+        "VANILLA4S4_native"
+    )
+)
+
+SMOKE_DIR = (
+    V4_ROOT
+    / "smoke_validation"
+)
+
+SMOKE_FLAG = (
+    SMOKE_DIR
+    / "recurrent_memory_smoke_validation_complete.flag"
+)
+
+LIFETIME_P2E_DIR = (
     MEMOQ_ROOT
-    / "lifetime_binned_P2F_vs_P2E"
+    / "lifetime_binned_P2E_det_vs_identity"
+)
+
+LIFETIME_P2F_DIR = (
+    MEMOQ_ROOT
+    / "lifetime_binned_P2F_det_vs_identity"
 )
 
 STUDY_OUT_DIR = (
@@ -119,7 +188,9 @@ STUDY_OUT_DIR = (
 )
 
 
-@dataclass(frozen=True)
+@dataclass(
+    frozen=True
+)
 class Condition:
     name: str
     run_dir: Path
@@ -133,14 +204,18 @@ class Condition:
     deadzone_fraction: float = 0.0
 
     @property
-    def out_dir(self) -> Path:
+    def out_dir(
+        self,
+    ) -> Path:
         return (
             self.out_root
             / self.name
         )
 
     @property
-    def complete_flag(self) -> Path:
+    def complete_flag(
+        self,
+    ) -> Path:
         return (
             self.out_dir
             / "recurrent_memory_complete.flag"
@@ -150,13 +225,16 @@ class Condition:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Submit the frozen recurrent-memory experiment matrix."
+            "Submit and validate the frozen "
+            "recurrent-memory experiment matrix."
         )
     )
 
     parser.add_argument(
         "stage",
         choices=(
+            "smoke",
+            "smoke-check",
             "conditions",
             "lifetime",
             "aggregate",
@@ -166,10 +244,19 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_checked(command: List[str]) -> str:
+def run_checked(
+    command: Sequence[
+        str
+    ],
+) -> str:
     printable = " ".join(
-        shlex.quote(part)
-        for part in command
+        shlex.quote(
+            str(
+                part
+            )
+        )
+        for part
+        in command
     )
 
     print(
@@ -178,34 +265,54 @@ def run_checked(command: List[str]) -> str:
     )
 
     completed = subprocess.run(
-        command,
+        [
+            str(
+                part
+            )
+            for part
+            in command
+        ],
         check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=(
+            subprocess.PIPE
+        ),
+        stderr=(
+            subprocess.PIPE
+        ),
         text=True,
     )
 
-    if completed.stderr.strip():
+    if (
+        completed.stderr.strip()
+    ):
         print(
             completed.stderr.strip(),
             file=sys.stderr,
             flush=True,
         )
 
-    return completed.stdout.strip()
+    return (
+        completed.stdout.strip()
+    )
 
 
-def require_file(path: Path) -> None:
+def require_file(
+    path: Path,
+) -> None:
     if not path.is_file():
         raise FileNotFoundError(
-            f"Required file does not exist: {path}"
+            f"Required file does not exist: "
+            f"{path}"
         )
 
 
-def require_dir(path: Path) -> None:
+def require_dir(
+    path: Path,
+) -> None:
     if not path.is_dir():
         raise FileNotFoundError(
-            f"Required directory does not exist: {path}"
+            f"Required directory does not exist: "
+            f"{path}"
         )
 
 
@@ -217,9 +324,11 @@ def static_checks() -> None:
         VANILLA4_RUN_DIR,
         VANILLA8_RUN_DIR,
     ):
-        require_dir(directory)
+        require_dir(
+            directory
+        )
 
-    for path in (
+    required_scripts = (
         GPU_WORKER,
         CPU_WORKER,
         PROJECT_DIR
@@ -228,8 +337,20 @@ def static_checks() -> None:
         / "eval/analyze_lifetime_binned_error.py",
         PROJECT_DIR
         / "eval/build_recurrent_memory_results.py",
+        PROJECT_DIR
+        / "eval/recurrent_memory_stats.py",
+        PROJECT_DIR
+        / "eval/validate_recurrent_memory_smoke.py",
+        PROJECT_DIR
+        / "eval/submit_recurrent_memory_matrix.py",
+    )
+
+    for path in (
+        required_scripts
     ):
-        require_file(path)
+        require_file(
+            path
+        )
 
     for fidelity in (
         P2E_FIDELITY,
@@ -238,7 +359,9 @@ def static_checks() -> None:
         V4_FIDELITY,
         V8_FIDELITY,
     ):
-        require_file(fidelity)
+        require_file(
+            fidelity
+        )
 
     for run_dir in (
         MEMOQ_RUN_DIR,
@@ -250,7 +373,7 @@ def static_checks() -> None:
             / "student_args.json"
         )
 
-    for path in (
+    for checkpoint in (
         MEMOQ_RUN_DIR
         / "stage2e_best.weights.h5",
         MEMOQ_RUN_DIR
@@ -262,7 +385,21 @@ def static_checks() -> None:
         VANILLA8_RUN_DIR
         / "student_best.weights.h5",
     ):
-        require_file(path)
+        require_file(
+            checkpoint
+        )
+
+    for path in (
+        V4_NATIVE_REFERENCE_DIR
+        / "writeback_summary.json",
+        V4_NATIVE_REFERENCE_DIR
+        / "writeback_manifest.json",
+        V4_NATIVE_REFERENCE_DIR
+        / "native_fidelity.json",
+    ):
+        require_file(
+            path
+        )
 
     run_checked(
         [
@@ -283,6 +420,14 @@ def static_checks() -> None:
             ),
             str(
                 PROJECT_DIR
+                / "eval/recurrent_memory_stats.py"
+            ),
+            str(
+                PROJECT_DIR
+                / "eval/validate_recurrent_memory_smoke.py"
+            ),
+            str(
+                PROJECT_DIR
                 / "eval/submit_recurrent_memory_matrix.py"
             ),
         ]
@@ -292,7 +437,9 @@ def static_checks() -> None:
         [
             "bash",
             "-n",
-            str(GPU_WORKER),
+            str(
+                GPU_WORKER
+            ),
         ]
     )
 
@@ -300,27 +447,65 @@ def static_checks() -> None:
         [
             "bash",
             "-n",
-            str(CPU_WORKER),
+            str(
+                CPU_WORKER
+            ),
         ]
     )
 
 
-def conditions() -> List[Condition]:
-    result: List[Condition] = []
+def conditions() -> List[
+    Condition
+]:
+    result: List[
+        Condition
+    ] = []
 
-    result.append(
-        Condition(
-            name="P2E_identity",
-            run_dir=MEMOQ_RUN_DIR,
-            phase="P2E",
-            method="identity",
-            state_bits=4,
-            fidelity_json=P2E_FIDELITY,
-            out_root=MEMOQ_ROOT,
-        )
+    result.extend(
+        [
+            Condition(
+                name=(
+                    "P2E_identity"
+                ),
+                run_dir=(
+                    MEMOQ_RUN_DIR
+                ),
+                phase="P2E",
+                method="identity",
+                state_bits=4,
+                fidelity_json=(
+                    P2E_FIDELITY
+                ),
+                out_root=(
+                    MEMOQ_ROOT
+                ),
+            ),
+            Condition(
+                name=(
+                    "P2E_det_B4"
+                ),
+                run_dir=(
+                    MEMOQ_RUN_DIR
+                ),
+                phase="P2E",
+                method=(
+                    "deterministic"
+                ),
+                state_bits=4,
+                fidelity_json=(
+                    P2E_FIDELITY
+                ),
+                out_root=(
+                    MEMOQ_ROOT
+                ),
+            ),
+        ]
     )
 
-    for phase, fidelity in (
+    for (
+        phase,
+        fidelity,
+    ) in (
         (
             "P2F",
             P2F_FIDELITY,
@@ -333,45 +518,110 @@ def conditions() -> List[Condition]:
         result.extend(
             [
                 Condition(
-                    name=f"{phase}_det_B4",
-                    run_dir=MEMOQ_RUN_DIR,
-                    phase=phase,
-                    method="deterministic",
+                    name=(
+                        f"{phase}_identity"
+                    ),
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
+                    method=(
+                        "identity"
+                    ),
                     state_bits=4,
-                    fidelity_json=fidelity,
-                    out_root=MEMOQ_ROOT,
-                ),
-                Condition(
-                    name=f"{phase}_ef_B4",
-                    run_dir=MEMOQ_RUN_DIR,
-                    phase=phase,
-                    method="error_feedback",
-                    state_bits=4,
-                    fidelity_json=fidelity,
-                    out_root=MEMOQ_ROOT,
-                ),
-                Condition(
-                    name=f"{phase}_sr_B4",
-                    run_dir=MEMOQ_RUN_DIR,
-                    phase=phase,
-                    method="stochastic",
-                    state_bits=4,
-                    fidelity_json=fidelity,
-                    out_root=MEMOQ_ROOT,
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
                 ),
                 Condition(
                     name=(
-                        f"{phase}_"
-                        "residual_FULL_HALFSTEP_B4"
+                        f"{phase}_det_B4"
                     ),
-                    run_dir=MEMOQ_RUN_DIR,
-                    phase=phase,
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
+                    method=(
+                        "deterministic"
+                    ),
+                    state_bits=4,
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
+                ),
+                Condition(
+                    name=(
+                        f"{phase}_ef_B4"
+                    ),
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
+                    method=(
+                        "error_feedback"
+                    ),
+                    state_bits=4,
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
+                ),
+                Condition(
+                    name=(
+                        f"{phase}_sr_B4"
+                    ),
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
+                    method=(
+                        "stochastic"
+                    ),
+                    state_bits=4,
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
+                ),
+                Condition(
+                    name=(
+                        f"{phase}_residual_"
+                        "FULL_HALFSTEP_B4"
+                    ),
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
                     method=(
                         "full_halfstep_residual"
                     ),
                     state_bits=4,
-                    fidelity_json=fidelity,
-                    out_root=MEMOQ_ROOT,
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
                 ),
             ]
         )
@@ -387,13 +637,25 @@ def conditions() -> List[Condition]:
                         f"{phase}_"
                         f"residual_R{bits}_B4"
                     ),
-                    run_dir=MEMOQ_RUN_DIR,
-                    phase=phase,
-                    method="quantized_residual",
+                    run_dir=(
+                        MEMOQ_RUN_DIR
+                    ),
+                    phase=(
+                        phase
+                    ),
+                    method=(
+                        "quantized_residual"
+                    ),
                     state_bits=4,
-                    residual_bits=bits,
-                    fidelity_json=fidelity,
-                    out_root=MEMOQ_ROOT,
+                    residual_bits=(
+                        bits
+                    ),
+                    fidelity_json=(
+                        fidelity
+                    ),
+                    out_root=(
+                        MEMOQ_ROOT
+                    ),
                 )
             )
 
@@ -417,16 +679,28 @@ def conditions() -> List[Condition]:
                             f"scw_K{bits}_"
                             f"{deadzone_label}_B4"
                         ),
-                        run_dir=MEMOQ_RUN_DIR,
-                        phase=phase,
-                        method="scw",
+                        run_dir=(
+                            MEMOQ_RUN_DIR
+                        ),
+                        phase=(
+                            phase
+                        ),
+                        method=(
+                            "scw"
+                        ),
                         state_bits=4,
-                        counter_bits=bits,
+                        counter_bits=(
+                            bits
+                        ),
                         deadzone_fraction=(
                             deadzone_fraction
                         ),
-                        fidelity_json=fidelity,
-                        out_root=MEMOQ_ROOT,
+                        fidelity_json=(
+                            fidelity
+                        ),
+                        out_root=(
+                            MEMOQ_ROOT
+                        ),
                     )
                 )
 
@@ -434,44 +708,74 @@ def conditions() -> List[Condition]:
         [
             Condition(
                 name="V4_det_B4",
-                run_dir=VANILLA4_RUN_DIR,
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="deterministic",
+                method=(
+                    "deterministic"
+                ),
                 state_bits=4,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             ),
             Condition(
                 name="V4_ef_B4",
-                run_dir=VANILLA4_RUN_DIR,
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="error_feedback",
+                method=(
+                    "error_feedback"
+                ),
                 state_bits=4,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             ),
             Condition(
                 name="V4_sr_B4",
-                run_dir=VANILLA4_RUN_DIR,
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="stochastic",
+                method=(
+                    "stochastic"
+                ),
                 state_bits=4,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             ),
             Condition(
                 name=(
                     "V4_residual_"
                     "FULL_HALFSTEP_B4"
                 ),
-                run_dir=VANILLA4_RUN_DIR,
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
                 method=(
                     "full_halfstep_residual"
                 ),
                 state_bits=4,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             ),
         ]
     )
@@ -483,14 +787,26 @@ def conditions() -> List[Condition]:
     ):
         result.append(
             Condition(
-                name=f"V4_residual_R{bits}_B4",
-                run_dir=VANILLA4_RUN_DIR,
+                name=(
+                    f"V4_residual_R{bits}_B4"
+                ),
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="quantized_residual",
+                method=(
+                    "quantized_residual"
+                ),
                 state_bits=4,
-                residual_bits=bits,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                residual_bits=(
+                    bits
+                ),
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             )
         )
 
@@ -513,16 +829,24 @@ def conditions() -> List[Condition]:
                         f"V4_scw_K{bits}_"
                         f"{deadzone_label}_B4"
                     ),
-                    run_dir=VANILLA4_RUN_DIR,
+                    run_dir=(
+                        VANILLA4_RUN_DIR
+                    ),
                     phase="VANILLA",
                     method="scw",
                     state_bits=4,
-                    counter_bits=bits,
+                    counter_bits=(
+                        bits
+                    ),
                     deadzone_fraction=(
                         deadzone_fraction
                     ),
-                    fidelity_json=V4_FIDELITY,
-                    out_root=V4_ROOT,
+                    fidelity_json=(
+                        V4_FIDELITY
+                    ),
+                    out_root=(
+                        V4_ROOT
+                    ),
                 )
             )
 
@@ -533,13 +857,25 @@ def conditions() -> List[Condition]:
     ):
         result.append(
             Condition(
-                name=f"V4_det_B{state_bits}",
-                run_dir=VANILLA4_RUN_DIR,
+                name=(
+                    f"V4_det_B{state_bits}"
+                ),
+                run_dir=(
+                    VANILLA4_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="deterministic",
-                state_bits=state_bits,
-                fidelity_json=V4_FIDELITY,
-                out_root=V4_ROOT,
+                method=(
+                    "deterministic"
+                ),
+                state_bits=(
+                    state_bits
+                ),
+                fidelity_json=(
+                    V4_FIDELITY
+                ),
+                out_root=(
+                    V4_ROOT
+                ),
             )
         )
 
@@ -547,36 +883,165 @@ def conditions() -> List[Condition]:
         [
             Condition(
                 name="V8_det_B8",
-                run_dir=VANILLA8_RUN_DIR,
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="deterministic",
+                method=(
+                    "deterministic"
+                ),
                 state_bits=8,
-                fidelity_json=V8_FIDELITY,
-                out_root=V8_ROOT,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
             ),
             Condition(
-                name="V8_forced_B4",
-                run_dir=VANILLA8_RUN_DIR,
+                name=(
+                    "V8_forced_B4"
+                ),
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
                 phase="VANILLA",
-                method="deterministic",
+                method=(
+                    "deterministic"
+                ),
                 state_bits=4,
-                fidelity_json=V8_FIDELITY,
-                out_root=V8_ROOT,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
+            ),
+            Condition(
+                name="V8_ef_B4",
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
+                phase="VANILLA",
+                method=(
+                    "error_feedback"
+                ),
+                state_bits=4,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
+            ),
+            Condition(
+                name=(
+                    "V8_residual_R2_B4"
+                ),
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
+                phase="VANILLA",
+                method=(
+                    "quantized_residual"
+                ),
+                state_bits=4,
+                residual_bits=2,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
+            ),
+            Condition(
+                name=(
+                    "V8_residual_R4_B4"
+                ),
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
+                phase="VANILLA",
+                method=(
+                    "quantized_residual"
+                ),
+                state_bits=4,
+                residual_bits=4,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
+            ),
+            Condition(
+                name=(
+                    "V8_scw_K4_TH1_8_B4"
+                ),
+                run_dir=(
+                    VANILLA8_RUN_DIR
+                ),
+                phase="VANILLA",
+                method="scw",
+                state_bits=4,
+                counter_bits=4,
+                deadzone_fraction=0.125,
+                fidelity_json=(
+                    V8_FIDELITY
+                ),
+                out_root=(
+                    V8_ROOT
+                ),
             ),
         ]
     )
 
     names = [
         condition.name
-        for condition in result
+        for condition
+        in result
     ]
 
-    if len(names) != len(set(names)):
+    if (
+        len(
+            names
+        )
+        != len(
+            set(
+                names
+            )
+        )
+    ):
         raise RuntimeError(
             "Condition matrix contains duplicate names"
         )
 
     return result
+
+
+def condition_by_name(
+    name: str,
+) -> Condition:
+    matches = [
+        condition
+        for condition
+        in conditions()
+        if condition.name
+        == name
+    ]
+
+    if len(
+        matches
+    ) != 1:
+        raise RuntimeError(
+            "Expected exactly one "
+            f"condition named {name}, "
+            f"found {len(matches)}"
+        )
+
+    return matches[
+        0
+    ]
 
 
 def submit_condition(
@@ -587,31 +1052,52 @@ def submit_condition(
         exist_ok=True,
     )
 
-    if condition.complete_flag.is_file():
+    if (
+        condition.complete_flag.is_file()
+    ):
         print(
-            f"[SKIP] complete: {condition.name}",
+            f"[SKIP] complete: "
+            f"{condition.name}",
             flush=True,
         )
+
         return
 
     command = [
         "sbatch",
         "--parsable",
-        f"--job-name=rm_{condition.name}",
-        str(GPU_WORKER),
-        str(condition.run_dir),
+        (
+            "--job-name="
+            f"rm_{condition.name}"
+        ),
+        str(
+            GPU_WORKER
+        ),
+        str(
+            condition.run_dir
+        ),
         condition.phase,
         condition.name,
         condition.method,
-        str(condition.state_bits),
-        str(condition.residual_bits),
-        str(condition.counter_bits),
+        str(
+            condition.state_bits
+        ),
+        str(
+            condition.residual_bits
+        ),
+        str(
+            condition.counter_bits
+        ),
         format(
             condition.deadzone_fraction,
             ".9g",
         ),
-        str(condition.out_dir),
-        str(condition.fidelity_json),
+        str(
+            condition.out_dir
+        ),
+        str(
+            condition.fidelity_json
+        ),
     ]
 
     job_id = run_checked(
@@ -619,13 +1105,98 @@ def submit_condition(
     )
 
     print(
-        f"[SUBMITTED] {condition.name}: {job_id}",
+        f"[SUBMITTED] "
+        f"{condition.name}: "
+        f"{job_id}",
+        flush=True,
+    )
+
+
+def stage_smoke() -> None:
+    V4_ROOT.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    smoke_condition = (
+        condition_by_name(
+            "V4_det_B4"
+        )
+    )
+
+    submit_condition(
+        smoke_condition
+    )
+
+    print(
+        "[NEXT] after V4_det_B4 "
+        "finishes successfully, run: "
+        "python "
+        "eval/submit_recurrent_memory_matrix.py "
+        "smoke-check",
+        flush=True,
+    )
+
+
+def stage_smoke_check() -> None:
+    smoke_condition = (
+        condition_by_name(
+            "V4_det_B4"
+        )
+    )
+
+    require_file(
+        smoke_condition.complete_flag
+    )
+
+    SMOKE_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    script = (
+        PROJECT_DIR
+        / "eval/validate_recurrent_memory_smoke.py"
+    )
+
+    run_checked(
+        [
+            sys.executable,
+            str(
+                script
+            ),
+            "--reference-dir",
+            str(
+                V4_NATIVE_REFERENCE_DIR
+            ),
+            "--new-dir",
+            str(
+                smoke_condition.out_dir
+            ),
+            "--out-dir",
+            str(
+                SMOKE_DIR
+            ),
+            "--absolute-tolerance",
+            "1e-6",
+        ]
+    )
+
+    require_file(
+        SMOKE_FLAG
+    )
+
+    print(
+        "[PASS] smoke validation passed. "
+        "Full condition matrix is authorized.",
         flush=True,
     )
 
 
 def stage_conditions() -> None:
-    all_conditions = conditions()
+    require_file(
+        SMOKE_FLAG
+    )
 
     for root in (
         MEMOQ_ROOT,
@@ -637,98 +1208,116 @@ def stage_conditions() -> None:
             exist_ok=True,
         )
 
-    for condition in all_conditions:
+    for condition in (
+        conditions()
+    ):
         submit_condition(
             condition
         )
 
     print(
-        "[DONE] condition submission pass complete. "
-        "Re-run this stage safely after failed jobs; "
-        "completed conditions are skipped.",
+        "[DONE] condition submission "
+        "pass complete. Re-running "
+        "this stage is safe; completed "
+        "conditions are skipped.",
         flush=True,
     )
 
 
 def require_condition_complete(
-    path: Path,
-) -> None:
-    require_file(
-        path
-        / "recurrent_memory_complete.flag"
+    condition_name: str,
+) -> Condition:
+    condition = (
+        condition_by_name(
+            condition_name
+        )
     )
 
     require_file(
-        path
+        condition.complete_flag
+    )
+
+    require_file(
+        condition.out_dir
         / "recurrent_memory_per_sequence.npz"
     )
 
     require_file(
-        path
+        condition.out_dir
         / "recurrent_memory_manifest.json"
     )
 
+    return condition
 
-def stage_lifetime() -> None:
-    reference_dir = (
-        MEMOQ_ROOT
-        / "P2E_identity"
+
+def submit_lifetime_pair(
+    reference_name: str,
+    condition_name: str,
+    out_dir: Path,
+) -> None:
+    reference = (
+        require_condition_complete(
+            reference_name
+        )
     )
 
-    condition_dir = (
-        MEMOQ_ROOT
-        / "P2F_det_B4"
+    condition = (
+        require_condition_complete(
+            condition_name
+        )
     )
 
-    require_condition_complete(
-        reference_dir
-    )
-
-    require_condition_complete(
-        condition_dir
-    )
-
-    LIFETIME_DIR.mkdir(
+    out_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
     complete_flag = (
-        LIFETIME_DIR
+        out_dir
         / "lifetime_binned_excess_error_complete.flag"
     )
 
     if complete_flag.is_file():
         print(
-            "[SKIP] lifetime analysis complete: "
-            f"{LIFETIME_DIR}",
+            "[SKIP] lifetime analysis "
+            f"complete: {out_dir}",
             flush=True,
         )
+
         return
 
     command = [
         "sbatch",
         "--parsable",
-        "--job-name=rm_lifetime",
-        str(CPU_WORKER),
+        (
+            "--job-name="
+            f"rm_life_{condition_name}"
+        ),
+        str(
+            CPU_WORKER
+        ),
         "lifetime",
         str(
-            reference_dir
+            reference.out_dir
             / "recurrent_memory_per_sequence.npz"
         ),
         str(
-            condition_dir
+            condition.out_dir
             / "recurrent_memory_per_sequence.npz"
         ),
         str(
-            reference_dir
+            reference.out_dir
             / "recurrent_memory_manifest.json"
         ),
         str(
-            condition_dir
+            condition.out_dir
             / "recurrent_memory_manifest.json"
         ),
-        str(LIFETIME_DIR),
+        reference_name,
+        condition_name,
+        str(
+            out_dir
+        ),
     ]
 
     job_id = run_checked(
@@ -736,38 +1325,71 @@ def stage_lifetime() -> None:
     )
 
     print(
-        f"[SUBMITTED] lifetime analysis: {job_id}",
+        "[SUBMITTED] lifetime "
+        f"{condition_name} vs "
+        f"{reference_name}: "
+        f"{job_id}",
         flush=True,
     )
 
 
+def stage_lifetime() -> None:
+    require_file(
+        SMOKE_FLAG
+    )
+
+    submit_lifetime_pair(
+        "P2E_identity",
+        "P2E_det_B4",
+        LIFETIME_P2E_DIR,
+    )
+
+    submit_lifetime_pair(
+        "P2F_identity",
+        "P2F_det_B4",
+        LIFETIME_P2F_DIR,
+    )
+
+
 def stage_aggregate() -> None:
-    all_conditions = conditions()
+    require_file(
+        SMOKE_FLAG
+    )
 
     missing = []
 
-    for condition in all_conditions:
-        if not condition.complete_flag.is_file():
+    for condition in (
+        conditions()
+    ):
+        if not (
+            condition.complete_flag.is_file()
+        ):
             missing.append(
                 str(
                     condition.complete_flag
                 )
             )
 
-    lifetime_flag = (
-        LIFETIME_DIR
-        / "lifetime_binned_excess_error_complete.flag"
-    )
-
-    if not lifetime_flag.is_file():
-        missing.append(
-            str(lifetime_flag)
-        )
+    for flag in (
+        LIFETIME_P2E_DIR
+        / "lifetime_binned_excess_error_complete.flag",
+        LIFETIME_P2F_DIR
+        / "lifetime_binned_excess_error_complete.flag",
+    ):
+        if not flag.is_file():
+            missing.append(
+                str(
+                    flag
+                )
+            )
 
     if missing:
         raise RuntimeError(
-            "Aggregation prerequisites are incomplete:\n  "
-            + "\n  ".join(missing)
+            "Aggregation prerequisites "
+            "are incomplete:\n  "
+            + "\n  ".join(
+                missing
+            )
         )
 
     STUDY_OUT_DIR.mkdir(
@@ -782,23 +1404,43 @@ def stage_aggregate() -> None:
 
     if complete_flag.is_file():
         print(
-            "[SKIP] aggregation already complete: "
+            "[SKIP] aggregation "
+            "already complete: "
             f"{STUDY_OUT_DIR}",
             flush=True,
         )
+
         return
 
     command = [
         "sbatch",
         "--parsable",
         "--job-name=rm_aggregate",
-        str(CPU_WORKER),
+        str(
+            CPU_WORKER
+        ),
         "aggregate",
-        str(MEMOQ_RUN_DIR),
-        str(VANILLA4_RUN_DIR),
-        str(VANILLA8_RUN_DIR),
-        str(LIFETIME_DIR),
-        str(STUDY_OUT_DIR),
+        str(
+            MEMOQ_RUN_DIR
+        ),
+        str(
+            VANILLA4_RUN_DIR
+        ),
+        str(
+            VANILLA8_RUN_DIR
+        ),
+        str(
+            LIFETIME_P2E_DIR
+        ),
+        str(
+            LIFETIME_P2F_DIR
+        ),
+        str(
+            SMOKE_DIR
+        ),
+        str(
+            STUDY_OUT_DIR
+        ),
     ]
 
     job_id = run_checked(
@@ -806,7 +1448,8 @@ def stage_aggregate() -> None:
     )
 
     print(
-        f"[SUBMITTED] aggregation: {job_id}",
+        "[SUBMITTED] aggregation: "
+        f"{job_id}",
         flush=True,
     )
 
@@ -816,20 +1459,44 @@ def main() -> None:
 
     static_checks()
 
-    if args.stage == "conditions":
+    if (
+        args.stage
+        == "smoke"
+    ):
+        stage_smoke()
+        return
+
+    if (
+        args.stage
+        == "smoke-check"
+    ):
+        stage_smoke_check()
+        return
+
+    if (
+        args.stage
+        == "conditions"
+    ):
         stage_conditions()
         return
 
-    if args.stage == "lifetime":
+    if (
+        args.stage
+        == "lifetime"
+    ):
         stage_lifetime()
         return
 
-    if args.stage == "aggregate":
+    if (
+        args.stage
+        == "aggregate"
+    ):
         stage_aggregate()
         return
 
     raise RuntimeError(
-        f"Unhandled stage: {args.stage}"
+        f"Unhandled stage: "
+        f"{args.stage}"
     )
 
 

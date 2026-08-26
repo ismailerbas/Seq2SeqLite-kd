@@ -17,3 +17,5 @@ eval/build_recurrent_memory_results.py text eol=lf
 eval/submit_recurrent_memory_matrix.py text eol=lf
 slurm/analyze_recurrent_memory text eol=lf
 slurm/analyze_recurrent_memory_cpu text eol=lf
+eval/recurrent_memory_stats.py text eol=lf
+eval/validate_recurrent_memory_smoke.py text eol=lf
