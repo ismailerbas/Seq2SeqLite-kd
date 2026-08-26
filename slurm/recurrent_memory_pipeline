@@ -1,0 +1,1088 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --time=00:45:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+MODE=${1:-bootstrap}
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+
+PIPELINE_SCRIPT="${PROJECT_DIR}/recurrent_memory_pipeline"
+GPU_WORKER="${PROJECT_DIR}/analyze_recurrent_memory"
+CPU_WORKER="${PROJECT_DIR}/analyze_recurrent_memory_cpu"
+
+ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_recurrent_memory.py"
+LIFETIME_SCRIPT="${PROJECT_DIR}/eval/analyze_lifetime_binned_error.py"
+AGGREGATE_SCRIPT="${PROJECT_DIR}/eval/build_recurrent_memory_results.py"
+STATS_SCRIPT="${PROJECT_DIR}/eval/recurrent_memory_stats.py"
+SMOKE_SCRIPT="${PROJECT_DIR}/eval/validate_recurrent_memory_smoke.py"
+BASE_ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_writeback.py"
+
+MEMOQ_RUN="${PROJECT_DIR}/results/paper_main_qkeras_matched_memoq_b4k4r4a4s4_gru32_dense3_effbs1024_microbs1024_lr1e-04_p1-40_2a30_2b30_2c10_2d10_2e30_2f30_p3-170_mse_q1_curr_nodither_aux0"
+MEMOQ_ROOT="${MEMOQ_RUN}/recurrent_memory_analysis"
+
+V4_RUN="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b4k4r4a4s4_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+V4_ROOT="${V4_RUN}/recurrent_memory_analysis"
+
+V8_RUN="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b8k8r8a8_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+V8_ROOT="${V8_RUN}/recurrent_memory_analysis"
+
+P2E_FIDELITY="${MEMOQ_RUN}/writeback_analysis/P2E_native/native_fidelity.json"
+P2F_FIDELITY="${MEMOQ_RUN}/writeback_analysis/P2F_native/native_fidelity.json"
+P3_FIDELITY="${MEMOQ_RUN}/writeback_analysis/P3_native/native_fidelity.json"
+
+V4_FIDELITY="${V4_RUN}/writeback_analysis/VANILLA4S4_native/native_fidelity.json"
+V8_FIDELITY="${V8_RUN}/writeback_analysis/VANILLA8_native/native_fidelity.json"
+
+V4_NATIVE_REFERENCE="${V4_RUN}/writeback_analysis/VANILLA4S4_native"
+V4_SMOKE_OUT="${V4_ROOT}/V4_det_B4"
+V4_SMOKE_CHECK="${V4_ROOT}/smoke_validation"
+V4_SMOKE_FLAG="${V4_SMOKE_CHECK}/recurrent_memory_smoke_validation_complete.flag"
+
+LIFETIME_P2E_DIR="${MEMOQ_ROOT}/lifetime_binned_P2E_det_vs_identity"
+LIFETIME_P2F_DIR="${MEMOQ_ROOT}/lifetime_binned_P2F_det_vs_identity"
+
+STUDY_OUT_DIR="${MEMOQ_RUN}/recurrent_memory_study"
+
+JOB_IDS=()
+
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+
+require_dir() {
+    local path=$1
+
+    if [[ ! -d "${path}" ]]; then
+        fatal "required directory does not exist: ${path}"
+    fi
+}
+
+
+require_file() {
+    local path=$1
+
+    if [[ ! -f "${path}" ]]; then
+        fatal "required file does not exist: ${path}"
+    fi
+}
+
+
+require_no_crlf() {
+    local path=$1
+
+    if grep -q $'\r' "${path}"; then
+        fatal "DOS CRLF line endings detected in ${path}. Run: sed -i 's/\r$//' ${path}"
+    fi
+}
+
+
+activate_environment() {
+    module purge
+    module load gcc/9.3.0/1
+
+    eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+    conda activate tf210_qkeras
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+
+    export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+    export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+    export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+    export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+    export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+    mkdir -p "${TMPDIR}"
+    mkdir -p "${PIP_CACHE_DIR}"
+    mkdir -p "${PIP_TMPDIR}"
+    mkdir -p "${MPLCONFIGDIR}"
+    mkdir -p "${XDG_CACHE_HOME}"
+}
+
+
+validate_fidelity_json() {
+    local path=$1
+
+    python - "${path}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+if payload.get("passed") is not True:
+    raise SystemExit(
+        f"native fidelity did not pass: {path}"
+    )
+
+print(f"[PREFLIGHT] fidelity passed: {path}")
+PY
+}
+
+
+preflight_common() {
+    log "Running preflight for mode=${MODE}"
+
+    cd "${PROJECT_DIR}"
+
+    command -v sbatch >/dev/null 2>&1 || fatal "sbatch is not available on this node"
+
+    require_dir "${PROJECT_DIR}"
+    require_dir "${DATA_DIR}"
+    require_dir "${MEMOQ_RUN}"
+    require_dir "${V4_RUN}"
+    require_dir "${V8_RUN}"
+
+    require_file "${PIPELINE_SCRIPT}"
+    require_file "${GPU_WORKER}"
+    require_file "${CPU_WORKER}"
+
+    require_file "${ANALYSIS_SCRIPT}"
+    require_file "${LIFETIME_SCRIPT}"
+    require_file "${AGGREGATE_SCRIPT}"
+    require_file "${STATS_SCRIPT}"
+    require_file "${SMOKE_SCRIPT}"
+    require_file "${BASE_ANALYSIS_SCRIPT}"
+
+    require_file "${P2E_FIDELITY}"
+    require_file "${P2F_FIDELITY}"
+    require_file "${P3_FIDELITY}"
+    require_file "${V4_FIDELITY}"
+    require_file "${V8_FIDELITY}"
+
+    require_file "${MEMOQ_RUN}/student_args.json"
+    require_file "${V4_RUN}/student_args.json"
+    require_file "${V8_RUN}/student_args.json"
+
+    require_file "${MEMOQ_RUN}/stage2e_best.weights.h5"
+    require_file "${MEMOQ_RUN}/stage2f_best.weights.h5"
+    require_file "${MEMOQ_RUN}/student_best.weights.h5"
+    require_file "${V4_RUN}/student_best.weights.h5"
+    require_file "${V8_RUN}/student_best.weights.h5"
+
+    require_file "${V4_NATIVE_REFERENCE}/writeback_summary.json"
+    require_file "${V4_NATIVE_REFERENCE}/writeback_manifest.json"
+    require_file "${V4_NATIVE_REFERENCE}/native_fidelity.json"
+
+    require_no_crlf "${PIPELINE_SCRIPT}"
+    require_no_crlf "${GPU_WORKER}"
+    require_no_crlf "${CPU_WORKER}"
+
+    bash -n "${PIPELINE_SCRIPT}"
+    bash -n "${GPU_WORKER}"
+    bash -n "${CPU_WORKER}"
+
+    activate_environment
+
+    python -m py_compile \
+        "${ANALYSIS_SCRIPT}" \
+        "${LIFETIME_SCRIPT}" \
+        "${AGGREGATE_SCRIPT}" \
+        "${STATS_SCRIPT}" \
+        "${SMOKE_SCRIPT}" \
+        "${BASE_ANALYSIS_SCRIPT}"
+
+    validate_fidelity_json "${P2E_FIDELITY}"
+    validate_fidelity_json "${P2F_FIDELITY}"
+    validate_fidelity_json "${P3_FIDELITY}"
+    validate_fidelity_json "${V4_FIDELITY}"
+    validate_fidelity_json "${V8_FIDELITY}"
+
+    mkdir -p "${MEMOQ_ROOT}"
+    mkdir -p "${V4_ROOT}"
+    mkdir -p "${V8_ROOT}"
+    mkdir -p "${V4_SMOKE_CHECK}"
+    mkdir -p "${LIFETIME_P2E_DIR}"
+    mkdir -p "${LIFETIME_P2F_DIR}"
+    mkdir -p "${STUDY_OUT_DIR}"
+
+    log "Preflight passed"
+}
+
+
+backup_completion_flag() {
+    local flag=$1
+
+    if [[ -f "${flag}" ]]; then
+        local timestamp
+        timestamp=$(date '+%Y%m%d_%H%M%S')
+
+        mv \
+            "${flag}" \
+            "${flag}.stale_${timestamp}"
+
+        log "Preserved stale completion flag as ${flag}.stale_${timestamp}"
+    fi
+}
+
+
+condition_matches_request() {
+    local out_dir=$1
+    local condition_name=$2
+    local run_dir=$3
+    local phase=$4
+    local method=$5
+    local state_bits=$6
+    local residual_bits=$7
+    local counter_bits=$8
+    local deadzone=$9
+    local fidelity_json=${10}
+
+    local complete_flag="${out_dir}/recurrent_memory_complete.flag"
+    local summary="${out_dir}/recurrent_memory_summary.json"
+    local manifest="${out_dir}/recurrent_memory_manifest.json"
+    local prediction="${out_dir}/recurrent_memory_per_sequence.npz"
+
+    if [[ ! -f "${complete_flag}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${summary}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${manifest}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${prediction}" ]]; then
+        return 1
+    fi
+
+    python - \
+        "${complete_flag}" \
+        "${summary}" \
+        "${manifest}" \
+        "${condition_name}" \
+        "${run_dir}" \
+        "${phase}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}" \
+        "${fidelity_json}" \
+        "${ANALYSIS_SCRIPT}" \
+        "${BASE_ANALYSIS_SCRIPT}" <<'PY'
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+(
+    complete_flag,
+    summary_path,
+    manifest_path,
+    condition_name,
+    run_dir,
+    phase,
+    method,
+    state_bits,
+    residual_bits,
+    counter_bits,
+    deadzone,
+    fidelity_json,
+    analysis_script,
+    base_analysis_script,
+) = sys.argv[1:]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+with open(complete_flag, "r", encoding="utf-8") as handle:
+    flag_value = handle.read().strip()
+
+if flag_value != condition_name:
+    raise SystemExit(1)
+
+with open(summary_path, "r", encoding="utf-8") as handle:
+    summary = json.load(handle)
+
+with open(manifest_path, "r", encoding="utf-8") as handle:
+    manifest = json.load(handle)
+
+if summary.get("condition_name") != condition_name:
+    raise SystemExit(1)
+
+if manifest.get("condition_name") != condition_name:
+    raise SystemExit(1)
+
+if summary.get("phase") != phase:
+    raise SystemExit(1)
+
+if manifest.get("phase") != phase:
+    raise SystemExit(1)
+
+if summary.get("method") != method:
+    raise SystemExit(1)
+
+if manifest.get("run_dir") != str(Path(run_dir).resolve()):
+    raise SystemExit(1)
+
+adapter = summary.get("adapter_equivalence")
+
+if not isinstance(adapter, dict) or adapter.get("passed") is not True:
+    raise SystemExit(1)
+
+operator = summary.get("operator")
+
+if not isinstance(operator, dict):
+    raise SystemExit(1)
+
+if int(operator.get("state_bits")) != int(state_bits):
+    raise SystemExit(1)
+
+expected_residual = int(residual_bits)
+
+if expected_residual >= 0:
+    if int(operator.get("residual_bits")) != expected_residual:
+        raise SystemExit(1)
+
+expected_counter = int(counter_bits)
+
+if expected_counter >= 0:
+    if int(operator.get("counter_bits")) != expected_counter:
+        raise SystemExit(1)
+
+expected_deadzone = float(deadzone)
+actual_deadzone = operator.get("deadzone_fraction_of_delta")
+
+if method == "scw":
+    if actual_deadzone is None:
+        raise SystemExit(1)
+
+    if not math.isclose(
+        float(actual_deadzone),
+        expected_deadzone,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise SystemExit(1)
+
+if manifest.get("analysis_script_sha256") != sha256_file(analysis_script):
+    raise SystemExit(1)
+
+if manifest.get("base_analysis_script_sha256") != sha256_file(base_analysis_script):
+    raise SystemExit(1)
+
+if manifest.get("fidelity_json_sha256") != sha256_file(fidelity_json):
+    raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+}
+
+
+verify_condition_output() {
+    local out_dir=$1
+    local condition_name=$2
+    local run_dir=$3
+    local phase=$4
+    local method=$5
+    local state_bits=$6
+    local residual_bits=$7
+    local counter_bits=$8
+    local deadzone=$9
+    local fidelity_json=${10}
+
+    if ! condition_matches_request \
+        "${out_dir}" \
+        "${condition_name}" \
+        "${run_dir}" \
+        "${phase}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}" \
+        "${fidelity_json}"
+    then
+        fatal "condition failed validation or is stale: ${condition_name}"
+    fi
+
+    log "Verified condition: ${condition_name}"
+}
+
+
+submit_condition() {
+    local run_dir=$1
+    local phase=$2
+    local condition_name=$3
+    local method=$4
+    local state_bits=$5
+    local residual_bits=$6
+    local counter_bits=$7
+    local deadzone=$8
+    local out_root=$9
+    local fidelity_json=${10}
+
+    local out_dir="${out_root}/${condition_name}"
+    local complete_flag="${out_dir}/recurrent_memory_complete.flag"
+
+    mkdir -p "${out_dir}"
+
+    if condition_matches_request \
+        "${out_dir}" \
+        "${condition_name}" \
+        "${run_dir}" \
+        "${phase}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}" \
+        "${fidelity_json}"
+    then
+        log "SKIP current completed condition: ${condition_name}"
+        return 0
+    fi
+
+    backup_completion_flag "${complete_flag}"
+
+    local job_id
+
+    job_id=$(
+        sbatch \
+            --parsable \
+            --job-name="rm_${condition_name}" \
+            "${GPU_WORKER}" \
+            "${run_dir}" \
+            "${phase}" \
+            "${condition_name}" \
+            "${method}" \
+            "${state_bits}" \
+            "${residual_bits}" \
+            "${counter_bits}" \
+            "${deadzone}" \
+            "${out_dir}" \
+            "${fidelity_json}"
+    )
+
+    [[ -n "${job_id}" ]] || fatal "sbatch returned no job ID for ${condition_name}"
+
+    JOB_IDS+=("${job_id}")
+
+    log "Submitted ${condition_name}: job ${job_id}"
+}
+
+
+submit_gate_after_current_jobs() {
+    local next_mode=$1
+    local job_name=$2
+
+    local gate_id
+
+    if (( ${#JOB_IDS[@]} == 0 )); then
+        gate_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${job_name}" \
+                "${PIPELINE_SCRIPT}" \
+                "${next_mode}"
+        )
+    else
+        local dependency
+
+        dependency=$(
+            IFS=:
+            echo "${JOB_IDS[*]}"
+        )
+
+        gate_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${job_name}" \
+                --dependency="afterany:${dependency}" \
+                "${PIPELINE_SCRIPT}" \
+                "${next_mode}"
+        )
+    fi
+
+    [[ -n "${gate_id}" ]] || fatal "failed to submit gate ${next_mode}"
+
+    log "Submitted gate ${next_mode}: job ${gate_id}"
+}
+
+
+submit_smoke_if_needed() {
+    JOB_IDS=()
+
+    submit_condition \
+        "${V4_RUN}" \
+        "VANILLA" \
+        "V4_det_B4" \
+        "deterministic" \
+        "4" \
+        "-1" \
+        "-1" \
+        "0" \
+        "${V4_ROOT}" \
+        "${V4_FIDELITY}"
+
+    submit_gate_after_current_jobs \
+        "after-smoke" \
+        "rm_gate_smoke"
+}
+
+
+run_smoke_validation() {
+    verify_condition_output \
+        "${V4_SMOKE_OUT}" \
+        "V4_det_B4" \
+        "${V4_RUN}" \
+        "VANILLA" \
+        "deterministic" \
+        "4" \
+        "-1" \
+        "-1" \
+        "0" \
+        "${V4_FIDELITY}"
+
+    backup_completion_flag "${V4_SMOKE_FLAG}"
+
+    python \
+        "${SMOKE_SCRIPT}" \
+        --reference-dir "${V4_NATIVE_REFERENCE}" \
+        --new-dir "${V4_SMOKE_OUT}" \
+        --out-dir "${V4_SMOKE_CHECK}" \
+        --absolute-tolerance 1e-6
+
+    require_file "${V4_SMOKE_FLAG}"
+
+    python - "${V4_SMOKE_CHECK}/recurrent_memory_smoke_validation.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+if payload.get("passed") is not True:
+    raise SystemExit(
+        "smoke validation JSON does not report passed=true"
+    )
+
+print("[SMOKE] validation passed")
+PY
+
+    log "Smoke validation passed"
+}
+
+
+submit_full_condition_matrix() {
+    JOB_IDS=()
+
+    submit_condition "${MEMOQ_RUN}" "P2E" "P2E_identity" "identity" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2E_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2E" "P2E_det_B4" "deterministic" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2E_FIDELITY}"
+
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_identity" "identity" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_det_B4" "deterministic" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_ef_B4" "error_feedback" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_sr_B4" "stochastic" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_residual_R2_B4" "quantized_residual" 4 2 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_residual_R3_B4" "quantized_residual" 4 3 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_residual_R4_B4" "quantized_residual" 4 4 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_residual_FULL_HALFSTEP_B4" "full_halfstep_residual" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K2_TH0_B4" "scw" 4 -1 2 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K2_TH1_8_B4" "scw" 4 -1 2 0.125 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K3_TH0_B4" "scw" 4 -1 3 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K3_TH1_8_B4" "scw" 4 -1 3 0.125 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K4_TH0_B4" "scw" 4 -1 4 0 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P2F" "P2F_scw_K4_TH1_8_B4" "scw" 4 -1 4 0.125 "${MEMOQ_ROOT}" "${P2F_FIDELITY}"
+
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_identity" "identity" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_det_B4" "deterministic" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_ef_B4" "error_feedback" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_sr_B4" "stochastic" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_residual_R2_B4" "quantized_residual" 4 2 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_residual_R3_B4" "quantized_residual" 4 3 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_residual_R4_B4" "quantized_residual" 4 4 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_residual_FULL_HALFSTEP_B4" "full_halfstep_residual" 4 -1 -1 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K2_TH0_B4" "scw" 4 -1 2 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K2_TH1_8_B4" "scw" 4 -1 2 0.125 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K3_TH0_B4" "scw" 4 -1 3 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K3_TH1_8_B4" "scw" 4 -1 3 0.125 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K4_TH0_B4" "scw" 4 -1 4 0 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+    submit_condition "${MEMOQ_RUN}" "P3" "P3_scw_K4_TH1_8_B4" "scw" 4 -1 4 0.125 "${MEMOQ_ROOT}" "${P3_FIDELITY}"
+
+    submit_condition "${V4_RUN}" "VANILLA" "V4_det_B4" "deterministic" 4 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_ef_B4" "error_feedback" 4 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_sr_B4" "stochastic" 4 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_residual_R2_B4" "quantized_residual" 4 2 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_residual_R3_B4" "quantized_residual" 4 3 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_residual_R4_B4" "quantized_residual" 4 4 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_residual_FULL_HALFSTEP_B4" "full_halfstep_residual" 4 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K2_TH0_B4" "scw" 4 -1 2 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K2_TH1_8_B4" "scw" 4 -1 2 0.125 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K3_TH0_B4" "scw" 4 -1 3 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K3_TH1_8_B4" "scw" 4 -1 3 0.125 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K4_TH0_B4" "scw" 4 -1 4 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_scw_K4_TH1_8_B4" "scw" 4 -1 4 0.125 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_det_B6" "deterministic" 6 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_det_B7" "deterministic" 7 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+    submit_condition "${V4_RUN}" "VANILLA" "V4_det_B8" "deterministic" 8 -1 -1 0 "${V4_ROOT}" "${V4_FIDELITY}"
+
+    submit_condition "${V8_RUN}" "VANILLA" "V8_det_B8" "deterministic" 8 -1 -1 0 "${V8_ROOT}" "${V8_FIDELITY}"
+    submit_condition "${V8_RUN}" "VANILLA" "V8_forced_B4" "deterministic" 4 -1 -1 0 "${V8_ROOT}" "${V8_FIDELITY}"
+    submit_condition "${V8_RUN}" "VANILLA" "V8_ef_B4" "error_feedback" 4 -1 -1 0 "${V8_ROOT}" "${V8_FIDELITY}"
+    submit_condition "${V8_RUN}" "VANILLA" "V8_residual_R2_B4" "quantized_residual" 4 2 -1 0 "${V8_ROOT}" "${V8_FIDELITY}"
+    submit_condition "${V8_RUN}" "VANILLA" "V8_residual_R4_B4" "quantized_residual" 4 4 -1 0 "${V8_ROOT}" "${V8_FIDELITY}"
+    submit_condition "${V8_RUN}" "VANILLA" "V8_scw_K4_TH1_8_B4" "scw" 4 -1 4 0.125 "${V8_ROOT}" "${V8_FIDELITY}"
+
+    submit_gate_after_current_jobs \
+        "after-conditions" \
+        "rm_gate_conditions"
+}
+
+
+verify_all_conditions() {
+    verify_condition_output "${MEMOQ_ROOT}/P2E_identity" "P2E_identity" "${MEMOQ_RUN}" "P2E" "identity" 4 -1 -1 0 "${P2E_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2E_det_B4" "P2E_det_B4" "${MEMOQ_RUN}" "P2E" "deterministic" 4 -1 -1 0 "${P2E_FIDELITY}"
+
+    verify_condition_output "${MEMOQ_ROOT}/P2F_identity" "P2F_identity" "${MEMOQ_RUN}" "P2F" "identity" 4 -1 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_det_B4" "P2F_det_B4" "${MEMOQ_RUN}" "P2F" "deterministic" 4 -1 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_ef_B4" "P2F_ef_B4" "${MEMOQ_RUN}" "P2F" "error_feedback" 4 -1 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_sr_B4" "P2F_sr_B4" "${MEMOQ_RUN}" "P2F" "stochastic" 4 -1 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_residual_R2_B4" "P2F_residual_R2_B4" "${MEMOQ_RUN}" "P2F" "quantized_residual" 4 2 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_residual_R3_B4" "P2F_residual_R3_B4" "${MEMOQ_RUN}" "P2F" "quantized_residual" 4 3 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_residual_R4_B4" "P2F_residual_R4_B4" "${MEMOQ_RUN}" "P2F" "quantized_residual" 4 4 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_residual_FULL_HALFSTEP_B4" "P2F_residual_FULL_HALFSTEP_B4" "${MEMOQ_RUN}" "P2F" "full_halfstep_residual" 4 -1 -1 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K2_TH0_B4" "P2F_scw_K2_TH0_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 2 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K2_TH1_8_B4" "P2F_scw_K2_TH1_8_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 2 0.125 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K3_TH0_B4" "P2F_scw_K3_TH0_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 3 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K3_TH1_8_B4" "P2F_scw_K3_TH1_8_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 3 0.125 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K4_TH0_B4" "P2F_scw_K4_TH0_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 4 0 "${P2F_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P2F_scw_K4_TH1_8_B4" "P2F_scw_K4_TH1_8_B4" "${MEMOQ_RUN}" "P2F" "scw" 4 -1 4 0.125 "${P2F_FIDELITY}"
+
+    verify_condition_output "${MEMOQ_ROOT}/P3_identity" "P3_identity" "${MEMOQ_RUN}" "P3" "identity" 4 -1 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_det_B4" "P3_det_B4" "${MEMOQ_RUN}" "P3" "deterministic" 4 -1 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_ef_B4" "P3_ef_B4" "${MEMOQ_RUN}" "P3" "error_feedback" 4 -1 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_sr_B4" "P3_sr_B4" "${MEMOQ_RUN}" "P3" "stochastic" 4 -1 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_residual_R2_B4" "P3_residual_R2_B4" "${MEMOQ_RUN}" "P3" "quantized_residual" 4 2 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_residual_R3_B4" "P3_residual_R3_B4" "${MEMOQ_RUN}" "P3" "quantized_residual" 4 3 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_residual_R4_B4" "P3_residual_R4_B4" "${MEMOQ_RUN}" "P3" "quantized_residual" 4 4 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_residual_FULL_HALFSTEP_B4" "P3_residual_FULL_HALFSTEP_B4" "${MEMOQ_RUN}" "P3" "full_halfstep_residual" 4 -1 -1 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K2_TH0_B4" "P3_scw_K2_TH0_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 2 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K2_TH1_8_B4" "P3_scw_K2_TH1_8_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 2 0.125 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K3_TH0_B4" "P3_scw_K3_TH0_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 3 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K3_TH1_8_B4" "P3_scw_K3_TH1_8_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 3 0.125 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K4_TH0_B4" "P3_scw_K4_TH0_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 4 0 "${P3_FIDELITY}"
+    verify_condition_output "${MEMOQ_ROOT}/P3_scw_K4_TH1_8_B4" "P3_scw_K4_TH1_8_B4" "${MEMOQ_RUN}" "P3" "scw" 4 -1 4 0.125 "${P3_FIDELITY}"
+
+    verify_condition_output "${V4_ROOT}/V4_det_B4" "V4_det_B4" "${V4_RUN}" "VANILLA" "deterministic" 4 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_ef_B4" "V4_ef_B4" "${V4_RUN}" "VANILLA" "error_feedback" 4 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_sr_B4" "V4_sr_B4" "${V4_RUN}" "VANILLA" "stochastic" 4 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_residual_R2_B4" "V4_residual_R2_B4" "${V4_RUN}" "VANILLA" "quantized_residual" 4 2 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_residual_R3_B4" "V4_residual_R3_B4" "${V4_RUN}" "VANILLA" "quantized_residual" 4 3 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_residual_R4_B4" "V4_residual_R4_B4" "${V4_RUN}" "VANILLA" "quantized_residual" 4 4 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_residual_FULL_HALFSTEP_B4" "V4_residual_FULL_HALFSTEP_B4" "${V4_RUN}" "VANILLA" "full_halfstep_residual" 4 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K2_TH0_B4" "V4_scw_K2_TH0_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 2 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K2_TH1_8_B4" "V4_scw_K2_TH1_8_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 2 0.125 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K3_TH0_B4" "V4_scw_K3_TH0_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 3 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K3_TH1_8_B4" "V4_scw_K3_TH1_8_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 3 0.125 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K4_TH0_B4" "V4_scw_K4_TH0_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 4 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_scw_K4_TH1_8_B4" "V4_scw_K4_TH1_8_B4" "${V4_RUN}" "VANILLA" "scw" 4 -1 4 0.125 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_det_B6" "V4_det_B6" "${V4_RUN}" "VANILLA" "deterministic" 6 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_det_B7" "V4_det_B7" "${V4_RUN}" "VANILLA" "deterministic" 7 -1 -1 0 "${V4_FIDELITY}"
+    verify_condition_output "${V4_ROOT}/V4_det_B8" "V4_det_B8" "${V4_RUN}" "VANILLA" "deterministic" 8 -1 -1 0 "${V4_FIDELITY}"
+
+    verify_condition_output "${V8_ROOT}/V8_det_B8" "V8_det_B8" "${V8_RUN}" "VANILLA" "deterministic" 8 -1 -1 0 "${V8_FIDELITY}"
+    verify_condition_output "${V8_ROOT}/V8_forced_B4" "V8_forced_B4" "${V8_RUN}" "VANILLA" "deterministic" 4 -1 -1 0 "${V8_FIDELITY}"
+    verify_condition_output "${V8_ROOT}/V8_ef_B4" "V8_ef_B4" "${V8_RUN}" "VANILLA" "error_feedback" 4 -1 -1 0 "${V8_FIDELITY}"
+    verify_condition_output "${V8_ROOT}/V8_residual_R2_B4" "V8_residual_R2_B4" "${V8_RUN}" "VANILLA" "quantized_residual" 4 2 -1 0 "${V8_FIDELITY}"
+    verify_condition_output "${V8_ROOT}/V8_residual_R4_B4" "V8_residual_R4_B4" "${V8_RUN}" "VANILLA" "quantized_residual" 4 4 -1 0 "${V8_FIDELITY}"
+    verify_condition_output "${V8_ROOT}/V8_scw_K4_TH1_8_B4" "V8_scw_K4_TH1_8_B4" "${V8_RUN}" "VANILLA" "scw" 4 -1 4 0.125 "${V8_FIDELITY}"
+
+    log "All recurrent-memory conditions verified"
+}
+
+
+lifetime_is_current() {
+    local out_dir=$1
+    local reference_name=$2
+    local condition_name=$3
+    local reference_manifest=$4
+    local condition_manifest=$5
+
+    local flag="${out_dir}/lifetime_binned_excess_error_complete.flag"
+    local json_path="${out_dir}/lifetime_binned_excess_error.json"
+    local csv_path="${out_dir}/lifetime_binned_excess_error.csv"
+
+    if [[ ! -f "${flag}" || ! -f "${json_path}" || ! -f "${csv_path}" ]]; then
+        return 1
+    fi
+
+    python - \
+        "${json_path}" \
+        "${reference_name}" \
+        "${condition_name}" \
+        "${reference_manifest}" \
+        "${condition_manifest}" \
+        "${LIFETIME_SCRIPT}" <<'PY'
+import hashlib
+import json
+import sys
+
+(
+    json_path,
+    reference_name,
+    condition_name,
+    reference_manifest,
+    condition_manifest,
+    lifetime_script,
+) = sys.argv[1:]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+with open(json_path, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+if payload.get("reference_name") != reference_name:
+    raise SystemExit(1)
+
+if payload.get("condition_name") != condition_name:
+    raise SystemExit(1)
+
+if payload.get("same_checkpoint_required") is not True:
+    raise SystemExit(1)
+
+if payload.get("reference_manifest_sha256") != sha256_file(reference_manifest):
+    raise SystemExit(1)
+
+if payload.get("condition_manifest_sha256") != sha256_file(condition_manifest):
+    raise SystemExit(1)
+
+if payload.get("analysis_script_sha256") != sha256_file(lifetime_script):
+    raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+}
+
+
+submit_lifetime_job() {
+    local reference_name=$1
+    local condition_name=$2
+    local reference_dir=$3
+    local condition_dir=$4
+    local out_dir=$5
+
+    local reference_npz="${reference_dir}/recurrent_memory_per_sequence.npz"
+    local condition_npz="${condition_dir}/recurrent_memory_per_sequence.npz"
+    local reference_manifest="${reference_dir}/recurrent_memory_manifest.json"
+    local condition_manifest="${condition_dir}/recurrent_memory_manifest.json"
+
+    require_file "${reference_npz}"
+    require_file "${condition_npz}"
+    require_file "${reference_manifest}"
+    require_file "${condition_manifest}"
+
+    mkdir -p "${out_dir}"
+
+    if lifetime_is_current \
+        "${out_dir}" \
+        "${reference_name}" \
+        "${condition_name}" \
+        "${reference_manifest}" \
+        "${condition_manifest}"
+    then
+        log "SKIP current lifetime analysis: ${condition_name} vs ${reference_name}"
+        return 0
+    fi
+
+    backup_completion_flag "${out_dir}/lifetime_binned_excess_error_complete.flag"
+
+    local job_id
+
+    job_id=$(
+        sbatch \
+            --parsable \
+            --job-name="rm_life_${condition_name}" \
+            "${CPU_WORKER}" \
+            lifetime \
+            "${reference_npz}" \
+            "${condition_npz}" \
+            "${reference_manifest}" \
+            "${condition_manifest}" \
+            "${reference_name}" \
+            "${condition_name}" \
+            "${out_dir}"
+    )
+
+    [[ -n "${job_id}" ]] || fatal "failed to submit lifetime analysis ${condition_name}"
+
+    JOB_IDS+=("${job_id}")
+
+    log "Submitted lifetime analysis ${condition_name} vs ${reference_name}: job ${job_id}"
+}
+
+
+submit_lifetime_stage() {
+    JOB_IDS=()
+
+    submit_lifetime_job \
+        "P2E_identity" \
+        "P2E_det_B4" \
+        "${MEMOQ_ROOT}/P2E_identity" \
+        "${MEMOQ_ROOT}/P2E_det_B4" \
+        "${LIFETIME_P2E_DIR}"
+
+    submit_lifetime_job \
+        "P2F_identity" \
+        "P2F_det_B4" \
+        "${MEMOQ_ROOT}/P2F_identity" \
+        "${MEMOQ_ROOT}/P2F_det_B4" \
+        "${LIFETIME_P2F_DIR}"
+
+    submit_gate_after_current_jobs \
+        "after-lifetime" \
+        "rm_gate_lifetime"
+}
+
+
+verify_lifetime_stage() {
+    if ! lifetime_is_current \
+        "${LIFETIME_P2E_DIR}" \
+        "P2E_identity" \
+        "P2E_det_B4" \
+        "${MEMOQ_ROOT}/P2E_identity/recurrent_memory_manifest.json" \
+        "${MEMOQ_ROOT}/P2E_det_B4/recurrent_memory_manifest.json"
+    then
+        fatal "P2E lifetime analysis failed or is stale"
+    fi
+
+    if ! lifetime_is_current \
+        "${LIFETIME_P2F_DIR}" \
+        "P2F_identity" \
+        "P2F_det_B4" \
+        "${MEMOQ_ROOT}/P2F_identity/recurrent_memory_manifest.json" \
+        "${MEMOQ_ROOT}/P2F_det_B4/recurrent_memory_manifest.json"
+    then
+        fatal "P2F lifetime analysis failed or is stale"
+    fi
+
+    log "Both lifetime analyses verified"
+}
+
+
+aggregate_is_current() {
+    local flag="${STUDY_OUT_DIR}/recurrent_memory_study_complete.flag"
+    local study_json="${STUDY_OUT_DIR}/recurrent_memory_study.json"
+
+    if [[ ! -f "${flag}" || ! -f "${study_json}" ]]; then
+        return 1
+    fi
+
+    local required_outputs=(
+        "${STUDY_OUT_DIR}/method_sweep.csv"
+        "${STUDY_OUT_DIR}/equal_storage_comparison.csv"
+        "${STUDY_OUT_DIR}/margin_decomposition.csv"
+        "${STUDY_OUT_DIR}/margin_histograms.csv"
+        "${STUDY_OUT_DIR}/margin_joint_gate_candidate.csv"
+        "${STUDY_OUT_DIR}/lifetime_binned_excess_error.csv"
+    )
+
+    local path
+
+    for path in "${required_outputs[@]}"; do
+        if [[ ! -f "${path}" ]]; then
+            return 1
+        fi
+    done
+
+    python - "${study_json}" "${AGGREGATE_SCRIPT}" <<'PY'
+import hashlib
+import json
+import os
+import sys
+
+study_json, aggregate_script = sys.argv[1:]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+
+with open(study_json, "r", encoding="utf-8") as handle:
+    payload = json.load(handle)
+
+if payload.get("passed") is not True:
+    raise SystemExit(1)
+
+if payload.get("analysis_script_sha256") != sha256_file(aggregate_script):
+    raise SystemExit(1)
+
+input_files = payload.get("input_files")
+
+if not isinstance(input_files, dict) or not input_files:
+    raise SystemExit(1)
+
+for path, expected_hash in input_files.items():
+    if not os.path.isfile(path):
+        raise SystemExit(1)
+
+    if sha256_file(path) != expected_hash:
+        raise SystemExit(1)
+
+raise SystemExit(0)
+PY
+}
+
+
+submit_aggregation() {
+    mkdir -p "${STUDY_OUT_DIR}"
+
+    if aggregate_is_current; then
+        log "SKIP current aggregation"
+        JOB_IDS=()
+        submit_gate_after_current_jobs \
+            "final-check" \
+            "rm_gate_final"
+        return
+    fi
+
+    backup_completion_flag "${STUDY_OUT_DIR}/recurrent_memory_study_complete.flag"
+
+    local aggregate_job
+
+    aggregate_job=$(
+        sbatch \
+            --parsable \
+            --job-name="rm_aggregate" \
+            "${CPU_WORKER}" \
+            aggregate \
+            "${MEMOQ_RUN}" \
+            "${V4_RUN}" \
+            "${V8_RUN}" \
+            "${LIFETIME_P2E_DIR}" \
+            "${LIFETIME_P2F_DIR}" \
+            "${V4_SMOKE_CHECK}" \
+            "${STUDY_OUT_DIR}"
+    )
+
+    [[ -n "${aggregate_job}" ]] || fatal "failed to submit aggregation"
+
+    JOB_IDS=("${aggregate_job}")
+
+    log "Submitted aggregation: job ${aggregate_job}"
+
+    submit_gate_after_current_jobs \
+        "final-check" \
+        "rm_gate_final"
+}
+
+
+run_final_check() {
+    if ! aggregate_is_current; then
+        fatal "final aggregation failed validation"
+    fi
+
+    log "============================================================"
+    log "RECURRENT-MEMORY PIPELINE PASSED"
+    log "============================================================"
+    log "Final study directory:"
+    log "${STUDY_OUT_DIR}"
+    log ""
+    log "Primary outputs:"
+    log "${STUDY_OUT_DIR}/method_sweep.csv"
+    log "${STUDY_OUT_DIR}/equal_storage_comparison.csv"
+    log "${STUDY_OUT_DIR}/margin_decomposition.csv"
+    log "${STUDY_OUT_DIR}/margin_histograms.csv"
+    log "${STUDY_OUT_DIR}/margin_joint_gate_candidate.csv"
+    log "${STUDY_OUT_DIR}/lifetime_binned_excess_error.csv"
+    log "${STUDY_OUT_DIR}/recurrent_memory_study.json"
+    log "${STUDY_OUT_DIR}/recurrent_memory_study_complete.flag"
+    log "============================================================"
+}
+
+
+case "${MODE}" in
+    bootstrap)
+        preflight_common
+        log "Starting automatic recurrent-memory pipeline"
+        submit_smoke_if_needed
+        ;;
+
+    after-smoke)
+        preflight_common
+        log "Smoke GPU stage terminated. Checking outputs before allowing the full matrix."
+        run_smoke_validation
+        submit_full_condition_matrix
+        ;;
+
+    after-conditions)
+        preflight_common
+        log "Condition jobs terminated. Validating every condition before lifetime analysis."
+        verify_all_conditions
+        submit_lifetime_stage
+        ;;
+
+    after-lifetime)
+        preflight_common
+        log "Lifetime jobs terminated. Validating paired same-checkpoint analyses before aggregation."
+        verify_all_conditions
+        verify_lifetime_stage
+        submit_aggregation
+        ;;
+
+    final-check)
+        preflight_common
+        log "Aggregation job terminated. Running final study validation."
+        verify_all_conditions
+        verify_lifetime_stage
+        run_final_check
+        ;;
+
+    *)
+        fatal "unknown MODE=${MODE}. Valid modes: bootstrap, after-smoke, after-conditions, after-lifetime, final-check"
+        ;;
+esac
