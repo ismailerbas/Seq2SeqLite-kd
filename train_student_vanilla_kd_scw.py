@@ -3157,34 +3157,81 @@ def build_scw_student(
     model = SCWStudentModel(
         seq_len=args.seq_len,
         n_out=args.n_out,
-        student_units=(
-            args.student_units
-        ),
-        bits_kernel=(
-            args.bits_kernel
-        ),
-        bits_recurrent=(
-            args.bits_recurrent
-        ),
-        bits_bias=(
-            args.bits_bias
-        ),
-        bits_activation=(
-            args.bits_activation
-        ),
-        bits_state=(
-            args.bits_state
-        ),
-        counter_bits=(
-            args.counter_bits
-        ),
-        deadzone_fraction=(
-            args.scw_deadzone_fraction
-        ),
-        q_alpha=(
-            args.q_alpha
-        ),
+        student_units=args.student_units,
+        bits_kernel=args.bits_kernel,
+        bits_recurrent=args.bits_recurrent,
+        bits_bias=args.bits_bias,
+        bits_activation=args.bits_activation,
+        bits_state=args.bits_state,
+        counter_bits=args.counter_bits,
+        deadzone_fraction=args.scw_deadzone_fraction,
+        q_alpha=args.q_alpha,
     )
+
+    if not model.sencgru.built:
+        model.sencgru.build(
+            tf.TensorShape(
+                [
+                    None,
+                    1,
+                ]
+            )
+        )
+
+    if not model.sdecgru.built:
+        model.sdecgru.build(
+            tf.TensorShape(
+                [
+                    None,
+                    1,
+                ]
+            )
+        )
+
+    if not model.sdec_dense.built:
+        model.sdec_dense.build(
+            tf.TensorShape(
+                [
+                    None,
+                    args.seq_len,
+                    args.student_units,
+                ]
+            )
+        )
+
+    for layer_name, layer in (
+        (
+            "sencgru",
+            model.sencgru,
+        ),
+        (
+            "sdecgru",
+            model.sdecgru,
+        ),
+    ):
+        if not layer.built:
+            raise RuntimeError(
+                f"{layer_name} did not build"
+            )
+
+        for attribute in (
+            "kernel",
+            "recurrent_kernel",
+            "bias",
+        ):
+            if not hasattr(
+                layer,
+                attribute,
+            ):
+                raise RuntimeError(
+                    f"{layer_name} failed to create "
+                    f"required variable {attribute}"
+                )
+
+    if not model.sdec_dense.built:
+        raise RuntimeError(
+            "sdec_dense did not build"
+        )
 
     dummy_enc = tf.zeros(
         (
@@ -3204,7 +3251,7 @@ def build_scw_student(
         tf.float32,
     )
 
-    _ = model(
+    output = model(
         [
             dummy_enc,
             dummy_dec,
@@ -3213,8 +3260,22 @@ def build_scw_student(
         operator_mode="scw",
     )
 
-    return model
+    expected_shape = (
+        1,
+        args.seq_len,
+        args.n_out,
+    )
 
+    if tuple(
+        output.shape
+    ) != expected_shape:
+        raise RuntimeError(
+            "Unexpected SCW model output shape: "
+            f"got {tuple(output.shape)}, "
+            f"expected {expected_shape}"
+        )
+
+    return model
 
 def train_step_per_replica(
     batch_x,

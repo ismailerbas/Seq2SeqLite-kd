@@ -24,3 +24,7 @@ train_student_vanilla_kd_scw.py text eol=lf
 slurm/studentvanilla_scw text eol=lf
 eval/build_v8_allocation_results.py text eol=lf
 slurm/v8_allocation_pipeline text eol=lf
+train_student_vanilla_kd_memory_campaign.py text eol=lf
+slurm/studentvanilla_memory_train text eol=lf
+slurm/recurrent_training_pipeline text eol=lf
+eval/build_recurrent_training_campaign.py text eol=lf

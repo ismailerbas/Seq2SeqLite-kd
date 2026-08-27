@@ -148,16 +148,7 @@ the output directory automatically).
 
 ---
 
-## Known bugs (open)
 
-- `train_student_vanilla_kd.py`: KL divergence loss applies `softmax` to regression outputs
-  (τ₁, τ₂, FRET). Should be replaced with plain MSE on teacher predictions. Fix in progress.
-- `train_student_vanilla_kd.py`: `--resume` flag not yet implemented. Preempted jobs restart
-  from epoch 0.
-- `train_student.py`: Teacher layer names (`enc_input` / `dec_input` with underscores) do not
-  match `train_teacher.py` (`encinput` / `decinput` without). Weight loading silently skips
-  mismatched layers. Fix by aligning both scripts to the no-underscore convention from
-  `train_teacher.py`.
 
 ---
 

@@ -1,0 +1,362 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=04:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@300
+
+set -euo pipefail
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
+PYTHON_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_memory_campaign.py"
+SCRIPT_PATH="${PROJECT_DIR}/studentvanilla_memory_train"
+TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
+TEACHER_CACHE="${DATA_PATH}/teacherPred_vanillaKD_L1351600000.npy"
+CAMPAIGN_SPEC="${CAMPAIGN_ROOT}/campaign_spec.json"
+
+CONDITION="${1:-}"
+INIT_SEED="${2:-}"
+RESUME_FLAG="${3:-}"
+
+case "${CONDITION}" in
+    b4|b6|r2|scw_k2)
+        ;;
+    *)
+        echo "FATAL: condition must be one of b4, b6, r2, scw_k2. Got: ${CONDITION:-<empty>}"
+        exit 1
+        ;;
+esac
+
+case "${INIT_SEED}" in
+    42|43|44)
+        ;;
+    *)
+        echo "FATAL: init seed must be one of 42, 43, 44. Got: ${INIT_SEED:-<empty>}"
+        exit 1
+        ;;
+esac
+
+if [[ -n "${RESUME_FLAG}" && "${RESUME_FLAG}" != "--resume" ]]; then
+    echo "FATAL: third argument must be --resume or empty. Got: ${RESUME_FLAG}"
+    exit 1
+fi
+
+JOB_NAME="vanilla_memory_${CONDITION}_seed${INIT_SEED}"
+JOB_DIR="${CAMPAIGN_ROOT}/results/${JOB_NAME}"
+FINAL_FLAG="${JOB_DIR}/campaign_training_complete.flag"
+TRAINING_FLAG="${JOB_DIR}/training_complete.flag"
+RESUME_STATE="${JOB_DIR}/resume_state.json"
+
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+    exit 1
+fi
+
+if [[ ! -d "${DATA_PATH}" ]]; then
+    echo "FATAL: data directory does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
+    echo "FATAL: campaign training script does not exist: ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+if [[ ! -f "${PROJECT_DIR}/train_student_vanilla_kd_scw.py" ]]; then
+    echo "FATAL: shared SCW source does not exist: ${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+    exit 1
+fi
+
+if [[ ! -f "${PROJECT_DIR}/train_student_vanilla_kd.py" ]]; then
+    echo "FATAL: vanilla source does not exist: ${PROJECT_DIR}/train_student_vanilla_kd.py"
+    exit 1
+fi
+
+if [[ ! -f "${TEACHER_WEIGHTS}" ]]; then
+    echo "FATAL: teacher checkpoint does not exist: ${TEACHER_WEIGHTS}"
+    exit 1
+fi
+
+if [[ ! -f "${TEACHER_CACHE}" ]]; then
+    echo "FATAL: locked teacher prediction cache does not exist: ${TEACHER_CACHE}"
+    exit 1
+fi
+
+if [[ ! -f "${CAMPAIGN_SPEC}" ]]; then
+    echo "FATAL: locked campaign specification does not exist: ${CAMPAIGN_SPEC}"
+    echo "Launch the campaign through recurrent_training_pipeline bootstrap."
+    exit 1
+fi
+
+if grep -q $'\r' "${SCRIPT_PATH}"; then
+    echo "FATAL: DOS CRLF line endings detected in ${SCRIPT_PATH}"
+    exit 1
+fi
+
+if grep -q $'\r' "${PYTHON_SCRIPT}"; then
+    echo "FATAL: DOS CRLF line endings detected in ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+if grep -q $'\r' "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"; then
+    echo "FATAL: DOS CRLF line endings detected in train_student_vanilla_kd_scw.py"
+    exit 1
+fi
+
+bash -n "${SCRIPT_PATH}"
+mkdir -p "${CAMPAIGN_ROOT}/results"
+mkdir -p "${JOB_DIR}"
+
+if [[ -f "${FINAL_FLAG}" ]]; then
+    echo "Campaign condition already complete: ${FINAL_FLAG}"
+    exit 0
+fi
+
+if [[ "${RESUME_FLAG}" == "--resume" ]]; then
+    if [[ ! -f "${RESUME_STATE}" && ! -f "${TRAINING_FLAG}" ]]; then
+        echo "FATAL: --resume requested but no resumable state exists."
+        echo "Expected one of:"
+        echo "  ${RESUME_STATE}"
+        echo "  ${TRAINING_FLAG}"
+        exit 1
+    fi
+fi
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+python - \
+    "${CAMPAIGN_SPEC}" \
+    "${CONDITION}" \
+    "${INIT_SEED}" \
+    "${PYTHON_SCRIPT}" \
+    "${PROJECT_DIR}/train_student_vanilla_kd.py" \
+    "${PROJECT_DIR}/train_student_vanilla_kd_scw.py" \
+    "${TEACHER_WEIGHTS}" \
+    "${TEACHER_CACHE}" <<'PY_VERIFY_SPEC'
+import hashlib
+import json
+import sys
+from pathlib import Path
+
+(
+    spec_path,
+    condition,
+    init_seed,
+    training_script,
+    baseline_script,
+    scw_script,
+    teacher_checkpoint,
+    teacher_cache,
+) = sys.argv[1:]
+init_seed = int(init_seed)
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        while True:
+            block = handle.read(1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+    return digest.hexdigest()
+
+with open(spec_path, "r", encoding="utf-8") as handle:
+    spec = json.load(handle)
+if spec.get("locked_before_training") is not True:
+    raise SystemExit("campaign specification is not locked_before_training")
+if condition not in spec.get("conditions", []):
+    raise SystemExit(f"condition {condition!r} is not in the locked campaign")
+if init_seed not in spec.get("init_seeds", []):
+    raise SystemExit(f"init seed {init_seed} is not in the locked campaign")
+expected = {
+    "split_seed": 42,
+    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "alpha": 0.6,
+    "temperature": 4.0,
+    "batch_size": 1024,
+    "report_all_conditions": True,
+}
+for key, value in expected.items():
+    if spec.get(key) != value:
+        raise SystemExit(
+            f"campaign specification mismatch for {key}: "
+            f"expected={value!r} got={spec.get(key)!r}"
+        )
+hashes = spec.get("script_hashes", {})
+expected_hashes = {
+    "training": sha256_file(training_script),
+    "baseline": sha256_file(baseline_script),
+    "scw": sha256_file(scw_script),
+}
+for key, value in expected_hashes.items():
+    if hashes.get(key) != value:
+        raise SystemExit(
+            f"campaign script hash mismatch for {key}: "
+            f"expected={value} got={hashes.get(key)}"
+        )
+if spec.get("teacher_checkpoint_sha256") != sha256_file(teacher_checkpoint):
+    raise SystemExit("teacher checkpoint hash differs from locked campaign specification")
+if spec.get("teacher_prediction_cache_sha256") != sha256_file(teacher_cache):
+    raise SystemExit("teacher prediction cache hash differs from locked campaign specification")
+print("CAMPAIGN_SPEC_VERIFIED")
+PY_VERIFY_SPEC
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${PIP_TMPDIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+
+python -m py_compile "${PYTHON_SCRIPT}"
+python -m py_compile "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+python -m py_compile "${PROJECT_DIR}/train_student_vanilla_kd.py"
+python -m py_compile "${PROJECT_DIR}/train_student_memoq.py"
+
+GPU_CHECK=$(python -c 'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' 2>/dev/null)
+
+if [[ -z "${GPU_CHECK}" || "${GPU_CHECK}" == "0" ]]; then
+    echo "FATAL: TensorFlow found zero GPUs."
+    exit 1
+fi
+
+echo "============================================================"
+echo "MATCHED RECURRENT-MEMORY TRAINING WORKER"
+echo "PROJECT_DIR          : ${PROJECT_DIR}"
+echo "DATA_PATH            : ${DATA_PATH}"
+echo "CAMPAIGN_ROOT        : ${CAMPAIGN_ROOT}"
+echo "JOB_DIR              : ${JOB_DIR}"
+echo "CONDITION            : ${CONDITION}"
+echo "INIT_SEED            : ${INIT_SEED}"
+echo "SPLIT_SEED           : 42"
+echo "ALPHA                : 0.6"
+echo "TEMPERATURE          : 4.0"
+echo "BATCH_SIZE           : 1024"
+echo "SCW                  : K2, theta=Delta/8"
+echo "R2                   : 2-bit quantized residual"
+echo "RESUME               : ${RESUME_FLAG:-off}"
+echo "TEACHER_WEIGHTS      : ${TEACHER_WEIGHTS}"
+echo "PYTHON               : $(which python)"
+echo "TF VERSION           : $(python -c 'import tensorflow as tf; print(tf.__version__)')"
+echo "QKERAS VERSION       : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo n/a)"
+echo "============================================================"
+
+cmd=(
+    python
+    "${PYTHON_SCRIPT}"
+    --condition "${CONDITION}"
+    --init-seed "${INIT_SEED}"
+    --data-dir "${DATA_PATH}"
+    --save-dir "${CAMPAIGN_ROOT}"
+    --teacher-ckpt "${TEACHER_WEIGHTS}"
+    --teacher-units 128
+    --teacher-layers 2
+    --student-units 32
+    --seq-len 135
+    --n-out 3
+    --gate-width-ns 0.09
+    --temperature 4.0
+    --alpha 0.6
+    --batch-size 1024
+    --accumulation-steps 1
+    --epochs 300
+    --patience 15
+    --min-delta 1e-5
+    --lr 1e-4
+    --ref-batch-size 1024
+    --lr-factor 0.5
+    --lr-patience 8
+    --lr-min 1e-6
+    --warmup-epochs 5
+    --infer-batch 4096
+    --log-interval 10
+    --prefetch-batches 32
+    --pipeline-workers 4
+    --split-seed 42
+)
+
+if [[ "${RESUME_FLAG}" == "--resume" ]]; then
+    cmd+=(--resume)
+fi
+
+PYTHON_PID=""
+STOP_REQUESTED=0
+
+handle_usr1() {
+    echo "============================================================"
+    echo "SIGUSR1 received by training worker."
+    echo "Forwarding SIGUSR1 to Python so it checkpoints after the current epoch."
+    echo "The pipeline gate will submit the continuation only after this job terminates."
+    echo "============================================================"
+    STOP_REQUESTED=1
+    if [[ -n "${PYTHON_PID}" ]] && kill -0 "${PYTHON_PID}" 2>/dev/null; then
+        kill -USR1 "${PYTHON_PID}"
+    fi
+}
+
+trap handle_usr1 SIGUSR1
+
+"${cmd[@]}" &
+PYTHON_PID=$!
+echo "Python PID=${PYTHON_PID}"
+
+set +e
+wait "${PYTHON_PID}"
+EXIT_CODE=$?
+set -e
+
+echo "Python exited with code ${EXIT_CODE}"
+
+if [[ -f "${FINAL_FLAG}" ]]; then
+    echo "Campaign condition completed successfully: ${FINAL_FLAG}"
+    exit 0
+fi
+
+if [[ "${EXIT_CODE}" != "0" ]]; then
+    echo "FATAL: Python exited with code ${EXIT_CODE}."
+    echo "No automatic continuation will be submitted for an unclassified Python failure."
+    exit "${EXIT_CODE}"
+fi
+
+if [[ "${STOP_REQUESTED}" == "1" ]]; then
+    if [[ ! -f "${RESUME_STATE}" && ! -f "${TRAINING_FLAG}" ]]; then
+        echo "FATAL: checkpoint stop was requested but no resumable state exists."
+        exit 1
+    fi
+    echo "Worker stopped cleanly with resumable state."
+    echo "The dependent pipeline gate will submit this condition with --resume."
+    exit 0
+fi
+
+if [[ -f "${RESUME_STATE}" || -f "${TRAINING_FLAG}" ]]; then
+    echo "Worker ended without the final campaign flag but resumable state exists."
+    echo "The dependent pipeline gate will submit this condition with --resume."
+    exit 0
+fi
+
+echo "FATAL: final completion flag is missing and no resumable state exists."
+exit 1

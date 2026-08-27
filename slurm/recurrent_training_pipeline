@@ -1,0 +1,738 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=2
+#SBATCH --time=01:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
+WORKER="${PROJECT_DIR}/studentvanilla_memory_train"
+TRAINING_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_memory_campaign.py"
+AGGREGATE_SCRIPT="${PROJECT_DIR}/eval/build_recurrent_training_campaign.py"
+PIPELINE_SCRIPT="${PROJECT_DIR}/recurrent_training_pipeline"
+TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
+TEACHER_CACHE="${DATA_PATH}/teacherPred_vanillaKD_L1351600000.npy"
+CAMPAIGN_SPEC="${CAMPAIGN_ROOT}/campaign_spec.json"
+MODE="${1:-bootstrap}"
+
+CONDITIONS=(b4 b6 r2 scw_k2)
+SEEDS=(42 43 44)
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+    [[ -f "${path}" ]] || fatal "required file does not exist: ${path}"
+}
+
+require_dir() {
+    local path="$1"
+    [[ -d "${path}" ]] || fatal "required directory does not exist: ${path}"
+}
+
+sha256_file() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+job_dir_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/results/vanilla_memory_%s_seed%s' "${CAMPAIGN_ROOT}" "${condition}" "${seed}"
+}
+
+completion_flag_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/campaign_training_complete.flag' "$(job_dir_for "${condition}" "${seed}")"
+}
+
+resume_state_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/resume_state.json' "$(job_dir_for "${condition}" "${seed}")"
+}
+
+training_flag_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/training_complete.flag' "$(job_dir_for "${condition}" "${seed}")"
+}
+
+provenance_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/run_provenance.json' "$(job_dir_for "${condition}" "${seed}")"
+}
+
+manifest_for() {
+    local condition="$1"
+    local seed="$2"
+    printf '%s/training_manifest.json' "$(job_dir_for "${condition}" "${seed}")"
+}
+
+preflight() {
+    log "Running recurrent training campaign preflight for mode=${MODE}"
+    require_dir "${PROJECT_DIR}"
+    require_dir "${DATA_PATH}"
+    cd "${PROJECT_DIR}"
+    require_file "${WORKER}"
+    require_file "${TRAINING_SCRIPT}"
+    require_file "${AGGREGATE_SCRIPT}"
+    require_file "${PIPELINE_SCRIPT}"
+    require_file "${PROJECT_DIR}/train_student_vanilla_kd.py"
+    require_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+    require_file "${PROJECT_DIR}/train_student_memoq.py"
+    require_file "${TEACHER_WEIGHTS}"
+    require_file "${TEACHER_CACHE}"
+
+    for file in \
+        "${WORKER}" \
+        "${TRAINING_SCRIPT}" \
+        "${AGGREGATE_SCRIPT}" \
+        "${PIPELINE_SCRIPT}" \
+        "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"; do
+        if grep -q $'\r' "${file}"; then
+            fatal "DOS CRLF line endings detected: ${file}"
+        fi
+    done
+
+    bash -n "${WORKER}"
+    bash -n "${PIPELINE_SCRIPT}"
+
+    module purge
+    module load gcc/9.3.0/1
+    eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+    conda activate tf210_qkeras
+
+    python -m py_compile "${TRAINING_SCRIPT}"
+    python -m py_compile "${AGGREGATE_SCRIPT}"
+    python -m py_compile "${PROJECT_DIR}/train_student_vanilla_kd.py"
+    python -m py_compile "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+    python -m py_compile "${PROJECT_DIR}/train_student_memoq.py"
+
+    python - "${TEACHER_CACHE}" <<'PY_CACHE_CHECK'
+import sys
+import numpy as np
+
+path = sys.argv[1]
+cache = np.load(path, mmap_mode="r")
+if cache.shape != (1600000, 135, 3):
+    raise SystemExit(f"teacher cache shape mismatch: {cache.shape}")
+if cache.dtype != np.float32:
+    raise SystemExit(f"teacher cache dtype mismatch: {cache.dtype}")
+print("TEACHER_CACHE_PASSED")
+PY_CACHE_CHECK
+
+    python - <<'PY_MODEL_SMOKE'
+from types import SimpleNamespace
+
+import numpy as np
+import tensorflow as tf
+
+import train_student_vanilla_kd_memory_campaign as campaign
+
+base = dict(
+    seq_len=135,
+    n_out=3,
+    student_units=32,
+    bits_kernel=4,
+    bits_recurrent=4,
+    bits_bias=4,
+    bits_activation=4,
+    bits_state=4,
+    q_alpha=1.0,
+    residual_bits=2,
+)
+dummy = tf.zeros((1, 135, 1), tf.float32)
+
+
+def native(state_bits):
+    tf.keras.utils.set_random_seed(42)
+    model = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, state_bits)
+    output = model([dummy, dummy], training=False)
+    if tuple(output.shape) != (1, 135, 3):
+        raise RuntimeError(
+            f"native B{state_bits} smoke output shape mismatch: {tuple(output.shape)}"
+        )
+    return model
+
+
+b4 = native(4)
+b6 = native(6)
+b4_weights = campaign.export_model_raw_weights(b4, "b4")
+b6_weights = campaign.export_model_raw_weights(b6, "b6")
+for key in sorted(b4_weights):
+    if not np.array_equal(b4_weights[key], b6_weights[key]):
+        raise RuntimeError(f"B4/B6 matched initialization failed for {key}")
+
+args = SimpleNamespace(**base)
+
+tf.keras.utils.set_random_seed(42)
+r2_reference = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, 4)
+r2 = campaign.R2StudentModel(args)
+campaign.build_custom_children(r2, args)
+r2_output = r2([dummy, dummy], training=False, operator_mode="r2")
+if tuple(r2_output.shape) != (1, 135, 3):
+    raise RuntimeError(f"r2 smoke output shape mismatch: {tuple(r2_output.shape)}")
+campaign.transfer_reference_weights(r2_reference, r2)
+r2_weights = campaign.export_model_raw_weights(r2, "r2")
+for key in sorted(b4_weights):
+    if not np.array_equal(b4_weights[key], r2_weights[key]):
+        raise RuntimeError(f"B4/R2 matched initialization failed for {key}")
+
+tf.keras.utils.set_random_seed(42)
+scw_reference = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, 4)
+scw = campaign.common.SCWStudentModel(
+    seq_len=135,
+    n_out=3,
+    student_units=32,
+    bits_kernel=4,
+    bits_recurrent=4,
+    bits_bias=4,
+    bits_activation=4,
+    bits_state=4,
+    counter_bits=2,
+    deadzone_fraction=0.125,
+    q_alpha=1.0,
+)
+campaign.build_custom_children(scw, args)
+scw_output = scw([dummy, dummy], training=False, operator_mode="scw")
+if tuple(scw_output.shape) != (1, 135, 3):
+    raise RuntimeError(f"scw_k2 smoke output shape mismatch: {tuple(scw_output.shape)}")
+campaign.transfer_reference_weights(scw_reference, scw)
+scw_weights = campaign.export_model_raw_weights(scw, "scw_k2")
+for key in sorted(b4_weights):
+    if not np.array_equal(b4_weights[key], scw_weights[key]):
+        raise RuntimeError(f"B4/SCW matched initialization failed for {key}")
+
+print("MODEL_SMOKE_PASSED")
+print("MATCHED_INITIALIZATION_SMOKE_PASSED")
+PY_MODEL_SMOKE
+
+    mkdir -p "${CAMPAIGN_ROOT}/results"
+    mkdir -p "${CAMPAIGN_ROOT}/aggregate"
+
+    command -v sbatch >/dev/null 2>&1 || fatal "sbatch is not available"
+    command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is not available"
+    log "Preflight passed"
+}
+
+write_or_verify_campaign_spec() {
+    local training_sha
+    local baseline_sha
+    local scw_sha
+    local aggregate_sha
+    local worker_sha
+    local pipeline_sha
+    local teacher_sha
+    local teacher_cache_sha
+    training_sha="$(sha256_file "${TRAINING_SCRIPT}")"
+    baseline_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd.py")"
+    scw_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py")"
+    aggregate_sha="$(sha256_file "${AGGREGATE_SCRIPT}")"
+    worker_sha="$(sha256_file "${WORKER}")"
+    pipeline_sha="$(sha256_file "${PIPELINE_SCRIPT}")"
+    teacher_sha="$(sha256_file "${TEACHER_WEIGHTS}")"
+    teacher_cache_sha="$(sha256_file "${TEACHER_CACHE}")"
+
+    if [[ ! -f "${CAMPAIGN_SPEC}" ]]; then
+        if find "${CAMPAIGN_ROOT}/results" -mindepth 1 -maxdepth 1 -type d -name 'vanilla_memory_*' -print -quit | grep -q .; then
+            fatal "campaign results already exist but campaign_spec.json is missing"
+        fi
+        python - \
+            "${CAMPAIGN_SPEC}" \
+            "${training_sha}" \
+            "${baseline_sha}" \
+            "${scw_sha}" \
+            "${aggregate_sha}" \
+            "${worker_sha}" \
+            "${pipeline_sha}" \
+            "${teacher_sha}" \
+            "${teacher_cache_sha}" <<'PY_CREATE_SPEC'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+(
+    path,
+    training_sha,
+    baseline_sha,
+    scw_sha,
+    aggregate_sha,
+    worker_sha,
+    pipeline_sha,
+    teacher_sha,
+    teacher_cache_sha,
+) = sys.argv[1:]
+payload = {
+    "created_utc": datetime.now(timezone.utc).isoformat(),
+    "locked_before_training": True,
+    "conditions": ["b4", "b6", "r2", "scw_k2"],
+    "init_seeds": [42, 43, 44],
+    "split_seed": 42,
+    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "alpha": 0.6,
+    "temperature": 4.0,
+    "batch_size": 1024,
+    "epochs_max": 300,
+    "early_stopping_patience": 15,
+    "min_delta": 1e-5,
+    "base_lr": 1e-4,
+    "lr_factor": 0.5,
+    "lr_patience": 8,
+    "lr_min": 1e-6,
+    "warmup_epochs": 5,
+    "b4": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 0,
+        "total_stored_bits_per_unit": 4,
+    },
+    "b6": {
+        "recurrence_visible_state_bits": 6,
+        "auxiliary_memory_bits": 0,
+        "total_stored_bits_per_unit": 6,
+        "kernel_recurrent_bias_activation_bits": 4,
+    },
+    "r2": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 2,
+        "total_stored_bits_per_unit": 6,
+        "residual_bits": 2,
+        "residual_levels": 4,
+        "auxiliary_gradient": "stop_gradient",
+    },
+    "scw_k2": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 2,
+        "total_stored_bits_per_unit": 6,
+        "counter_bits": 2,
+        "trigger_votes": 2,
+        "deadzone_fraction_of_delta": 0.125,
+        "counter_gradient": "none",
+    },
+    "report_all_conditions": True,
+    "script_hashes": {
+        "training": training_sha,
+        "baseline": baseline_sha,
+        "scw": scw_sha,
+        "aggregate": aggregate_sha,
+        "worker": worker_sha,
+        "pipeline": pipeline_sha,
+    },
+    "teacher_checkpoint_sha256": teacher_sha,
+    "teacher_prediction_cache": "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacherPred_vanillaKD_L1351600000.npy",
+    "teacher_prediction_cache_sha256": teacher_cache_sha,
+}
+target = Path(path)
+target.parent.mkdir(parents=True, exist_ok=True)
+tmp = target.with_suffix(target.suffix + ".tmp")
+with tmp.open("w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(tmp, target)
+PY_CREATE_SPEC
+        log "Created locked campaign specification: ${CAMPAIGN_SPEC}"
+    fi
+
+    python - \
+        "${CAMPAIGN_SPEC}" \
+        "${training_sha}" \
+        "${baseline_sha}" \
+        "${scw_sha}" \
+        "${aggregate_sha}" \
+        "${worker_sha}" \
+        "${pipeline_sha}" \
+        "${teacher_sha}" \
+        "${teacher_cache_sha}" <<'PY_VERIFY_SPEC'
+import json
+import math
+import sys
+
+(
+    path,
+    training_sha,
+    baseline_sha,
+    scw_sha,
+    aggregate_sha,
+    worker_sha,
+    pipeline_sha,
+    teacher_sha,
+    teacher_cache_sha,
+) = sys.argv[1:]
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+expected = {
+    "locked_before_training": True,
+    "conditions": ["b4", "b6", "r2", "scw_k2"],
+    "init_seeds": [42, 43, 44],
+    "split_seed": 42,
+    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "alpha": 0.6,
+    "temperature": 4.0,
+    "batch_size": 1024,
+    "report_all_conditions": True,
+    "teacher_checkpoint_sha256": teacher_sha,
+    "teacher_prediction_cache_sha256": teacher_cache_sha,
+}
+for key, value in expected.items():
+    actual = data.get(key)
+    if isinstance(value, float):
+        if not isinstance(actual, (int, float)) or not math.isclose(
+            float(actual), value, rel_tol=0.0, abs_tol=0.0
+        ):
+            raise SystemExit(
+                f"campaign spec mismatch {key}: expected={value!r} got={actual!r}"
+            )
+    elif actual != value:
+        raise SystemExit(
+            f"campaign spec mismatch {key}: expected={value!r} got={actual!r}"
+        )
+expected_hashes = {
+    "training": training_sha,
+    "baseline": baseline_sha,
+    "scw": scw_sha,
+    "aggregate": aggregate_sha,
+    "worker": worker_sha,
+    "pipeline": pipeline_sha,
+}
+if data.get("script_hashes") != expected_hashes:
+    raise SystemExit(
+        f"campaign spec script hash mismatch: expected={expected_hashes!r} "
+        f"got={data.get('script_hashes')!r}"
+    )
+PY_VERIFY_SPEC
+    log "Campaign specification verified"
+}
+
+verify_provenance() {
+    local condition="$1"
+    local seed="$2"
+    local provenance
+    provenance="$(provenance_for "${condition}" "${seed}")"
+    require_file "${provenance}"
+
+    local current_training_sha
+    local current_baseline_sha
+    local current_scw_sha
+    local current_teacher_sha
+    current_training_sha="$(sha256_file "${TRAINING_SCRIPT}")"
+    current_baseline_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd.py")"
+    current_scw_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py")"
+    current_teacher_sha="$(sha256_file "${TEACHER_WEIGHTS}")"
+
+    python - \
+        "${provenance}" \
+        "${condition}" \
+        "${seed}" \
+        "${current_training_sha}" \
+        "${current_baseline_sha}" \
+        "${current_scw_sha}" \
+        "${current_teacher_sha}" <<'PY'
+import json
+import math
+import sys
+
+(
+    path,
+    condition,
+    seed,
+    training_sha,
+    baseline_sha,
+    scw_sha,
+    teacher_sha,
+) = sys.argv[1:]
+seed = int(seed)
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+expected = {
+    "condition": condition,
+    "init_seed": seed,
+    "split_seed": 42,
+    "alpha": 0.6,
+    "temperature": 4.0,
+    "training_script_sha256": training_sha,
+    "baseline_source_sha256": baseline_sha,
+    "scw_source_sha256": scw_sha,
+    "teacher_checkpoint_sha256": teacher_sha,
+    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+}
+for key, value in expected.items():
+    actual = data.get(key)
+    if isinstance(value, float):
+        if not isinstance(actual, (int, float)) or not math.isclose(
+            float(actual), value, rel_tol=0.0, abs_tol=0.0
+        ):
+            raise SystemExit(
+                f"provenance mismatch {key}: expected={value!r} got={actual!r}"
+            )
+    elif actual != value:
+        raise SystemExit(
+            f"provenance mismatch {key}: expected={value!r} got={actual!r}"
+        )
+PY
+}
+
+verify_completed_condition() {
+    local condition="$1"
+    local seed="$2"
+    local dir
+    dir="$(job_dir_for "${condition}" "${seed}")"
+    require_file "${dir}/campaign_training_complete.flag"
+    require_file "${dir}/training_complete.flag"
+    require_file "${dir}/training_manifest.json"
+    require_file "${dir}/test_metrics.json"
+    require_file "${dir}/test_per_sequence.npz"
+    require_file "${dir}/student_best.weights.h5"
+    require_file "${dir}/student_final.weights.h5"
+    require_file "${dir}/initial_weights.npz"
+    verify_provenance "${condition}" "${seed}"
+
+    local current_training_sha
+    current_training_sha="$(sha256_file "${TRAINING_SCRIPT}")"
+    python - \
+        "${dir}/training_manifest.json" \
+        "${condition}" \
+        "${seed}" \
+        "${current_training_sha}" <<'PY'
+import json
+import math
+import sys
+
+path, condition, seed, training_sha = sys.argv[1:]
+seed = int(seed)
+with open(path, "r", encoding="utf-8") as handle:
+    data = json.load(handle)
+expected = {
+    "training_complete": True,
+    "condition": condition,
+    "init_seed": seed,
+    "split_seed": 42,
+    "alpha": 0.6,
+    "temperature": 4.0,
+    "training_script_sha256": training_sha,
+    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+}
+for key, value in expected.items():
+    actual = data.get(key)
+    if isinstance(value, float):
+        if not isinstance(actual, (int, float)) or not math.isclose(
+            float(actual), value, rel_tol=0.0, abs_tol=0.0
+        ):
+            raise SystemExit(
+                f"manifest mismatch {key}: expected={value!r} got={actual!r}"
+            )
+    elif actual != value:
+        raise SystemExit(
+            f"manifest mismatch {key}: expected={value!r} got={actual!r}"
+        )
+storage = {
+    "b4": (4, 0, 4),
+    "b6": (6, 0, 6),
+    "r2": (4, 2, 6),
+    "scw_k2": (4, 2, 6),
+}[condition]
+actual_storage = (
+    data.get("recurrence_visible_state_bits"),
+    data.get("auxiliary_memory_bits"),
+    data.get("total_stored_bits_per_unit"),
+)
+if actual_storage != storage:
+    raise SystemExit(
+        f"storage mismatch: expected={storage!r} got={actual_storage!r}"
+    )
+operator = data.get("operator", {})
+if condition == "scw_k2":
+    if operator.get("counter_bits") != 2:
+        raise SystemExit("SCW counter_bits is not 2")
+    if operator.get("trigger_votes") != 2:
+        raise SystemExit("SCW trigger_votes is not 2")
+    if float(operator.get("deadzone_fraction_of_delta")) != 0.125:
+        raise SystemExit("SCW dead-zone fraction is not 0.125")
+if condition == "r2":
+    if operator.get("residual_bits") != 2:
+        raise SystemExit("R2 residual_bits is not 2")
+    if operator.get("residual_levels") != 4:
+        raise SystemExit("R2 residual_levels is not 4")
+PY
+}
+
+submit_worker() {
+    local condition="$1"
+    local seed="$2"
+    local resume_mode="$3"
+    local job_id
+    local job_name="mem_${condition}_s${seed}"
+
+    if [[ "${resume_mode}" == "resume" ]]; then
+        log "Submitting resume: condition=${condition} seed=${seed}"
+        job_id=$(sbatch --parsable --job-name="${job_name}" "${WORKER}" "${condition}" "${seed}" --resume)
+    else
+        log "Submitting fresh: condition=${condition} seed=${seed}"
+        job_id=$(sbatch --parsable --job-name="${job_name}" "${WORKER}" "${condition}" "${seed}")
+    fi
+    [[ -n "${job_id}" ]] || fatal "sbatch returned an empty job ID for ${condition} seed ${seed}"
+    SUBMITTED_JOB_IDS+=("${job_id}")
+    log "Submitted ${condition} seed ${seed} as job ${job_id}"
+}
+
+submit_gate_after_jobs() {
+    local dependency
+    local old_ifs="${IFS}"
+    IFS=:
+    dependency="${SUBMITTED_JOB_IDS[*]}"
+    IFS="${old_ifs}"
+    [[ -n "${dependency}" ]] || fatal "cannot submit gate with empty dependency"
+    local gate_id
+    gate_id=$(sbatch \
+        --parsable \
+        --dependency="afterany:${dependency}" \
+        --job-name="mem_train_gate" \
+        "${PIPELINE_SCRIPT}" \
+        gate)
+    [[ -n "${gate_id}" ]] || fatal "failed to submit dependent training gate"
+    log "Submitted dependent gate job ${gate_id} after ${dependency}"
+}
+
+run_bootstrap() {
+    SUBMITTED_JOB_IDS=()
+    for condition in "${CONDITIONS[@]}"; do
+        for seed in "${SEEDS[@]}"; do
+            local final_flag
+            local provenance
+            local resume_state
+            local training_flag
+            final_flag="$(completion_flag_for "${condition}" "${seed}")"
+            provenance="$(provenance_for "${condition}" "${seed}")"
+            resume_state="$(resume_state_for "${condition}" "${seed}")"
+            training_flag="$(training_flag_for "${condition}" "${seed}")"
+
+            if [[ -f "${final_flag}" ]]; then
+                verify_completed_condition "${condition}" "${seed}"
+                log "Already complete and current: ${condition} seed ${seed}"
+                continue
+            fi
+
+            if [[ -f "${resume_state}" || -f "${training_flag}" ]]; then
+                verify_provenance "${condition}" "${seed}"
+                submit_worker "${condition}" "${seed}" resume
+                continue
+            fi
+
+            if [[ -f "${provenance}" ]]; then
+                verify_provenance "${condition}" "${seed}"
+                fatal "${condition} seed ${seed} has provenance but no completion or resumable state; inspect its failed SLURM log before restarting"
+            fi
+
+            submit_worker "${condition}" "${seed}" fresh
+        done
+    done
+
+    if [[ "${#SUBMITTED_JOB_IDS[@]}" -gt 0 ]]; then
+        submit_gate_after_jobs
+        log "Bootstrap submission complete"
+        return
+    fi
+
+    log "No training workers were required; running gate immediately"
+    run_gate
+}
+
+run_gate() {
+    SUBMITTED_JOB_IDS=()
+    local hard_failure=0
+
+    for condition in "${CONDITIONS[@]}"; do
+        for seed in "${SEEDS[@]}"; do
+            local final_flag
+            local provenance
+            local resume_state
+            local training_flag
+            final_flag="$(completion_flag_for "${condition}" "${seed}")"
+            provenance="$(provenance_for "${condition}" "${seed}")"
+            resume_state="$(resume_state_for "${condition}" "${seed}")"
+            training_flag="$(training_flag_for "${condition}" "${seed}")"
+
+            if [[ -f "${final_flag}" ]]; then
+                verify_completed_condition "${condition}" "${seed}"
+                log "Verified complete: ${condition} seed ${seed}"
+                continue
+            fi
+
+            if [[ -f "${resume_state}" || -f "${training_flag}" ]]; then
+                verify_provenance "${condition}" "${seed}"
+                submit_worker "${condition}" "${seed}" resume
+                continue
+            fi
+
+            if [[ -f "${provenance}" ]]; then
+                log "HARD FAILURE: ${condition} seed ${seed} has no resumable checkpoint"
+                hard_failure=1
+            else
+                log "HARD FAILURE: ${condition} seed ${seed} never created run provenance"
+                hard_failure=1
+            fi
+        done
+    done
+
+    if [[ "${hard_failure}" -ne 0 ]]; then
+        fatal "at least one training condition failed before a safe resume point; no downstream aggregation was submitted"
+    fi
+
+    if [[ "${#SUBMITTED_JOB_IDS[@]}" -gt 0 ]]; then
+        submit_gate_after_jobs
+        log "Resumable conditions were resubmitted; aggregation remains blocked"
+        return
+    fi
+
+    log "All 12 training conditions are complete and current"
+    log "Running aggregate analysis inside this dependent SLURM gate"
+
+    module purge
+    module load gcc/9.3.0/1
+    eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+    conda activate tf210_qkeras
+
+    python "${AGGREGATE_SCRIPT}" \
+        --campaign-root "${CAMPAIGN_ROOT}" \
+        --training-script "${TRAINING_SCRIPT}"
+
+    require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_summary.json"
+    require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_seed_metrics.csv"
+    require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_complete.flag"
+    log "Training campaign aggregate passed"
+    log "Summary: ${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_summary.json"
+    log "CSV: ${CAMPAIGN_ROOT}/aggregate/trained_memory_seed_metrics.csv"
+}
+
+preflight
+write_or_verify_campaign_spec
+
+case "${MODE}" in
+    bootstrap)
+        run_bootstrap
+        ;;
+    gate)
+        run_gate
+        ;;
+    *)
+        fatal "unsupported mode: ${MODE}; expected bootstrap or gate"
+        ;;
+esac
