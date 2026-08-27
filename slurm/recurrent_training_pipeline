@@ -11,12 +11,13 @@
 set -euo pipefail
 
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+SLURM_DIR="${PROJECT_DIR}/slurm"
 DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
-WORKER="${PROJECT_DIR}/studentvanilla_memory_train"
+WORKER="${SLURM_DIR}/studentvanilla_memory_train"
 TRAINING_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_memory_campaign.py"
 AGGREGATE_SCRIPT="${PROJECT_DIR}/eval/build_recurrent_training_campaign.py"
-PIPELINE_SCRIPT="${PROJECT_DIR}/recurrent_training_pipeline"
+PIPELINE_SCRIPT="${SLURM_DIR}/recurrent_training_pipeline"
 TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
 TEACHER_CACHE="${DATA_PATH}/teacherPred_vanillaKD_L1351600000.npy"
 CAMPAIGN_SPEC="${CAMPAIGN_ROOT}/campaign_spec.json"
@@ -72,6 +73,14 @@ training_flag_for() {
     printf '%s/training_complete.flag' "$(job_dir_for "${condition}" "${seed}")"
 }
 
+resume_request_flag_for() {
+    local condition="$1"
+    local seed="$2"
+
+    printf '%s/pipeline_resume_requested.flag' \
+        "$(job_dir_for "${condition}" "${seed}")"
+}
+
 provenance_for() {
     local condition="$1"
     local seed="$2"
@@ -86,9 +95,13 @@ manifest_for() {
 
 preflight() {
     log "Running recurrent training campaign preflight for mode=${MODE}"
+
     require_dir "${PROJECT_DIR}"
+    require_dir "${SLURM_DIR}"
     require_dir "${DATA_PATH}"
+
     cd "${PROJECT_DIR}"
+
     require_file "${WORKER}"
     require_file "${TRAINING_SCRIPT}"
     require_file "${AGGREGATE_SCRIPT}"
@@ -115,6 +128,7 @@ preflight() {
 
     module purge
     module load gcc/9.3.0/1
+
     eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
     conda activate tf210_qkeras
 
@@ -126,24 +140,499 @@ preflight() {
 
     python - "${TEACHER_CACHE}" <<'PY_CACHE_CHECK'
 import sys
+
 import numpy as np
 
 path = sys.argv[1]
-cache = np.load(path, mmap_mode="r")
-if cache.shape != (1600000, 135, 3):
-    raise SystemExit(f"teacher cache shape mismatch: {cache.shape}")
+
+cache = np.load(
+    path,
+    mmap_mode="r",
+)
+
+if cache.shape != (
+    1600000,
+    135,
+    3,
+):
+    raise SystemExit(
+        "teacher cache shape "
+        f"mismatch: {cache.shape}"
+    )
+
 if cache.dtype != np.float32:
-    raise SystemExit(f"teacher cache dtype mismatch: {cache.dtype}")
-print("TEACHER_CACHE_PASSED")
+    raise SystemExit(
+        "teacher cache dtype "
+        f"mismatch: {cache.dtype}"
+    )
+
+print(
+    "TEACHER_CACHE_PASSED"
+)
 PY_CACHE_CHECK
 
-    python - <<'PY_MODEL_SMOKE'
+    python - \
+        "${DATA_PATH}" \
+        "${TEACHER_CACHE}" <<'PY_MODEL_SMOKE'
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import tensorflow as tf
 
 import train_student_vanilla_kd_memory_campaign as campaign
+
+
+data_path = sys.argv[1]
+teacher_cache_path = sys.argv[2]
+
+(
+    file_input,
+    file_res,
+    _,
+    _,
+    file_val,
+    _,
+) = campaign.common.find_data_files(
+    data_path,
+    135,
+)
+
+normalized_input = np.load(
+    file_input,
+    mmap_mode="r",
+)
+
+targets = np.load(
+    file_res,
+    mmap_mode="r",
+)
+
+validation_indices = np.asarray(
+    np.load(
+        file_val
+    ),
+    dtype=np.int64,
+)
+
+teacher_cache = np.load(
+    teacher_cache_path,
+    mmap_mode="r",
+)
+
+if len(
+    validation_indices
+) < 2:
+    raise RuntimeError(
+        "Real validation smoke "
+        "requires at least two "
+        "validation samples"
+    )
+
+rows = validation_indices[
+    :2
+]
+
+enc = tf.constant(
+    np.asarray(
+        normalized_input[
+            rows
+        ],
+        dtype=np.float32,
+    ),
+    dtype=tf.float32,
+)
+
+dec = tf.zeros(
+    (
+        len(
+            rows
+        ),
+        135,
+        1,
+    ),
+    dtype=tf.float32,
+)
+
+target = tf.constant(
+    np.asarray(
+        targets[
+            rows
+        ],
+        dtype=np.float32,
+    ),
+    dtype=tf.float32,
+)
+
+teacher = tf.constant(
+    np.asarray(
+        teacher_cache[
+            rows
+        ],
+        dtype=np.float32,
+    ),
+    dtype=tf.float32,
+)
+
+expected_output_shape = (
+    len(
+        rows
+    ),
+    135,
+    3,
+)
+
+
+def require_finite_output(
+    label,
+    output,
+):
+    output_array = np.asarray(
+        output.numpy(),
+        dtype=np.float32,
+    )
+
+    if (
+        output_array.shape
+        != expected_output_shape
+    ):
+        raise RuntimeError(
+            f"{label} output shape "
+            f"mismatch: "
+            f"{output_array.shape}"
+        )
+
+    if not np.all(
+        np.isfinite(
+            output_array
+        )
+    ):
+        raise RuntimeError(
+            f"{label} produced "
+            "non-finite output"
+        )
+
+
+def require_weights_equal(
+    reference,
+    alternative,
+    label,
+):
+    if (
+        set(
+            reference
+        )
+        != set(
+            alternative
+        )
+    ):
+        raise RuntimeError(
+            f"{label} initial-weight "
+            "keys differ"
+        )
+
+    for key in sorted(
+        reference
+    ):
+        if not np.array_equal(
+            reference[
+                key
+            ],
+            alternative[
+                key
+            ],
+        ):
+            max_abs = float(
+                np.max(
+                    np.abs(
+                        reference[
+                            key
+                        ]
+                        - alternative[
+                            key
+                        ]
+                    )
+                )
+            )
+
+            raise RuntimeError(
+                f"{label} matched "
+                "initialization failed "
+                f"for {key}: "
+                f"max_abs={max_abs:.9g}"
+            )
+
+
+def require_deterministic_equivalence(
+    reference_model,
+    custom_model,
+    label,
+):
+    reference_output = (
+        reference_model(
+            [
+                enc,
+                dec,
+            ],
+            training=False,
+        )
+    )
+
+    custom_output = (
+        custom_model(
+            [
+                enc,
+                dec,
+            ],
+            training=False,
+            operator_mode=(
+                "deterministic"
+            ),
+        )
+    )
+
+    reference_array = np.asarray(
+        reference_output.numpy(),
+        dtype=np.float32,
+    )
+
+    custom_array = np.asarray(
+        custom_output.numpy(),
+        dtype=np.float32,
+    )
+
+    difference = np.abs(
+        reference_array
+        - custom_array
+    ).astype(
+        np.float64
+    )
+
+    max_abs = float(
+        np.max(
+            difference
+        )
+    )
+
+    mean_abs = float(
+        np.mean(
+            difference
+        )
+    )
+
+    if (
+        max_abs
+        > 5e-5
+        or mean_abs
+        > 5e-5
+    ):
+        raise RuntimeError(
+            f"{label} deterministic "
+            "equivalence failed: "
+            f"max_abs={max_abs:.9g} "
+            f"mean_abs={mean_abs:.9g}"
+        )
+
+
+def require_gradient_probe(
+    model,
+    condition,
+):
+    with tf.GradientTape() as tape:
+        output = (
+            campaign.model_forward(
+                model,
+                condition,
+                enc,
+                dec,
+                True,
+            )
+        )
+
+        hard_loss = (
+            tf.reduce_mean(
+                tf.square(
+                    output
+                    - target
+                )
+            )
+        )
+
+        soft_loss = (
+            tf.reduce_mean(
+                tf.square(
+                    output
+                    - teacher
+                )
+            )
+        )
+
+        total_loss = (
+            tf.constant(
+                0.6,
+                tf.float32,
+            )
+            * soft_loss
+            + tf.constant(
+                0.4,
+                tf.float32,
+            )
+            * hard_loss
+        )
+
+    variables = (
+        model
+        .trainable_variables
+    )
+
+    gradients = tape.gradient(
+        total_loss,
+        variables,
+    )
+
+    if (
+        len(
+            gradients
+        )
+        != len(
+            variables
+        )
+    ):
+        raise RuntimeError(
+            f"{condition} gradient "
+            "count mismatch"
+        )
+
+    missing = [
+        variable.name
+        for (
+            gradient,
+            variable,
+        ) in zip(
+            gradients,
+            variables,
+        )
+        if gradient is None
+    ]
+
+    if missing:
+        raise RuntimeError(
+            f"{condition} has "
+            "disconnected trainable "
+            f"variables: {missing}"
+        )
+
+    for (
+        gradient,
+        variable,
+    ) in zip(
+        gradients,
+        variables,
+    ):
+        finite = bool(
+            tf.reduce_all(
+                tf.math.is_finite(
+                    gradient
+                )
+            ).numpy()
+        )
+
+        if not finite:
+            raise RuntimeError(
+                f"{condition} produced "
+                "non-finite gradient for "
+                f"{variable.name}"
+            )
+
+    if not bool(
+        tf.math.is_finite(
+            total_loss
+        ).numpy()
+    ):
+        raise RuntimeError(
+            f"{condition} produced "
+            "non-finite real-data "
+            "smoke loss"
+        )
+
+
+def native_model(
+    state_bits,
+):
+    tf.keras.utils.set_random_seed(
+        42
+    )
+
+    model = (
+        campaign
+        .common
+        .build_student(
+            135,
+            3,
+            32,
+            4,
+            4,
+            4,
+            4,
+            state_bits,
+        )
+    )
+
+    output = model(
+        [
+            enc,
+            dec,
+        ],
+        training=False,
+    )
+
+    require_finite_output(
+        f"B{state_bits}",
+        output,
+    )
+
+    return model
+
+
+b4 = native_model(
+    4
+)
+
+b6 = native_model(
+    6
+)
+
+b4_weights = (
+    campaign
+    .export_model_raw_weights(
+        b4,
+        "b4",
+    )
+)
+
+b6_weights = (
+    campaign
+    .export_model_raw_weights(
+        b6,
+        "b6",
+    )
+)
+
+require_weights_equal(
+    b4_weights,
+    b6_weights,
+    "B4/B6",
+)
+
+require_gradient_probe(
+    b4,
+    "b4",
+)
+
+require_gradient_probe(
+    b6,
+    "b6",
+)
 
 base = dict(
     seq_len=135,
@@ -157,79 +646,194 @@ base = dict(
     q_alpha=1.0,
     residual_bits=2,
 )
-dummy = tf.zeros((1, 135, 1), tf.float32)
 
-
-def native(state_bits):
-    tf.keras.utils.set_random_seed(42)
-    model = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, state_bits)
-    output = model([dummy, dummy], training=False)
-    if tuple(output.shape) != (1, 135, 3):
-        raise RuntimeError(
-            f"native B{state_bits} smoke output shape mismatch: {tuple(output.shape)}"
-        )
-    return model
-
-
-b4 = native(4)
-b6 = native(6)
-b4_weights = campaign.export_model_raw_weights(b4, "b4")
-b6_weights = campaign.export_model_raw_weights(b6, "b6")
-for key in sorted(b4_weights):
-    if not np.array_equal(b4_weights[key], b6_weights[key]):
-        raise RuntimeError(f"B4/B6 matched initialization failed for {key}")
-
-args = SimpleNamespace(**base)
-
-tf.keras.utils.set_random_seed(42)
-r2_reference = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, 4)
-r2 = campaign.R2StudentModel(args)
-campaign.build_custom_children(r2, args)
-r2_output = r2([dummy, dummy], training=False, operator_mode="r2")
-if tuple(r2_output.shape) != (1, 135, 3):
-    raise RuntimeError(f"r2 smoke output shape mismatch: {tuple(r2_output.shape)}")
-campaign.transfer_reference_weights(r2_reference, r2)
-r2_weights = campaign.export_model_raw_weights(r2, "r2")
-for key in sorted(b4_weights):
-    if not np.array_equal(b4_weights[key], r2_weights[key]):
-        raise RuntimeError(f"B4/R2 matched initialization failed for {key}")
-
-tf.keras.utils.set_random_seed(42)
-scw_reference = campaign.common.build_student(135, 3, 32, 4, 4, 4, 4, 4)
-scw = campaign.common.SCWStudentModel(
-    seq_len=135,
-    n_out=3,
-    student_units=32,
-    bits_kernel=4,
-    bits_recurrent=4,
-    bits_bias=4,
-    bits_activation=4,
-    bits_state=4,
-    counter_bits=2,
-    deadzone_fraction=0.125,
-    q_alpha=1.0,
+args = SimpleNamespace(
+    **base
 )
-campaign.build_custom_children(scw, args)
-scw_output = scw([dummy, dummy], training=False, operator_mode="scw")
-if tuple(scw_output.shape) != (1, 135, 3):
-    raise RuntimeError(f"scw_k2 smoke output shape mismatch: {tuple(scw_output.shape)}")
-campaign.transfer_reference_weights(scw_reference, scw)
-scw_weights = campaign.export_model_raw_weights(scw, "scw_k2")
-for key in sorted(b4_weights):
-    if not np.array_equal(b4_weights[key], scw_weights[key]):
-        raise RuntimeError(f"B4/SCW matched initialization failed for {key}")
 
-print("MODEL_SMOKE_PASSED")
-print("MATCHED_INITIALIZATION_SMOKE_PASSED")
+tf.keras.utils.set_random_seed(
+    42
+)
+
+r2_reference = (
+    campaign
+    .common
+    .build_student(
+        135,
+        3,
+        32,
+        4,
+        4,
+        4,
+        4,
+        4,
+    )
+)
+
+r2 = campaign.R2StudentModel(
+    args
+)
+
+campaign.build_custom_children(
+    r2,
+    args,
+)
+
+campaign.transfer_reference_weights(
+    r2_reference,
+    r2,
+)
+
+r2_output = r2(
+    [
+        enc,
+        dec,
+    ],
+    training=False,
+    operator_mode="r2",
+)
+
+require_finite_output(
+    "R2",
+    r2_output,
+)
+
+r2_weights = (
+    campaign
+    .export_model_raw_weights(
+        r2,
+        "r2",
+    )
+)
+
+require_weights_equal(
+    b4_weights,
+    r2_weights,
+    "B4/R2",
+)
+
+require_deterministic_equivalence(
+    r2_reference,
+    r2,
+    "R2",
+)
+
+require_gradient_probe(
+    r2,
+    "r2",
+)
+
+tf.keras.utils.set_random_seed(
+    42
+)
+
+scw_reference = (
+    campaign
+    .common
+    .build_student(
+        135,
+        3,
+        32,
+        4,
+        4,
+        4,
+        4,
+        4,
+    )
+)
+
+scw = (
+    campaign
+    .common
+    .SCWStudentModel(
+        seq_len=135,
+        n_out=3,
+        student_units=32,
+        bits_kernel=4,
+        bits_recurrent=4,
+        bits_bias=4,
+        bits_activation=4,
+        bits_state=4,
+        counter_bits=2,
+        deadzone_fraction=0.125,
+        q_alpha=1.0,
+    )
+)
+
+campaign.build_custom_children(
+    scw,
+    args,
+)
+
+campaign.transfer_reference_weights(
+    scw_reference,
+    scw,
+)
+
+scw_output = scw(
+    [
+        enc,
+        dec,
+    ],
+    training=False,
+    operator_mode="scw",
+)
+
+require_finite_output(
+    "SCW K2",
+    scw_output,
+)
+
+scw_weights = (
+    campaign
+    .export_model_raw_weights(
+        scw,
+        "scw_k2",
+    )
+)
+
+require_weights_equal(
+    b4_weights,
+    scw_weights,
+    "B4/SCW K2",
+)
+
+require_deterministic_equivalence(
+    scw_reference,
+    scw,
+    "SCW K2",
+)
+
+require_gradient_probe(
+    scw,
+    "scw_k2",
+)
+
+print(
+    "REAL_VALIDATION_MODEL_SMOKE_PASSED"
+)
+
+print(
+    "REAL_VALIDATION_GRADIENT_SMOKE_PASSED"
+)
+
+print(
+    "MATCHED_INITIALIZATION_SMOKE_PASSED"
+)
 PY_MODEL_SMOKE
 
     mkdir -p "${CAMPAIGN_ROOT}/results"
     mkdir -p "${CAMPAIGN_ROOT}/aggregate"
 
-    command -v sbatch >/dev/null 2>&1 || fatal "sbatch is not available"
-    command -v sha256sum >/dev/null 2>&1 || fatal "sha256sum is not available"
+    command -v sbatch >/dev/null 2>&1 || \
+        fatal "sbatch is not available"
+
+    command -v sha256sum >/dev/null 2>&1 || \
+        fatal "sha256sum is not available"
+
     log "Preflight passed"
 }
+
 
 write_or_verify_campaign_spec() {
     local training_sha
@@ -578,71 +1182,200 @@ submit_worker() {
     local condition="$1"
     local seed="$2"
     local resume_mode="$3"
+    local raw_job_id
     local job_id
     local job_name="mem_${condition}_s${seed}"
 
     if [[ "${resume_mode}" == "resume" ]]; then
         log "Submitting resume: condition=${condition} seed=${seed}"
-        job_id=$(sbatch --parsable --job-name="${job_name}" "${WORKER}" "${condition}" "${seed}" --resume)
-    else
+
+        raw_job_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${job_name}" \
+                "${WORKER}" \
+                "${condition}" \
+                "${seed}" \
+                --resume
+        )
+
+    elif [[ "${resume_mode}" == "fresh" ]]; then
         log "Submitting fresh: condition=${condition} seed=${seed}"
-        job_id=$(sbatch --parsable --job-name="${job_name}" "${WORKER}" "${condition}" "${seed}")
+
+        raw_job_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${job_name}" \
+                "${WORKER}" \
+                "${condition}" \
+                "${seed}"
+        )
+
+    else
+        fatal "unsupported worker submission mode: ${resume_mode}"
     fi
-    [[ -n "${job_id}" ]] || fatal "sbatch returned an empty job ID for ${condition} seed ${seed}"
-    SUBMITTED_JOB_IDS+=("${job_id}")
+
+    job_id="${raw_job_id%%;*}"
+
+    if [[ ! "${job_id}" =~ ^[0-9]+$ ]]; then
+        fatal "invalid sbatch job ID for ${condition} seed ${seed}: ${raw_job_id}"
+    fi
+
+    SUBMITTED_JOB_IDS+=(
+        "${job_id}"
+    )
+
     log "Submitted ${condition} seed ${seed} as job ${job_id}"
 }
 
 submit_gate_after_jobs() {
     local dependency
     local old_ifs="${IFS}"
+    local raw_gate_id
+    local gate_id
+
     IFS=:
     dependency="${SUBMITTED_JOB_IDS[*]}"
     IFS="${old_ifs}"
-    [[ -n "${dependency}" ]] || fatal "cannot submit gate with empty dependency"
-    local gate_id
-    gate_id=$(sbatch \
-        --parsable \
-        --dependency="afterany:${dependency}" \
-        --job-name="mem_train_gate" \
-        "${PIPELINE_SCRIPT}" \
-        gate)
-    [[ -n "${gate_id}" ]] || fatal "failed to submit dependent training gate"
+
+    [[ -n "${dependency}" ]] || \
+        fatal "cannot submit gate with empty dependency"
+
+    raw_gate_id=$(
+        sbatch \
+            --parsable \
+            --dependency="afterany:${dependency}" \
+            --job-name="mem_train_gate" \
+            "${PIPELINE_SCRIPT}" \
+            gate
+    )
+
+    gate_id="${raw_gate_id%%;*}"
+
+    if [[ ! "${gate_id}" =~ ^[0-9]+$ ]]; then
+        fatal "invalid dependent gate job ID: ${raw_gate_id}"
+    fi
+
     log "Submitted dependent gate job ${gate_id} after ${dependency}"
 }
 
 run_bootstrap() {
     SUBMITTED_JOB_IDS=()
+
+    local -a plan_conditions=()
+    local -a plan_seeds=()
+    local -a plan_modes=()
+
+    local condition
+    local seed
+    local final_flag
+    local provenance
+    local resume_state
+    local training_flag
+    local resume_request
+    local index
+
     for condition in "${CONDITIONS[@]}"; do
         for seed in "${SEEDS[@]}"; do
-            local final_flag
-            local provenance
-            local resume_state
-            local training_flag
-            final_flag="$(completion_flag_for "${condition}" "${seed}")"
-            provenance="$(provenance_for "${condition}" "${seed}")"
-            resume_state="$(resume_state_for "${condition}" "${seed}")"
-            training_flag="$(training_flag_for "${condition}" "${seed}")"
+            final_flag="$(
+                completion_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            provenance="$(
+                provenance_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            resume_state="$(
+                resume_state_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            training_flag="$(
+                training_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            resume_request="$(
+                resume_request_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
 
             if [[ -f "${final_flag}" ]]; then
-                verify_completed_condition "${condition}" "${seed}"
+                verify_completed_condition \
+                    "${condition}" \
+                    "${seed}"
+
                 log "Already complete and current: ${condition} seed ${seed}"
+
+                continue
+            fi
+
+            if [[ -f "${resume_request}" ]]; then
+                if [[ ! -f "${resume_state}" && ! -f "${training_flag}" ]]; then
+                    fatal "${condition} seed ${seed} has a controlled-resume marker but no resumable state"
+                fi
+
+                verify_provenance \
+                    "${condition}" \
+                    "${seed}"
+
+                plan_conditions+=(
+                    "${condition}"
+                )
+
+                plan_seeds+=(
+                    "${seed}"
+                )
+
+                plan_modes+=(
+                    "resume"
+                )
+
                 continue
             fi
 
             if [[ -f "${resume_state}" || -f "${training_flag}" ]]; then
-                verify_provenance "${condition}" "${seed}"
-                submit_worker "${condition}" "${seed}" resume
-                continue
+                verify_provenance \
+                    "${condition}" \
+                    "${seed}"
+
+                fatal "${condition} seed ${seed} has resumable state but no controlled walltime resume marker; inspect its previous SLURM log before restarting"
             fi
 
             if [[ -f "${provenance}" ]]; then
-                verify_provenance "${condition}" "${seed}"
-                fatal "${condition} seed ${seed} has provenance but no completion or resumable state; inspect its failed SLURM log before restarting"
+                verify_provenance \
+                    "${condition}" \
+                    "${seed}"
+
+                fatal "${condition} seed ${seed} has provenance but no completion or controlled resumable state; inspect its failed SLURM log before restarting"
             fi
 
-            submit_worker "${condition}" "${seed}" fresh
+            plan_conditions+=(
+                "${condition}"
+            )
+
+            plan_seeds+=(
+                "${seed}"
+            )
+
+            plan_modes+=(
+                "fresh"
+            )
         done
+    done
+
+    for index in "${!plan_conditions[@]}"; do
+        submit_worker \
+            "${plan_conditions[${index}]}" \
+            "${plan_seeds[${index}]}" \
+            "${plan_modes[${index}]}"
     done
 
     if [[ "${#SUBMITTED_JOB_IDS[@]}" -gt 0 ]]; then
@@ -652,38 +1385,102 @@ run_bootstrap() {
     fi
 
     log "No training workers were required; running gate immediately"
+
     run_gate
 }
 
 run_gate() {
     SUBMITTED_JOB_IDS=()
+
+    local -a plan_conditions=()
+    local -a plan_seeds=()
+
     local hard_failure=0
+    local condition
+    local seed
+    local final_flag
+    local provenance
+    local resume_state
+    local training_flag
+    local resume_request
+    local index
 
     for condition in "${CONDITIONS[@]}"; do
         for seed in "${SEEDS[@]}"; do
-            local final_flag
-            local provenance
-            local resume_state
-            local training_flag
-            final_flag="$(completion_flag_for "${condition}" "${seed}")"
-            provenance="$(provenance_for "${condition}" "${seed}")"
-            resume_state="$(resume_state_for "${condition}" "${seed}")"
-            training_flag="$(training_flag_for "${condition}" "${seed}")"
+            final_flag="$(
+                completion_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            provenance="$(
+                provenance_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            resume_state="$(
+                resume_state_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            training_flag="$(
+                training_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
+
+            resume_request="$(
+                resume_request_flag_for \
+                    "${condition}" \
+                    "${seed}"
+            )"
 
             if [[ -f "${final_flag}" ]]; then
-                verify_completed_condition "${condition}" "${seed}"
+                verify_completed_condition \
+                    "${condition}" \
+                    "${seed}"
+
                 log "Verified complete: ${condition} seed ${seed}"
+
+                continue
+            fi
+
+            if [[ -f "${resume_request}" ]]; then
+                if [[ ! -f "${resume_state}" && ! -f "${training_flag}" ]]; then
+                    log "HARD FAILURE: ${condition} seed ${seed} has a controlled-resume marker but no resumable state"
+                    hard_failure=1
+                    continue
+                fi
+
+                verify_provenance \
+                    "${condition}" \
+                    "${seed}"
+
+                plan_conditions+=(
+                    "${condition}"
+                )
+
+                plan_seeds+=(
+                    "${seed}"
+                )
+
                 continue
             fi
 
             if [[ -f "${resume_state}" || -f "${training_flag}" ]]; then
-                verify_provenance "${condition}" "${seed}"
-                submit_worker "${condition}" "${seed}" resume
+                verify_provenance \
+                    "${condition}" \
+                    "${seed}"
+
+                log "HARD FAILURE: ${condition} seed ${seed} has resumable state but no controlled walltime resume marker"
+                hard_failure=1
                 continue
             fi
 
             if [[ -f "${provenance}" ]]; then
-                log "HARD FAILURE: ${condition} seed ${seed} has no resumable checkpoint"
+                log "HARD FAILURE: ${condition} seed ${seed} has provenance but no completion or controlled resumable state"
                 hard_failure=1
             else
                 log "HARD FAILURE: ${condition} seed ${seed} never created run provenance"
@@ -693,12 +1490,21 @@ run_gate() {
     done
 
     if [[ "${hard_failure}" -ne 0 ]]; then
-        fatal "at least one training condition failed before a safe resume point; no downstream aggregation was submitted"
+        fatal "at least one training condition failed outside the controlled walltime-resume path; no continuation jobs and no downstream aggregation were submitted"
     fi
+
+    for index in "${!plan_conditions[@]}"; do
+        submit_worker \
+            "${plan_conditions[${index}]}" \
+            "${plan_seeds[${index}]}" \
+            resume
+    done
 
     if [[ "${#SUBMITTED_JOB_IDS[@]}" -gt 0 ]]; then
         submit_gate_after_jobs
-        log "Resumable conditions were resubmitted; aggregation remains blocked"
+
+        log "Controlled walltime continuations were submitted; aggregation remains blocked"
+
         return
     fi
 
@@ -707,6 +1513,7 @@ run_gate() {
 
     module purge
     module load gcc/9.3.0/1
+
     eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
     conda activate tf210_qkeras
 
@@ -717,6 +1524,7 @@ run_gate() {
     require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_summary.json"
     require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_seed_metrics.csv"
     require_file "${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_complete.flag"
+
     log "Training campaign aggregate passed"
     log "Summary: ${CAMPAIGN_ROOT}/aggregate/trained_memory_campaign_summary.json"
     log "CSV: ${CAMPAIGN_ROOT}/aggregate/trained_memory_seed_metrics.csv"

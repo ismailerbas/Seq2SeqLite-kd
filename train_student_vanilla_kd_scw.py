@@ -3233,49 +3233,8 @@ def build_scw_student(
             "sdec_dense did not build"
         )
 
-    dummy_enc = tf.zeros(
-        (
-            1,
-            args.seq_len,
-            1,
-        ),
-        tf.float32,
-    )
-
-    dummy_dec = tf.zeros(
-        (
-            1,
-            args.seq_len,
-            1,
-        ),
-        tf.float32,
-    )
-
-    output = model(
-        [
-            dummy_enc,
-            dummy_dec,
-        ],
-        training=False,
-        operator_mode="scw",
-    )
-
-    expected_shape = (
-        1,
-        args.seq_len,
-        args.n_out,
-    )
-
-    if tuple(
-        output.shape
-    ) != expected_shape:
-        raise RuntimeError(
-            "Unexpected SCW model output shape: "
-            f"got {tuple(output.shape)}, "
-            f"expected {expected_shape}"
-        )
-
     return model
+
 def train_step_per_replica(
     batch_x,
     batch_y,

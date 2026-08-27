@@ -704,11 +704,36 @@ def training_loop(
     train_steps: int,
     args,
     job_dir: Path,
-) -> Tuple[Dict[str, List[float]], float, bool]:
-    best_ckpt = job_dir / "student_best.weights.h5"
-    resume_path = job_dir / "resume_state.json"
-    training_flag = job_dir / "training_complete.flag"
-    history_path = job_dir / "training_history.csv"
+) -> Tuple[
+    Dict[
+        str,
+        List[
+            float
+        ],
+    ],
+    float,
+    bool,
+]:
+    best_ckpt = (
+        job_dir
+        / "student_best.weights.h5"
+    )
+
+    resume_path = (
+        job_dir
+        / "resume_state.json"
+    )
+
+    training_flag = (
+        job_dir
+        / "training_complete.flag"
+    )
+
+    history_path = (
+        job_dir
+        / "training_history.csv"
+    )
+
     history = {
         key: []
         for key in (
@@ -722,34 +747,248 @@ def training_loop(
             "grad_norm",
         )
     }
-    best_val = float("inf")
+
+    best_val = float(
+        "inf"
+    )
+
     patience_count = 0
     start_epoch = 0
 
     if args.resume:
-        if training_flag.is_file():
-            if not best_ckpt.is_file():
-                raise RuntimeError(f"Missing best checkpoint: {best_ckpt}")
-            model.load_weights(str(best_ckpt))
-            return history, best_val, True
-        if not resume_path.is_file() or not best_ckpt.is_file():
-            raise RuntimeError("Resume requires resume_state.json and student_best.weights.h5")
-        with resume_path.open("r", encoding="utf-8") as handle:
-            state = json.load(handle)
-        start_epoch = int(state["epoch"])
-        best_val = float(state["best_val"])
-        patience_count = int(state["patience_count"])
-        for key, values in state.get("history", {}).items():
-            if key in history:
-                history[key] = [float(value) for value in values]
-        if not 0 < start_epoch <= args.epochs:
-            raise RuntimeError(f"Invalid resume epoch: {start_epoch}")
-        common.restore_exact_resume_checkpoint(
-            strategy, model, optimizer, scheduler, job_dir, start_epoch
+        if not resume_path.is_file():
+            raise RuntimeError(
+                "--resume requires "
+                f"resume_state.json: {resume_path}"
+            )
+
+        if not best_ckpt.is_file():
+            raise RuntimeError(
+                "--resume requires "
+                f"student_best.weights.h5: "
+                f"{best_ckpt}"
+            )
+
+        with resume_path.open(
+            "r",
+            encoding="utf-8",
+        ) as handle:
+            state = json.load(
+                handle
+            )
+
+        start_epoch = int(
+            state[
+                "epoch"
+            ]
         )
+
+        best_val = float(
+            state[
+                "best_val"
+            ]
+        )
+
+        patience_count = int(
+            state[
+                "patience_count"
+            ]
+        )
+
+        if (
+            state.get(
+                "condition"
+            )
+            != args.condition
+        ):
+            raise RuntimeError(
+                "Resume condition mismatch: "
+                f"expected={args.condition!r}, "
+                f"got={state.get('condition')!r}"
+            )
+
+        if (
+            int(
+                state.get(
+                    "init_seed",
+                    -1,
+                )
+            )
+            != int(
+                args.init_seed
+            )
+        ):
+            raise RuntimeError(
+                "Resume initialization seed "
+                "mismatch: "
+                f"expected={args.init_seed}, "
+                f"got={state.get('init_seed')!r}"
+            )
+
+        if (
+            state.get(
+                "epoch_shuffle_policy"
+            )
+            !=
+            "split_seed_plus_zero_based_epoch"
+        ):
+            raise RuntimeError(
+                "Resume shuffle policy mismatch: "
+                f"{state.get('epoch_shuffle_policy')!r}"
+            )
+
+        if not np.isfinite(
+            best_val
+        ):
+            raise RuntimeError(
+                "Resume best validation loss "
+                f"is non-finite: {best_val}"
+            )
+
+        if not (
+            0
+            < start_epoch
+            <= args.epochs
+        ):
+            raise RuntimeError(
+                f"Invalid resume epoch: "
+                f"{start_epoch}"
+            )
+
+        saved_history = (
+            state.get(
+                "history",
+                {},
+            )
+        )
+
+        for key in history:
+            if key not in saved_history:
+                raise RuntimeError(
+                    "Resume history is missing "
+                    f"required key: {key}"
+                )
+
+            history[
+                key
+            ] = [
+                float(
+                    value
+                )
+                for value in saved_history[
+                    key
+                ]
+            ]
+
+            if (
+                len(
+                    history[
+                        key
+                    ]
+                )
+                != start_epoch
+            ):
+                raise RuntimeError(
+                    "Resume history length "
+                    f"mismatch for {key}: "
+                    f"expected={start_epoch}, "
+                    f"got="
+                    f"{len(history[key])}"
+                )
+
+        if training_flag.is_file():
+            model.load_weights(
+                str(
+                    best_ckpt
+                )
+            )
+
+            common.pf(
+                "[RESUME] Training phase "
+                "already complete. "
+                f"epoch={start_epoch} "
+                f"best_val={best_val:.8g}. "
+                "Loaded selected best "
+                "checkpoint for evaluation."
+            )
+
+            return (
+                history,
+                best_val,
+                True,
+            )
+
+        if (
+            start_epoch
+            >= args.epochs
+            or patience_count
+            >= args.patience
+        ):
+            model.load_weights(
+                str(
+                    best_ckpt
+                )
+            )
+
+            training_flag.write_text(
+                "passed\n",
+                encoding="utf-8",
+            )
+
+            reason = (
+                "maximum epochs reached"
+                if start_epoch
+                >= args.epochs
+                else "early stopping reached"
+            )
+
+            common.pf(
+                "[RESUME] Training had "
+                "already reached its "
+                f"stopping rule: {reason}. "
+                f"epoch={start_epoch} "
+                f"best_val={best_val:.8g}. "
+                "Loaded selected best "
+                "checkpoint."
+            )
+
+            return (
+                history,
+                best_val,
+                True,
+            )
+
+        common.restore_exact_resume_checkpoint(
+            strategy,
+            model,
+            optimizer,
+            scheduler,
+            job_dir,
+            start_epoch,
+        )
+
+        common.pf(
+            f"[RESUME] Continuing "
+            f"condition={args.condition} "
+            f"seed={args.init_seed} "
+            f"from epoch "
+            f"{start_epoch + 1}/"
+            f"{args.epochs} "
+            f"best_val={best_val:.8g} "
+            f"patience="
+            f"{patience_count}/"
+            f"{args.patience}"
+        )
+
     else:
-        with history_path.open("w", encoding="utf-8", newline="") as handle:
-            csv.writer(handle).writerow(
+        with history_path.open(
+            "w",
+            encoding="utf-8",
+            newline="",
+        ) as handle:
+            csv.writer(
+                handle
+            ).writerow(
                 [
                     "epoch",
                     "total",
@@ -765,100 +1004,393 @@ def training_loop(
                 ]
             )
 
-    train_step = make_distributed_train_step(strategy, model, optimizer, args)
-    val_step = make_distributed_val_step(strategy, model, args)
-    val_dataset = make_campaign_kd_dataset(
-        enc_val, tgt_val, tpred_val, args, shuffle=False, seed=args.split_seed
+    train_step = (
+        make_distributed_train_step(
+            strategy,
+            model,
+            optimizer,
+            args,
+        )
     )
-    dist_val_dataset = strategy.experimental_distribute_dataset(val_dataset)
+
+    val_step = (
+        make_distributed_val_step(
+            strategy,
+            model,
+            args,
+        )
+    )
+
+    val_dataset = (
+        make_campaign_kd_dataset(
+            enc_val,
+            tgt_val,
+            tpred_val,
+            args,
+            shuffle=False,
+            seed=args.split_seed,
+        )
+    )
+
+    dist_val_dataset = (
+        strategy
+        .experimental_distribute_dataset(
+            val_dataset
+        )
+    )
+
     interrupted = False
 
-    for epoch in range(start_epoch, args.epochs):
-        epoch_seed = int(args.split_seed + epoch)
-        train_dataset = make_campaign_kd_dataset(
-            enc_train, tgt_train, tpred_train, args, shuffle=True, seed=epoch_seed
+    for epoch in range(
+        start_epoch,
+        args.epochs,
+    ):
+        epoch_seed = int(
+            args.split_seed
+            + epoch
         )
-        dist_train_dataset = strategy.experimental_distribute_dataset(train_dataset)
+
+        train_dataset = (
+            make_campaign_kd_dataset(
+                enc_train,
+                tgt_train,
+                tpred_train,
+                args,
+                shuffle=True,
+                seed=epoch_seed,
+            )
+        )
+
+        dist_train_dataset = (
+            strategy
+            .experimental_distribute_dataset(
+                train_dataset
+            )
+        )
+
         started = time.time()
-        sums = np.zeros(4, dtype=np.float64)
+
+        sums = np.zeros(
+            4,
+            dtype=np.float64,
+        )
+
         count = 0
         bad_count = 0
-        common.pf(f"[EPOCH {epoch + 1}/{args.epochs}] train lr={scheduler.current_lr:.3e}")
-        common.pf(f"[EPOCH {epoch + 1}] deterministic shuffle seed={epoch_seed}")
-        for step_index, (bx, by) in enumerate(dist_train_dataset):
-            total, hard, soft, bad, norm = train_step(bx, by)
-            sums += (float(total), float(hard), float(soft), float(norm))
-            count += 1
-            bad_count += int(float(bad) > 0.0)
-            if (step_index + 1) % args.log_interval == 0 or step_index + 1 == train_steps:
-                elapsed = time.time() - started
-                remaining = elapsed / max(step_index + 1, 1) * max(train_steps - step_index - 1, 0)
-                common.pf(
-                    f"  step {step_index + 1}/{train_steps} total={sums[0]/count:.6f} "
-                    f"hard={sums[1]/count:.6f} soft={sums[2]/count:.6f} "
-                    f"grad_norm={sums[3]/count:.5f} bad={bad_count} eta={remaining/60:.1f}m"
-                )
-        if count == 0:
-            raise RuntimeError("Training dataset yielded zero batches")
-        train_total, train_hard, train_soft, grad_norm = sums / count
 
-        val_sums = np.zeros(4, dtype=np.float64)
-        val_count = 0
-        for bx, by in dist_val_dataset:
-            values = val_step(bx, by)
-            val_sums += [float(value) for value in values]
-            val_count += 1
-        if val_count == 0:
-            raise RuntimeError("Validation dataset yielded zero batches")
-        val_total, val_hard, val_soft, val_mae = val_sums / val_count
+        common.pf(
+            f"[EPOCH {epoch + 1}/"
+            f"{args.epochs}] "
+            f"train lr="
+            f"{scheduler.current_lr:.3e}"
+        )
 
-        for key, value in (
-            ("total", train_total),
-            ("hard", train_hard),
-            ("soft", train_soft),
-            ("val_total", val_total),
-            ("val_hard", val_hard),
-            ("val_soft", val_soft),
-            ("val_mae", val_mae),
-            ("grad_norm", grad_norm),
+        common.pf(
+            f"[EPOCH {epoch + 1}] "
+            f"deterministic shuffle "
+            f"seed={epoch_seed}"
+        )
+
+        for (
+            step_index,
+            (
+                bx,
+                by,
+            ),
+        ) in enumerate(
+            dist_train_dataset
         ):
-            history[key].append(float(value))
-
-        if args.effective_warmup_epochs > 0 and epoch < args.effective_warmup_epochs:
-            scheduler.lr_var.assign(
-                args.effective_lr * (epoch + 1) / args.effective_warmup_epochs
+            (
+                total,
+                hard,
+                soft,
+                bad,
+                norm,
+            ) = train_step(
+                bx,
+                by,
             )
-        else:
-            scheduler.step(float(val_total), epoch)
 
-        if val_total < best_val - args.min_delta:
-            best_val = float(val_total)
+            sums += (
+                float(
+                    total
+                ),
+                float(
+                    hard
+                ),
+                float(
+                    soft
+                ),
+                float(
+                    norm
+                ),
+            )
+
+            count += 1
+
+            bad_count += int(
+                float(
+                    bad
+                )
+                > 0.0
+            )
+
+            if (
+                (
+                    step_index
+                    + 1
+                )
+                % args.log_interval
+                == 0
+                or (
+                    step_index
+                    + 1
+                )
+                == train_steps
+            ):
+                elapsed = (
+                    time.time()
+                    - started
+                )
+
+                remaining = (
+                    elapsed
+                    / max(
+                        step_index
+                        + 1,
+                        1,
+                    )
+                    * max(
+                        train_steps
+                        - step_index
+                        - 1,
+                        0,
+                    )
+                )
+
+                common.pf(
+                    f"  step "
+                    f"{step_index + 1}/"
+                    f"{train_steps} "
+                    f"total="
+                    f"{sums[0] / count:.6f} "
+                    f"hard="
+                    f"{sums[1] / count:.6f} "
+                    f"soft="
+                    f"{sums[2] / count:.6f} "
+                    f"grad_norm="
+                    f"{sums[3] / count:.5f} "
+                    f"bad={bad_count} "
+                    f"eta="
+                    f"{remaining / 60:.1f}m"
+                )
+
+        if count == 0:
+            raise RuntimeError(
+                "Training dataset "
+                "yielded zero batches"
+            )
+
+        (
+            train_total,
+            train_hard,
+            train_soft,
+            grad_norm,
+        ) = (
+            sums
+            / count
+        )
+
+        val_sums = np.zeros(
+            4,
+            dtype=np.float64,
+        )
+
+        val_count = 0
+
+        for (
+            bx,
+            by,
+        ) in dist_val_dataset:
+            values = val_step(
+                bx,
+                by,
+            )
+
+            val_sums += [
+                float(
+                    value
+                )
+                for value in values
+            ]
+
+            val_count += 1
+
+        if val_count == 0:
+            raise RuntimeError(
+                "Validation dataset "
+                "yielded zero batches"
+            )
+
+        (
+            val_total,
+            val_hard,
+            val_soft,
+            val_mae,
+        ) = (
+            val_sums
+            / val_count
+        )
+
+        for (
+            key,
+            value,
+        ) in (
+            (
+                "total",
+                train_total,
+            ),
+            (
+                "hard",
+                train_hard,
+            ),
+            (
+                "soft",
+                train_soft,
+            ),
+            (
+                "val_total",
+                val_total,
+            ),
+            (
+                "val_hard",
+                val_hard,
+            ),
+            (
+                "val_soft",
+                val_soft,
+            ),
+            (
+                "val_mae",
+                val_mae,
+            ),
+            (
+                "grad_norm",
+                grad_norm,
+            ),
+        ):
+            history[
+                key
+            ].append(
+                float(
+                    value
+                )
+            )
+
+        if (
+            args.effective_warmup_epochs
+            > 0
+            and epoch
+            < args.effective_warmup_epochs
+        ):
+            scheduler.lr_var.assign(
+                args.effective_lr
+                * (
+                    epoch
+                    + 1
+                )
+                / args.effective_warmup_epochs
+            )
+
+        else:
+            scheduler.step(
+                float(
+                    val_total
+                ),
+                epoch,
+            )
+
+        if (
+            val_total
+            < best_val
+            - args.min_delta
+        ):
+            best_val = float(
+                val_total
+            )
+
             patience_count = 0
-            model.save_weights(str(best_ckpt))
+
+            model.save_weights(
+                str(
+                    best_ckpt
+                )
+            )
+
         else:
             patience_count += 1
 
-        completed_epoch = epoch + 1
-        exact_checkpoint = common.save_exact_resume_checkpoint(
-            strategy, model, optimizer, scheduler, job_dir, completed_epoch
+        completed_epoch = (
+            epoch
+            + 1
         )
+
+        exact_checkpoint = (
+            common
+            .save_exact_resume_checkpoint(
+                strategy,
+                model,
+                optimizer,
+                scheduler,
+                job_dir,
+                completed_epoch,
+            )
+        )
+
         atomic_write_json(
             resume_path,
             {
-                "epoch": completed_epoch,
-                "best_val": best_val,
-                "patience_count": patience_count,
-                "lr": scheduler.current_lr,
-                "exact_checkpoint": exact_checkpoint,
-                "condition": args.condition,
-                "init_seed": args.init_seed,
-                "epoch_shuffle_seed": epoch_seed,
-                "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
-                "history": history,
+                "epoch": (
+                    completed_epoch
+                ),
+                "best_val": (
+                    best_val
+                ),
+                "patience_count": (
+                    patience_count
+                ),
+                "lr": (
+                    scheduler.current_lr
+                ),
+                "exact_checkpoint": (
+                    exact_checkpoint
+                ),
+                "condition": (
+                    args.condition
+                ),
+                "init_seed": (
+                    args.init_seed
+                ),
+                "epoch_shuffle_seed": (
+                    epoch_seed
+                ),
+                "epoch_shuffle_policy": (
+                    "split_seed_plus_zero_based_epoch"
+                ),
+                "history": (
+                    history
+                ),
             },
         )
-        with history_path.open("a", encoding="utf-8", newline="") as handle:
-            csv.writer(handle).writerow(
+
+        with history_path.open(
+            "a",
+            encoding="utf-8",
+            newline="",
+        ) as handle:
+            csv.writer(
+                handle
+            ).writerow(
                 [
                     completed_epoch,
                     train_total,
@@ -873,27 +1405,86 @@ def training_loop(
                     bad_count,
                 ]
             )
+
         common.pf(
-            f"[EPOCH {completed_epoch}] train={train_total:.6f} val={val_total:.6f} "
-            f"val_mae={val_mae:.6f} best={best_val:.6f} "
-            f"patience={patience_count}/{args.patience} time={(time.time()-started)/60:.1f}m"
+            f"[EPOCH "
+            f"{completed_epoch}] "
+            f"train="
+            f"{train_total:.6f} "
+            f"val="
+            f"{val_total:.6f} "
+            f"val_mae="
+            f"{val_mae:.6f} "
+            f"best="
+            f"{best_val:.6f} "
+            f"patience="
+            f"{patience_count}/"
+            f"{args.patience} "
+            f"time="
+            f"{(time.time() - started) / 60:.1f}m"
         )
+
         if common.STOP_AFTER_EPOCH:
             interrupted = True
-            common.pf("[SIGNAL] Exact epoch checkpoint saved; exiting for gated resume.")
+
+            common.pf(
+                "[SIGNAL] Exact epoch "
+                "checkpoint saved; "
+                "exiting for gated resume."
+            )
+
             break
-        if patience_count >= args.patience:
-            common.pf(f"[EARLY STOP] epoch={completed_epoch}")
+
+        if (
+            patience_count
+            >= args.patience
+        ):
+            common.pf(
+                f"[EARLY STOP] "
+                f"epoch="
+                f"{completed_epoch}"
+            )
+
             break
 
     if interrupted:
-        return history, best_val, False
-    if not best_ckpt.is_file():
-        raise RuntimeError(f"No best checkpoint was created: {best_ckpt}")
-    model.load_weights(str(best_ckpt))
-    training_flag.write_text("passed\n", encoding="utf-8")
-    return history, best_val, True
+        return (
+            history,
+            best_val,
+            False,
+        )
 
+    if not best_ckpt.is_file():
+        raise RuntimeError(
+            "No best checkpoint "
+            f"was created: {best_ckpt}"
+        )
+
+    if not np.isfinite(
+        best_val
+    ):
+        raise RuntimeError(
+            "Training completed with "
+            "a non-finite selected "
+            f"validation loss: {best_val}"
+        )
+
+    model.load_weights(
+        str(
+            best_ckpt
+        )
+    )
+
+    training_flag.write_text(
+        "passed\n",
+        encoding="utf-8",
+    )
+
+    return (
+        history,
+        best_val,
+        True,
+    )
 
 def save_training_plot(history: Dict[str, List[float]], job_dir: Path, args) -> None:
     if not history["total"]:
@@ -1008,11 +1599,24 @@ def evaluate_condition(model, normalized_input, res, labels, test_idx, args, job
     return {"native": test_metrics, "operator_comparison": comparison}
 
 
-def build_model(strategy, normalized_input, val_idx, args, job_dir):
+def build_model(
+    strategy,
+    normalized_input,
+    val_idx,
+    args,
+    job_dir,
+):
     equivalence = None
+
     with strategy.scope():
-        tf.keras.utils.set_random_seed(args.init_seed)
-        if args.condition in ("b4", "b6"):
+        tf.keras.utils.set_random_seed(
+            args.init_seed
+        )
+
+        if args.condition in (
+            "b4",
+            "b6",
+        ):
             model = common.build_student(
                 args.seq_len,
                 args.n_out,
@@ -1023,6 +1627,7 @@ def build_model(strategy, normalized_input, val_idx, args, job_dir):
                 args.bits_activation,
                 args.bits_state,
             )
+
         else:
             reference = common.build_student(
                 args.seq_len,
@@ -1034,6 +1639,7 @@ def build_model(strategy, normalized_input, val_idx, args, job_dir):
                 4,
                 4,
             )
+
             if args.condition == "scw_k2":
                 model = common.SCWStudentModel(
                     seq_len=args.seq_len,
@@ -1048,19 +1654,43 @@ def build_model(strategy, normalized_input, val_idx, args, job_dir):
                     deadzone_fraction=SCW_DEADZONE_FRACTION,
                     q_alpha=1.0,
                 )
-            else:
-                model = R2StudentModel(args)
-            build_custom_children(model, args)
-            dummy = tf.zeros((1, args.seq_len, 1), tf.float32)
-            operator = "scw" if args.condition == "scw_k2" else "r2"
-            model([dummy, dummy], training=False, operator_mode=operator)
-            transfer_reference_weights(reference, model)
-            equivalence = deterministic_equivalence(
-                reference, model, normalized_input, val_idx, args, job_dir
-            )
-            del reference
-    return model, equivalence
 
+            elif args.condition == "r2":
+                model = R2StudentModel(
+                    args
+                )
+
+            else:
+                raise ValueError(
+                    f"Unsupported condition: "
+                    f"{args.condition!r}"
+                )
+
+            build_custom_children(
+                model,
+                args,
+            )
+
+            transfer_reference_weights(
+                reference,
+                model,
+            )
+
+            equivalence = deterministic_equivalence(
+                reference,
+                model,
+                normalized_input,
+                val_idx,
+                args,
+                job_dir,
+            )
+
+            del reference
+
+    return (
+        model,
+        equivalence,
+    )
 
 def main() -> None:
     args = parse_args()

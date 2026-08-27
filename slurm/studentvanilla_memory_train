@@ -8,16 +8,17 @@
 #SBATCH --time=04:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
-#SBATCH --signal=B:SIGUSR1@300
+#SBATCH --signal=B:SIGUSR1@1200
 
 set -euo pipefail
 
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+SLURM_DIR="${PROJECT_DIR}/slurm"
 DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
 PYTHON_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_memory_campaign.py"
-SCRIPT_PATH="${PROJECT_DIR}/studentvanilla_memory_train"
+SCRIPT_PATH="${SLURM_DIR}/studentvanilla_memory_train"
 TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
 TEACHER_CACHE="${DATA_PATH}/teacherPred_vanillaKD_L1351600000.npy"
 CAMPAIGN_SPEC="${CAMPAIGN_ROOT}/campaign_spec.json"
@@ -54,14 +55,25 @@ JOB_DIR="${CAMPAIGN_ROOT}/results/${JOB_NAME}"
 FINAL_FLAG="${JOB_DIR}/campaign_training_complete.flag"
 TRAINING_FLAG="${JOB_DIR}/training_complete.flag"
 RESUME_STATE="${JOB_DIR}/resume_state.json"
+RESUME_REQUEST_FLAG="${JOB_DIR}/pipeline_resume_requested.flag"
 
 if [[ ! -d "${PROJECT_DIR}" ]]; then
     echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
     exit 1
 fi
 
+if [[ ! -d "${SLURM_DIR}" ]]; then
+    echo "FATAL: SLURM directory does not exist: ${SLURM_DIR}"
+    exit 1
+fi
+
 if [[ ! -d "${DATA_PATH}" ]]; then
     echo "FATAL: data directory does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+if [[ ! -f "${SCRIPT_PATH}" ]]; then
+    echo "FATAL: worker script does not exist: ${SCRIPT_PATH}"
     exit 1
 fi
 
@@ -80,6 +92,11 @@ if [[ ! -f "${PROJECT_DIR}/train_student_vanilla_kd.py" ]]; then
     exit 1
 fi
 
+if [[ ! -f "${PROJECT_DIR}/train_student_memoq.py" ]]; then
+    echo "FATAL: MemoQ shared source does not exist: ${PROJECT_DIR}/train_student_memoq.py"
+    exit 1
+fi
+
 if [[ ! -f "${TEACHER_WEIGHTS}" ]]; then
     echo "FATAL: teacher checkpoint does not exist: ${TEACHER_WEIGHTS}"
     exit 1
@@ -92,30 +109,27 @@ fi
 
 if [[ ! -f "${CAMPAIGN_SPEC}" ]]; then
     echo "FATAL: locked campaign specification does not exist: ${CAMPAIGN_SPEC}"
-    echo "Launch the campaign through recurrent_training_pipeline bootstrap."
+    echo "Launch the campaign through slurm/recurrent_training_pipeline bootstrap."
     exit 1
 fi
 
-if grep -q $'\r' "${SCRIPT_PATH}"; then
-    echo "FATAL: DOS CRLF line endings detected in ${SCRIPT_PATH}"
-    exit 1
-fi
-
-if grep -q $'\r' "${PYTHON_SCRIPT}"; then
-    echo "FATAL: DOS CRLF line endings detected in ${PYTHON_SCRIPT}"
-    exit 1
-fi
-
-if grep -q $'\r' "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"; then
-    echo "FATAL: DOS CRLF line endings detected in train_student_vanilla_kd_scw.py"
-    exit 1
-fi
+for FILE_TO_CHECK in \
+    "${SCRIPT_PATH}" \
+    "${PYTHON_SCRIPT}" \
+    "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"; do
+    if grep -q $'\r' "${FILE_TO_CHECK}"; then
+        echo "FATAL: DOS CRLF line endings detected: ${FILE_TO_CHECK}"
+        exit 1
+    fi
+done
 
 bash -n "${SCRIPT_PATH}"
+
 mkdir -p "${CAMPAIGN_ROOT}/results"
 mkdir -p "${JOB_DIR}"
 
 if [[ -f "${FINAL_FLAG}" ]]; then
+    rm -f "${RESUME_REQUEST_FLAG}"
     echo "Campaign condition already complete: ${FINAL_FLAG}"
     exit 0
 fi
@@ -129,6 +143,8 @@ if [[ "${RESUME_FLAG}" == "--resume" ]]; then
         exit 1
     fi
 fi
+
+rm -f "${RESUME_REQUEST_FLAG}"
 
 module purge
 module load gcc/9.3.0/1
@@ -160,57 +176,145 @@ from pathlib import Path
     teacher_checkpoint,
     teacher_cache,
 ) = sys.argv[1:]
+
 init_seed = int(init_seed)
+
 
 def sha256_file(path):
     digest = hashlib.sha256()
+
     with Path(path).open("rb") as handle:
         while True:
-            block = handle.read(1024 * 1024)
+            block = handle.read(
+                1024 * 1024
+            )
+
             if not block:
                 break
-            digest.update(block)
+
+            digest.update(
+                block
+            )
+
     return digest.hexdigest()
 
-with open(spec_path, "r", encoding="utf-8") as handle:
-    spec = json.load(handle)
-if spec.get("locked_before_training") is not True:
-    raise SystemExit("campaign specification is not locked_before_training")
-if condition not in spec.get("conditions", []):
-    raise SystemExit(f"condition {condition!r} is not in the locked campaign")
-if init_seed not in spec.get("init_seeds", []):
-    raise SystemExit(f"init seed {init_seed} is not in the locked campaign")
+
+with open(
+    spec_path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    spec = json.load(
+        handle
+    )
+
+if spec.get(
+    "locked_before_training"
+) is not True:
+    raise SystemExit(
+        "campaign specification "
+        "is not locked_before_training"
+    )
+
+if condition not in spec.get(
+    "conditions",
+    [],
+):
+    raise SystemExit(
+        f"condition {condition!r} "
+        "is not in the locked campaign"
+    )
+
+if init_seed not in spec.get(
+    "init_seeds",
+    [],
+):
+    raise SystemExit(
+        f"init seed {init_seed} "
+        "is not in the locked campaign"
+    )
+
 expected = {
     "split_seed": 42,
-    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "epoch_shuffle_policy": (
+        "split_seed_plus_zero_based_epoch"
+    ),
     "alpha": 0.6,
     "temperature": 4.0,
     "batch_size": 1024,
     "report_all_conditions": True,
 }
+
 for key, value in expected.items():
-    if spec.get(key) != value:
+    if spec.get(
+        key
+    ) != value:
         raise SystemExit(
-            f"campaign specification mismatch for {key}: "
-            f"expected={value!r} got={spec.get(key)!r}"
+            "campaign specification "
+            f"mismatch for {key}: "
+            f"expected={value!r} "
+            f"got={spec.get(key)!r}"
         )
-hashes = spec.get("script_hashes", {})
+
+hashes = spec.get(
+    "script_hashes",
+    {},
+)
+
 expected_hashes = {
-    "training": sha256_file(training_script),
-    "baseline": sha256_file(baseline_script),
-    "scw": sha256_file(scw_script),
+    "training": sha256_file(
+        training_script
+    ),
+    "baseline": sha256_file(
+        baseline_script
+    ),
+    "scw": sha256_file(
+        scw_script
+    ),
 }
+
 for key, value in expected_hashes.items():
-    if hashes.get(key) != value:
+    if hashes.get(
+        key
+    ) != value:
         raise SystemExit(
-            f"campaign script hash mismatch for {key}: "
-            f"expected={value} got={hashes.get(key)}"
+            "campaign script hash "
+            f"mismatch for {key}: "
+            f"expected={value} "
+            f"got={hashes.get(key)}"
         )
-if spec.get("teacher_checkpoint_sha256") != sha256_file(teacher_checkpoint):
-    raise SystemExit("teacher checkpoint hash differs from locked campaign specification")
-if spec.get("teacher_prediction_cache_sha256") != sha256_file(teacher_cache):
-    raise SystemExit("teacher prediction cache hash differs from locked campaign specification")
-print("CAMPAIGN_SPEC_VERIFIED")
+
+if (
+    spec.get(
+        "teacher_checkpoint_sha256"
+    )
+    != sha256_file(
+        teacher_checkpoint
+    )
+):
+    raise SystemExit(
+        "teacher checkpoint hash "
+        "differs from locked campaign "
+        "specification"
+    )
+
+if (
+    spec.get(
+        "teacher_prediction_cache_sha256"
+    )
+    != sha256_file(
+        teacher_cache
+    )
+):
+    raise SystemExit(
+        "teacher prediction cache hash "
+        "differs from locked campaign "
+        "specification"
+    )
+
+print(
+    "CAMPAIGN_SPEC_VERIFIED"
+)
 PY_VERIFY_SPEC
 
 export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
@@ -247,6 +351,7 @@ fi
 echo "============================================================"
 echo "MATCHED RECURRENT-MEMORY TRAINING WORKER"
 echo "PROJECT_DIR          : ${PROJECT_DIR}"
+echo "SLURM_DIR            : ${SLURM_DIR}"
 echo "DATA_PATH            : ${DATA_PATH}"
 echo "CAMPAIGN_ROOT        : ${CAMPAIGN_ROOT}"
 echo "JOB_DIR              : ${JOB_DIR}"
@@ -309,10 +414,14 @@ STOP_REQUESTED=0
 handle_usr1() {
     echo "============================================================"
     echo "SIGUSR1 received by training worker."
-    echo "Forwarding SIGUSR1 to Python so it checkpoints after the current epoch."
-    echo "The pipeline gate will submit the continuation only after this job terminates."
+    echo "Requesting a controlled epoch-boundary checkpoint."
+    echo "The dependent gate will submit the continuation after this job terminates."
     echo "============================================================"
+
     STOP_REQUESTED=1
+
+    printf 'requested\n' > "${RESUME_REQUEST_FLAG}"
+
     if [[ -n "${PYTHON_PID}" ]] && kill -0 "${PYTHON_PID}" 2>/dev/null; then
         kill -USR1 "${PYTHON_PID}"
     fi
@@ -322,6 +431,7 @@ trap handle_usr1 SIGUSR1
 
 "${cmd[@]}" &
 PYTHON_PID=$!
+
 echo "Python PID=${PYTHON_PID}"
 
 set +e
@@ -332,31 +442,42 @@ set -e
 echo "Python exited with code ${EXIT_CODE}"
 
 if [[ -f "${FINAL_FLAG}" ]]; then
+    rm -f "${RESUME_REQUEST_FLAG}"
     echo "Campaign condition completed successfully: ${FINAL_FLAG}"
     exit 0
 fi
 
 if [[ "${EXIT_CODE}" != "0" ]]; then
+    if [[ "${STOP_REQUESTED}" == "1" ]] && \
+       [[ "${EXIT_CODE}" == "137" || "${EXIT_CODE}" == "143" ]] && \
+       [[ -f "${RESUME_STATE}" || -f "${TRAINING_FLAG}" ]]; then
+        echo "Python was terminated after a controlled walltime checkpoint request."
+        echo "A valid resumable state exists."
+        echo "The dependent gate will submit the continuation."
+        exit 0
+    fi
+
+    rm -f "${RESUME_REQUEST_FLAG}"
+
     echo "FATAL: Python exited with code ${EXIT_CODE}."
-    echo "No automatic continuation will be submitted for an unclassified Python failure."
+    echo "This was not classified as a controlled walltime continuation."
+    echo "The dependent gate will stop rather than repeatedly resubmit a failing run."
     exit "${EXIT_CODE}"
 fi
 
 if [[ "${STOP_REQUESTED}" == "1" ]]; then
     if [[ ! -f "${RESUME_STATE}" && ! -f "${TRAINING_FLAG}" ]]; then
-        echo "FATAL: checkpoint stop was requested but no resumable state exists."
+        rm -f "${RESUME_REQUEST_FLAG}"
+        echo "FATAL: controlled checkpoint stop was requested but no resumable state exists."
         exit 1
     fi
+
     echo "Worker stopped cleanly with resumable state."
     echo "The dependent pipeline gate will submit this condition with --resume."
     exit 0
 fi
 
-if [[ -f "${RESUME_STATE}" || -f "${TRAINING_FLAG}" ]]; then
-    echo "Worker ended without the final campaign flag but resumable state exists."
-    echo "The dependent pipeline gate will submit this condition with --resume."
-    exit 0
-fi
+rm -f "${RESUME_REQUEST_FLAG}"
 
-echo "FATAL: final completion flag is missing and no resumable state exists."
+echo "FATAL: Python exited normally without the final campaign flag and without a controlled walltime request."
 exit 1
