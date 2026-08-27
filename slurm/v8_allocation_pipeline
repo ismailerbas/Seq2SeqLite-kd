@@ -1,0 +1,722 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=4
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+MODE=${1:-bootstrap}
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+
+PIPELINE_SCRIPT="${PROJECT_DIR}/v8_allocation_pipeline"
+
+ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_recurrent_memory.py"
+BASE_ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_writeback.py"
+STATS_SCRIPT="${PROJECT_DIR}/eval/recurrent_memory_stats.py"
+BUILDER_SCRIPT="${PROJECT_DIR}/eval/build_v8_allocation_results.py"
+BASE_BUILDER_SCRIPT="${PROJECT_DIR}/eval/build_recurrent_memory_results.py"
+
+if [[ -f "${PROJECT_DIR}/analyze_recurrent_memory" ]]; then
+    GPU_WORKER="${PROJECT_DIR}/analyze_recurrent_memory"
+
+elif [[ -f "${PROJECT_DIR}/slurm/analyze_recurrent_memory" ]]; then
+    GPU_WORKER="${PROJECT_DIR}/slurm/analyze_recurrent_memory"
+
+else
+    echo "FATAL: analyze_recurrent_memory SLURM worker was not found in project root or slurm/."
+    exit 1
+fi
+
+V8_RUN="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b8k8r8a8_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+V8_ROOT="${V8_RUN}/recurrent_memory_analysis"
+V8_FIDELITY="${V8_RUN}/writeback_analysis/VANILLA8_native/native_fidelity.json"
+OUT_DIR="${V8_RUN}/v8_allocation_study"
+FINAL_FLAG="${OUT_DIR}/v8_allocation_study_complete.flag"
+
+JOB_IDS=()
+
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+}
+
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+
+require_dir() {
+    local path=$1
+
+    if [[ ! -d "${path}" ]]; then
+        fatal "required directory does not exist: ${path}"
+    fi
+}
+
+
+require_file() {
+    local path=$1
+
+    if [[ ! -f "${path}" ]]; then
+        fatal "required file does not exist: ${path}"
+    fi
+}
+
+
+require_no_crlf() {
+    local path=$1
+
+    if grep -q $'\r' "${path}"; then
+        fatal "DOS CRLF line endings detected in ${path}"
+    fi
+}
+
+
+activate_environment() {
+    module purge
+    module load gcc/9.3.0/1
+
+    eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+    conda activate tf210_qkeras
+
+    export OMP_NUM_THREADS=1
+    export MKL_NUM_THREADS=1
+    export OPENBLAS_NUM_THREADS=1
+
+    export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+    export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+    export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+    export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+    export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+    mkdir -p "${TMPDIR}"
+    mkdir -p "${PIP_CACHE_DIR}"
+    mkdir -p "${PIP_TMPDIR}"
+    mkdir -p "${MPLCONFIGDIR}"
+    mkdir -p "${XDG_CACHE_HOME}"
+}
+
+
+preflight() {
+    cd "${PROJECT_DIR}"
+
+    command -v sbatch >/dev/null 2>&1 || fatal "sbatch is not available"
+
+    require_dir "${PROJECT_DIR}"
+    require_dir "${DATA_DIR}"
+    require_dir "${V8_RUN}"
+    require_dir "${V8_RUN}/writeback_analysis/VANILLA8_native"
+
+    require_file "${PIPELINE_SCRIPT}"
+    require_file "${GPU_WORKER}"
+    require_file "${ANALYSIS_SCRIPT}"
+    require_file "${BASE_ANALYSIS_SCRIPT}"
+    require_file "${STATS_SCRIPT}"
+    require_file "${BUILDER_SCRIPT}"
+    require_file "${BASE_BUILDER_SCRIPT}"
+    require_file "${V8_RUN}/student_args.json"
+    require_file "${V8_RUN}/student_best.weights.h5"
+    require_file "${V8_FIDELITY}"
+
+    require_no_crlf "${PIPELINE_SCRIPT}"
+    require_no_crlf "${GPU_WORKER}"
+
+    bash -n "${PIPELINE_SCRIPT}"
+    bash -n "${GPU_WORKER}"
+
+    activate_environment
+
+    python -m py_compile "${ANALYSIS_SCRIPT}"
+    python -m py_compile "${BASE_ANALYSIS_SCRIPT}"
+    python -m py_compile "${STATS_SCRIPT}"
+    python -m py_compile "${BUILDER_SCRIPT}"
+    python -m py_compile "${BASE_BUILDER_SCRIPT}"
+
+    python - "${V8_FIDELITY}" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+with open(
+    path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    payload = json.load(
+        handle
+    )
+
+if payload.get(
+    "passed"
+) is not True:
+    raise SystemExit(
+        f"native fidelity did not pass: "
+        f"{path}"
+    )
+
+print(
+    f"[PREFLIGHT] native fidelity passed: "
+    f"{path}"
+)
+PY
+
+    mkdir -p "${V8_ROOT}"
+    mkdir -p "${OUT_DIR}"
+
+    log "Preflight passed for mode=${MODE}"
+}
+
+
+condition_matches_request() {
+    local condition_name=$1
+    local method=$2
+    local state_bits=$3
+    local residual_bits=$4
+    local counter_bits=$5
+    local deadzone=$6
+
+    local out_dir="${V8_ROOT}/${condition_name}"
+    local flag="${out_dir}/recurrent_memory_complete.flag"
+    local summary="${out_dir}/recurrent_memory_summary.json"
+    local manifest="${out_dir}/recurrent_memory_manifest.json"
+    local prediction="${out_dir}/recurrent_memory_per_sequence.npz"
+
+    if [[ ! -f "${flag}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${summary}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${manifest}" ]]; then
+        return 1
+    fi
+
+    if [[ ! -f "${prediction}" ]]; then
+        return 1
+    fi
+
+    python - \
+        "${flag}" \
+        "${summary}" \
+        "${manifest}" \
+        "${condition_name}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}" \
+        "${V8_RUN}" \
+        "${V8_FIDELITY}" \
+        "${ANALYSIS_SCRIPT}" \
+        "${BASE_ANALYSIS_SCRIPT}" <<'PY'
+import hashlib
+import json
+import math
+import sys
+from pathlib import Path
+
+(
+    flag_path,
+    summary_path,
+    manifest_path,
+    condition_name,
+    method,
+    state_bits,
+    residual_bits,
+    counter_bits,
+    deadzone,
+    run_dir,
+    fidelity_json,
+    analysis_script,
+    base_analysis_script,
+) = sys.argv[1:]
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+
+    with open(
+        path,
+        "rb",
+    ) as handle:
+        while True:
+            block = handle.read(
+                1024
+                * 1024
+            )
+
+            if not block:
+                break
+
+            digest.update(
+                block
+            )
+
+    return digest.hexdigest()
+
+
+with open(
+    flag_path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    if (
+        handle.read().strip()
+        != condition_name
+    ):
+        raise SystemExit(1)
+
+
+with open(
+    summary_path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    summary = json.load(
+        handle
+    )
+
+
+with open(
+    manifest_path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    manifest = json.load(
+        handle
+    )
+
+
+if (
+    summary.get(
+        "condition_name"
+    )
+    != condition_name
+):
+    raise SystemExit(1)
+
+
+if (
+    manifest.get(
+        "condition_name"
+    )
+    != condition_name
+):
+    raise SystemExit(1)
+
+
+if (
+    summary.get(
+        "phase"
+    )
+    != "VANILLA"
+):
+    raise SystemExit(1)
+
+
+if (
+    summary.get(
+        "method"
+    )
+    != method
+):
+    raise SystemExit(1)
+
+
+if (
+    manifest.get(
+        "run_dir"
+    )
+    != str(
+        Path(
+            run_dir
+        ).resolve()
+    )
+):
+    raise SystemExit(1)
+
+
+adapter = summary.get(
+    "adapter_equivalence"
+)
+
+if (
+    not isinstance(
+        adapter,
+        dict,
+    )
+    or adapter.get(
+        "passed"
+    )
+    is not True
+):
+    raise SystemExit(1)
+
+
+operator = summary.get(
+    "operator"
+)
+
+if not isinstance(
+    operator,
+    dict,
+):
+    raise SystemExit(1)
+
+
+if (
+    int(
+        operator.get(
+            "state_bits"
+        )
+    )
+    != int(
+        state_bits
+    )
+):
+    raise SystemExit(1)
+
+
+expected_residual = int(
+    residual_bits
+)
+
+if expected_residual >= 0:
+    if (
+        int(
+            operator.get(
+                "residual_bits"
+            )
+        )
+        != expected_residual
+    ):
+        raise SystemExit(1)
+
+
+expected_counter = int(
+    counter_bits
+)
+
+if expected_counter >= 0:
+    if (
+        int(
+            operator.get(
+                "counter_bits"
+            )
+        )
+        != expected_counter
+    ):
+        raise SystemExit(1)
+
+
+if method == "scw":
+    actual_deadzone = (
+        operator.get(
+            "deadzone_fraction_of_delta"
+        )
+    )
+
+    if actual_deadzone is None:
+        raise SystemExit(1)
+
+    if not math.isclose(
+        float(
+            actual_deadzone
+        ),
+        float(
+            deadzone
+        ),
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise SystemExit(1)
+
+
+if (
+    manifest.get(
+        "analysis_script_sha256"
+    )
+    != sha256_file(
+        analysis_script
+    )
+):
+    raise SystemExit(1)
+
+
+if (
+    manifest.get(
+        "base_analysis_script_sha256"
+    )
+    != sha256_file(
+        base_analysis_script
+    )
+):
+    raise SystemExit(1)
+
+
+if (
+    manifest.get(
+        "fidelity_json_sha256"
+    )
+    != sha256_file(
+        fidelity_json
+    )
+):
+    raise SystemExit(1)
+
+
+raise SystemExit(0)
+PY
+}
+
+
+submit_condition() {
+    local condition_name=$1
+    local method=$2
+    local state_bits=$3
+    local residual_bits=$4
+    local counter_bits=$5
+    local deadzone=$6
+
+    local out_dir="${V8_ROOT}/${condition_name}"
+
+    mkdir -p "${out_dir}"
+
+    if condition_matches_request \
+        "${condition_name}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}"
+    then
+        log "SKIP current condition: ${condition_name}"
+        return 0
+    fi
+
+    if [[ -f "${out_dir}/recurrent_memory_complete.flag" ]]; then
+        mv \
+            "${out_dir}/recurrent_memory_complete.flag" \
+            "${out_dir}/recurrent_memory_complete.flag.stale_$(date '+%Y%m%d_%H%M%S')"
+    fi
+
+    local job_id
+
+    job_id=$(
+        sbatch \
+            --parsable \
+            --job-name="rm_${condition_name}" \
+            "${GPU_WORKER}" \
+            "${V8_RUN}" \
+            VANILLA \
+            "${condition_name}" \
+            "${method}" \
+            "${state_bits}" \
+            "${residual_bits}" \
+            "${counter_bits}" \
+            "${deadzone}" \
+            "${out_dir}" \
+            "${V8_FIDELITY}"
+    )
+
+    if [[ -z "${job_id}" ]]; then
+        fatal "sbatch returned no job ID for ${condition_name}"
+    fi
+
+    JOB_IDS+=(
+        "${job_id}"
+    )
+
+    log "Submitted ${condition_name}: job ${job_id}"
+}
+
+
+verify_condition() {
+    local condition_name=$1
+    local method=$2
+    local state_bits=$3
+    local residual_bits=$4
+    local counter_bits=$5
+    local deadzone=$6
+
+    if ! condition_matches_request \
+        "${condition_name}" \
+        "${method}" \
+        "${state_bits}" \
+        "${residual_bits}" \
+        "${counter_bits}" \
+        "${deadzone}"
+    then
+        fatal "condition failed, is missing, or is stale: ${condition_name}"
+    fi
+
+    log "Verified ${condition_name}"
+}
+
+
+submit_gate() {
+    local dependency=""
+    local gate_id=""
+
+    if (( ${#JOB_IDS[@]} > 0 )); then
+        dependency=$(
+            IFS=:
+            echo "${JOB_IDS[*]}"
+        )
+
+        gate_id=$(
+            sbatch \
+                --parsable \
+                --job-name=rm_gate_v8alloc \
+                --dependency="afterany:${dependency}" \
+                "${PIPELINE_SCRIPT}" \
+                after-conditions
+        )
+
+    else
+        gate_id=$(
+            sbatch \
+                --parsable \
+                --job-name=rm_gate_v8alloc \
+                "${PIPELINE_SCRIPT}" \
+                after-conditions
+        )
+    fi
+
+    if [[ -z "${gate_id}" ]]; then
+        fatal "failed to submit V8 allocation gate"
+    fi
+
+    log "Submitted after-conditions gate: job ${gate_id}"
+}
+
+
+submit_missing_grid() {
+    JOB_IDS=()
+
+    submit_condition V8_det_B6 deterministic 6 -1 -1 0
+    submit_condition V8_det_B7 deterministic 7 -1 -1 0
+    submit_condition V8_det_B8 deterministic 8 -1 -1 0
+
+    submit_condition V8_residual_R2_B4 quantized_residual 4 2 -1 0
+    submit_condition V8_residual_R3_B4 quantized_residual 4 3 -1 0
+    submit_condition V8_residual_R4_B4 quantized_residual 4 4 -1 0
+
+    submit_condition V8_scw_K2_TH0_B4 scw 4 -1 2 0
+    submit_condition V8_scw_K2_TH1_8_B4 scw 4 -1 2 0.125
+
+    submit_condition V8_scw_K3_TH0_B4 scw 4 -1 3 0
+    submit_condition V8_scw_K3_TH1_8_B4 scw 4 -1 3 0.125
+
+    submit_condition V8_scw_K4_TH0_B4 scw 4 -1 4 0
+    submit_condition V8_scw_K4_TH1_8_B4 scw 4 -1 4 0.125
+
+    submit_condition V8_forced_B4 deterministic 4 -1 -1 0
+    submit_condition V8_ef_B4 error_feedback 4 -1 -1 0
+
+    submit_gate
+}
+
+
+verify_full_grid() {
+    verify_condition V8_det_B6 deterministic 6 -1 -1 0
+    verify_condition V8_det_B7 deterministic 7 -1 -1 0
+    verify_condition V8_det_B8 deterministic 8 -1 -1 0
+
+    verify_condition V8_residual_R2_B4 quantized_residual 4 2 -1 0
+    verify_condition V8_residual_R3_B4 quantized_residual 4 3 -1 0
+    verify_condition V8_residual_R4_B4 quantized_residual 4 4 -1 0
+
+    verify_condition V8_scw_K2_TH0_B4 scw 4 -1 2 0
+    verify_condition V8_scw_K2_TH1_8_B4 scw 4 -1 2 0.125
+
+    verify_condition V8_scw_K3_TH0_B4 scw 4 -1 3 0
+    verify_condition V8_scw_K3_TH1_8_B4 scw 4 -1 3 0.125
+
+    verify_condition V8_scw_K4_TH0_B4 scw 4 -1 4 0
+    verify_condition V8_scw_K4_TH1_8_B4 scw 4 -1 4 0.125
+
+    verify_condition V8_forced_B4 deterministic 4 -1 -1 0
+    verify_condition V8_ef_B4 error_feedback 4 -1 -1 0
+}
+
+
+build_results() {
+    rm -f "${FINAL_FLAG}"
+
+    python \
+        "${BUILDER_SCRIPT}" \
+        --v8-run-dir "${V8_RUN}" \
+        --out-dir "${OUT_DIR}" \
+        --paired-bootstrap-reps 2000 \
+        --paired-bootstrap-seed 20000 \
+        --paired-bootstrap-batch-reps 8
+
+    require_file "${FINAL_FLAG}"
+
+    python - "${OUT_DIR}/v8_allocation_study.json" <<'PY'
+import json
+import sys
+
+with open(
+    sys.argv[1],
+    "r",
+    encoding="utf-8",
+) as handle:
+    payload = json.load(
+        handle
+    )
+
+if payload.get(
+    "passed"
+) is not True:
+    raise SystemExit(
+        "v8_allocation_study.json "
+        "does not report passed=true"
+    )
+
+print(
+    "[V8 ALLOCATION] final "
+    "study validation passed"
+)
+PY
+}
+
+
+case "${MODE}" in
+    bootstrap)
+        preflight
+
+        log "Submitting the missing B8-trained allocation-grid conditions."
+
+        submit_missing_grid
+        ;;
+
+    after-conditions)
+        preflight
+
+        log "All submitted allocation jobs terminated. Validating the complete grid before paired aggregation."
+
+        verify_full_grid
+        build_results
+
+        log "V8 allocation study passed: ${OUT_DIR}"
+        ;;
+
+    *)
+        fatal "unknown mode=${MODE}; valid modes are bootstrap and after-conditions"
+        ;;
+esac

@@ -1,0 +1,311 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=04:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@300
+
+set -euo pipefail
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+PYTHON_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+SCRIPT_PATH="${PROJECT_DIR}/studentvanilla_scw"
+TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
+
+BITS_KERNEL=4
+BITS_BIAS=4
+BITS_RECURRENT=4
+BITS_ACTIVATION=4
+BITS_STATE=4
+COUNTER_BITS=4
+SCW_DEADZONE_FRACTION=0.125
+STUDENT_UNITS=32
+TEACHER_UNITS=128
+TEACHER_LAYERS=2
+BATCH_SIZE=1024
+ACCUMULATION_STEPS=1
+TEMPERATURE=4.0
+ALPHA=0.6
+WARMUP_EPOCHS=5
+TOTAL_EPOCHS=300
+PATIENCE=15
+LR=1e-4
+
+RESUME_FLAG=""
+
+if [[ "${1:-}" == "--resume" ]]; then
+    RESUME_FLAG="--resume"
+
+elif [[ -n "${1:-}" ]]; then
+    echo "FATAL: unsupported argument: ${1}"
+    echo "Usage: sbatch ./studentvanilla_scw [--resume]"
+    exit 1
+fi
+
+JOB_TAG="vanilla_scw_kd_T4.0_a0.6_b4k4r4a4s4_scwK4_th0p125_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+JOB_DIR="${PROJECT_DIR}/results/${JOB_TAG}"
+FINAL_FLAG="${JOB_DIR}/scw_training_complete.flag"
+TRAINING_FLAG="${JOB_DIR}/training_complete.flag"
+RESUME_STATE="${JOB_DIR}/resume_state.json"
+
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+    exit 1
+fi
+
+if [[ ! -d "${DATA_PATH}" ]]; then
+    echo "FATAL: data directory does not exist: ${DATA_PATH}"
+    exit 1
+fi
+
+if [[ ! -f "${PYTHON_SCRIPT}" ]]; then
+    echo "FATAL: training script does not exist: ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+if [[ ! -f "${TEACHER_WEIGHTS}" ]]; then
+    echo "FATAL: teacher checkpoint does not exist: ${TEACHER_WEIGHTS}"
+    exit 1
+fi
+
+if grep -q $'\r' "${SCRIPT_PATH}"; then
+    echo "FATAL: DOS CRLF line endings detected in ${SCRIPT_PATH}"
+    exit 1
+fi
+
+if grep -q $'\r' "${PYTHON_SCRIPT}"; then
+    echo "FATAL: DOS CRLF line endings detected in ${PYTHON_SCRIPT}"
+    exit 1
+fi
+
+bash -n "${SCRIPT_PATH}"
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${PIP_TMPDIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+mkdir -p "${JOB_DIR}"
+
+python -m py_compile "${PYTHON_SCRIPT}"
+python -m py_compile "${PROJECT_DIR}/train_student_vanilla_kd.py"
+python -m py_compile "${PROJECT_DIR}/train_student_memoq.py"
+
+GPU_CHECK=$(python -c 'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' 2>/dev/null)
+
+if [[ -z "${GPU_CHECK}" || "${GPU_CHECK}" == "0" ]]; then
+    echo "FATAL: TensorFlow found zero GPUs."
+    exit 1
+fi
+
+if [[ "${RESUME_FLAG}" == "--resume" ]]; then
+    if [[ -f "${FINAL_FLAG}" ]]; then
+        echo "SCW training and evaluation are already complete: ${FINAL_FLAG}"
+        exit 0
+    fi
+
+    if [[ ! -f "${RESUME_STATE}" && ! -f "${TRAINING_FLAG}" ]]; then
+        echo "FATAL: --resume requested but neither resume_state.json nor training_complete.flag exists."
+        echo "Expected resume state: ${RESUME_STATE}"
+        echo "Expected training flag: ${TRAINING_FLAG}"
+        exit 1
+    fi
+fi
+
+echo "============================================================"
+echo "SCW VANILLA KD TRAINING"
+echo "PROJECT_DIR          : ${PROJECT_DIR}"
+echo "DATA_PATH            : ${DATA_PATH}"
+echo "JOB_DIR              : ${JOB_DIR}"
+echo "TEACHER_WEIGHTS      : ${TEACHER_WEIGHTS}"
+echo "BITS k/r/b/a/s       : ${BITS_KERNEL}/${BITS_RECURRENT}/${BITS_BIAS}/${BITS_ACTIVATION}/${BITS_STATE}"
+echo "SCW counter bits     : ${COUNTER_BITS}"
+echo "SCW deadzone fraction: ${SCW_DEADZONE_FRACTION}"
+echo "BATCH_SIZE           : ${BATCH_SIZE}"
+echo "TEMPERATURE          : ${TEMPERATURE}"
+echo "ALPHA                : ${ALPHA}"
+echo "LR                   : ${LR}"
+echo "WARMUP_EPOCHS        : ${WARMUP_EPOCHS}"
+echo "RESUME               : ${RESUME_FLAG:-off}"
+echo "PYTHON               : $(which python)"
+echo "TF VERSION           : $(python -c 'import tensorflow as tf; print(tf.__version__)')"
+echo "QKERAS VERSION       : $(python -c 'import qkeras; print(qkeras.__version__)' 2>/dev/null || echo n/a)"
+echo "============================================================"
+
+cmd=(
+    python
+    "${PYTHON_SCRIPT}"
+    --data-dir "${DATA_PATH}"
+    --save-dir "${PROJECT_DIR}"
+    --teacher-ckpt "${TEACHER_WEIGHTS}"
+    --teacher-units "${TEACHER_UNITS}"
+    --teacher-layers "${TEACHER_LAYERS}"
+    --student-units "${STUDENT_UNITS}"
+    --seq-len 135
+    --n-out 3
+    --gate-width-ns 0.09
+    --temperature "${TEMPERATURE}"
+    --alpha "${ALPHA}"
+    --bits-kernel "${BITS_KERNEL}"
+    --bits-bias "${BITS_BIAS}"
+    --bits-recurrent "${BITS_RECURRENT}"
+    --bits-activation "${BITS_ACTIVATION}"
+    --bits-state "${BITS_STATE}"
+    --q-alpha 1.0
+    --counter-bits "${COUNTER_BITS}"
+    --scw-deadzone-fraction "${SCW_DEADZONE_FRACTION}"
+    --batch-size "${BATCH_SIZE}"
+    --accumulation-steps "${ACCUMULATION_STEPS}"
+    --epochs "${TOTAL_EPOCHS}"
+    --patience "${PATIENCE}"
+    --min-delta 1e-5
+    --lr "${LR}"
+    --ref-batch-size 1024
+    --lr-factor 0.5
+    --lr-patience 8
+    --lr-min 1e-6
+    --warmup-epochs "${WARMUP_EPOCHS}"
+    --infer-batch 4096
+    --log-interval 10
+    --prefetch-batches 32
+    --pipeline-workers 4
+    --split-seed 42
+)
+
+if [[ "${RESUME_FLAG}" == "--resume" ]]; then
+    cmd+=(--resume)
+fi
+
+PYTHON_PID=""
+RESUBMIT=0
+
+handle_usr1() {
+    echo "============================================================"
+    echo "SIGUSR1 received by SLURM wrapper."
+    echo "Requesting Python to finish the current epoch and save an exact resume checkpoint."
+    echo "============================================================"
+
+    RESUBMIT=1
+
+    if [[ -n "${PYTHON_PID}" ]] && kill -0 "${PYTHON_PID}" 2>/dev/null; then
+        kill -USR1 "${PYTHON_PID}"
+    fi
+}
+
+trap handle_usr1 SIGUSR1
+
+"${cmd[@]}" &
+PYTHON_PID=$!
+
+echo "Python PID=${PYTHON_PID}"
+
+set +e
+wait "${PYTHON_PID}"
+EXIT_CODE=$?
+set -e
+
+echo "Python exited with code ${EXIT_CODE}"
+
+if [[ -f "${FINAL_FLAG}" ]]; then
+    echo "Final SCW completion flag found. No resubmission required."
+    exit 0
+fi
+
+if [[ "${EXIT_CODE}" == "143" || "${EXIT_CODE}" == "137" ]]; then
+    RESUBMIT=1
+fi
+
+if [[ "${EXIT_CODE}" != "0" && "${RESUBMIT}" == "0" ]]; then
+    echo "FATAL: Python exited with code ${EXIT_CODE}."
+    echo "The job will not auto-resubmit an unclassified training error."
+    exit "${EXIT_CODE}"
+fi
+
+if [[ -f "${TRAINING_FLAG}" && ! -f "${FINAL_FLAG}" ]]; then
+    echo "Training is complete but final evaluation is incomplete. Resubmitting in resume mode to finish evaluation."
+    RESUBMIT=1
+fi
+
+if [[ -f "${RESUME_STATE}" && ! -f "${FINAL_FLAG}" ]]; then
+    read -r COMPLETED_EPOCHS PATIENCE_COUNT < <(
+        python - "${RESUME_STATE}" <<'PY'
+import json
+import sys
+
+with open(
+    sys.argv[1],
+    "r",
+    encoding="utf-8",
+) as handle:
+    state = json.load(
+        handle
+    )
+
+print(
+    int(
+        state.get(
+            "epoch",
+            0,
+        )
+    ),
+    int(
+        state.get(
+            "patience_count",
+            0,
+        )
+    ),
+)
+PY
+    )
+
+    echo "resume_state epoch=${COMPLETED_EPOCHS} patience=${PATIENCE_COUNT}"
+
+    if [[ "${COMPLETED_EPOCHS}" -lt "${TOTAL_EPOCHS}" && "${PATIENCE_COUNT}" -lt "${PATIENCE}" ]]; then
+        RESUBMIT=1
+    fi
+fi
+
+if [[ "${RESUBMIT}" == "1" ]]; then
+    echo "Submitting continuation with --resume."
+
+    NEW_JOB_ID=$(
+        sbatch
+        --parsable
+        --job-name="${SLURM_JOB_NAME}"
+        "${SCRIPT_PATH}"
+        --resume
+    )
+
+    echo "Resubmitted as job ${NEW_JOB_ID}"
+    exit 0
+fi
+
+echo "FATAL: SCW final completion flag is missing and no safe resubmission condition was detected."
+exit 1
