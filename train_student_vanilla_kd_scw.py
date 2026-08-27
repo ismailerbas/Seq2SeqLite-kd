@@ -3276,7 +3276,6 @@ def build_scw_student(
         )
 
     return model
-
 def train_step_per_replica(
     batch_x,
     batch_y,
