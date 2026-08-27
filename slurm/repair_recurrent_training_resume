@@ -1,0 +1,92 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=1
+#SBATCH --time=00:15:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+REPAIR_SCRIPT="${PROJECT_DIR}/eval/repair_recurrent_training_resume.py"
+PIPELINE_SCRIPT="${PROJECT_DIR}/slurm/recurrent_training_pipeline"
+PYTHON="/gpfs/u/home/HBNN/HBNNrbss/scratch/miniconda3x86/envs/tf210_qkeras/bin/python"
+
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+    exit 1
+fi
+
+if [[ ! -x "${PYTHON}" ]]; then
+    echo "FATAL: Python executable does not exist: ${PYTHON}"
+    exit 1
+fi
+
+if [[ ! -f "${REPAIR_SCRIPT}" ]]; then
+    echo "FATAL: repair script does not exist: ${REPAIR_SCRIPT}"
+    exit 1
+fi
+
+if [[ ! -f "${PIPELINE_SCRIPT}" ]]; then
+    echo "FATAL: pipeline script does not exist: ${PIPELINE_SCRIPT}"
+    exit 1
+fi
+
+cd "${PROJECT_DIR}"
+
+ACTIVE_WORKERS="$(
+    squeue \
+        -h \
+        -u "${USER}" \
+        -o '%j' \
+    | grep -E '^(mem_b4_s(42|43|44)|mem_b6_s(42|43|44)|mem_r2_s(42|43|44)|mem_scw_k2_s(42|43|44))$' \
+    || true
+)"
+
+if [[ -n "${ACTIVE_WORKERS}" ]]; then
+    echo "FATAL: recurrent-memory training workers are still active."
+    echo "Wait for these workers to become terminal before recovery:"
+    printf '%s\n' "${ACTIVE_WORKERS}"
+    exit 1
+fi
+
+ACTIVE_GATES="$(
+    squeue \
+        -h \
+        -u "${USER}" \
+        -n mem_train_gate \
+        -o '%i %j %T %R' \
+    || true
+)"
+
+if [[ -n "${ACTIVE_GATES}" ]]; then
+    echo "FATAL: an existing mem_train_gate job is still queued."
+    echo "Cancel the old gate before running recovery:"
+    printf '%s\n' "${ACTIVE_GATES}"
+    exit 1
+fi
+
+"${PYTHON}" \
+    -m \
+    py_compile \
+    "${REPAIR_SCRIPT}"
+
+"${PYTHON}" \
+    "${REPAIR_SCRIPT}" \
+    --project-dir "${PROJECT_DIR}"
+
+GATE_SUBMISSION="$(
+    sbatch \
+        --job-name=mem_train_gate \
+        "${PIPELINE_SCRIPT}" \
+        gate
+)"
+
+printf '%s\n' "${GATE_SUBMISSION}"
+
+echo "Recovery metadata passed. A new mem_train_gate was submitted."
+echo "The gate will submit only incomplete runs that have valid controlled-resume markers."
+echo "Future walltime continuations will be chained automatically by the pipeline."

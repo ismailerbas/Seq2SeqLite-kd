@@ -418,12 +418,21 @@ handle_usr1() {
     echo "The dependent gate will submit the continuation after this job terminates."
     echo "============================================================"
 
+    if [[ "${STOP_REQUESTED}" == "1" ]]; then
+        echo "Controlled stop was already requested; ignoring duplicate SIGUSR1."
+        return
+    fi
+
     STOP_REQUESTED=1
 
     printf 'requested\n' > "${RESUME_REQUEST_FLAG}"
 
     if [[ -n "${PYTHON_PID}" ]] && kill -0 "${PYTHON_PID}" 2>/dev/null; then
-        kill -USR1 "${PYTHON_PID}"
+        if ! kill -USR1 "${PYTHON_PID}" 2>/dev/null; then
+            echo "Python exited before SIGUSR1 could be forwarded."
+        fi
+    else
+        echo "Python is not running; controlled-stop marker retained for gate inspection."
     fi
 }
 
@@ -434,26 +443,51 @@ PYTHON_PID=$!
 
 echo "Python PID=${PYTHON_PID}"
 
-set +e
-wait "${PYTHON_PID}"
-EXIT_CODE=$?
-set -e
+EXIT_CODE=0
+
+while true; do
+    set +e
+
+    wait "${PYTHON_PID}"
+    WAIT_STATUS=$?
+
+    set -e
+
+    if [[ "${WAIT_STATUS}" == "138" ]] && \
+       [[ "${STOP_REQUESTED}" == "1" ]] && \
+       kill -0 "${PYTHON_PID}" 2>/dev/null; then
+
+        echo "Bash wait was interrupted by SIGUSR1 while Python is still running."
+        echo "Continuing to wait for Python to finish the current epoch and save its exact checkpoint."
+
+        continue
+    fi
+
+    EXIT_CODE="${WAIT_STATUS}"
+
+    break
+done
 
 echo "Python exited with code ${EXIT_CODE}"
 
 if [[ -f "${FINAL_FLAG}" ]]; then
     rm -f "${RESUME_REQUEST_FLAG}"
+
     echo "Campaign condition completed successfully: ${FINAL_FLAG}"
+
     exit 0
 fi
 
 if [[ "${EXIT_CODE}" != "0" ]]; then
+
     if [[ "${STOP_REQUESTED}" == "1" ]] && \
-       [[ "${EXIT_CODE}" == "137" || "${EXIT_CODE}" == "143" ]] && \
+       [[ "${EXIT_CODE}" == "137" || "${EXIT_CODE}" == "138" || "${EXIT_CODE}" == "143" ]] && \
        [[ -f "${RESUME_STATE}" || -f "${TRAINING_FLAG}" ]]; then
-        echo "Python was terminated after a controlled walltime checkpoint request."
-        echo "A valid resumable state exists."
+
+        echo "Python terminated after a controlled walltime checkpoint request."
+        echo "A valid resumable checkpoint state exists."
         echo "The dependent gate will submit the continuation."
+
         exit 0
     fi
 
@@ -462,22 +496,28 @@ if [[ "${EXIT_CODE}" != "0" ]]; then
     echo "FATAL: Python exited with code ${EXIT_CODE}."
     echo "This was not classified as a controlled walltime continuation."
     echo "The dependent gate will stop rather than repeatedly resubmit a failing run."
+
     exit "${EXIT_CODE}"
 fi
 
 if [[ "${STOP_REQUESTED}" == "1" ]]; then
+
     if [[ ! -f "${RESUME_STATE}" && ! -f "${TRAINING_FLAG}" ]]; then
         rm -f "${RESUME_REQUEST_FLAG}"
+
         echo "FATAL: controlled checkpoint stop was requested but no resumable state exists."
+
         exit 1
     fi
 
     echo "Worker stopped cleanly with resumable state."
     echo "The dependent pipeline gate will submit this condition with --resume."
+
     exit 0
 fi
 
 rm -f "${RESUME_REQUEST_FLAG}"
 
 echo "FATAL: Python exited normally without the final campaign flag and without a controlled walltime request."
+
 exit 1
