@@ -1335,6 +1335,35 @@ def build_scw_model(
     deadzone_fraction: float,
     build_encoder_batch: np.ndarray,
 ) -> SCWStudentModel:
+    encoder_array = np.asarray(
+        build_encoder_batch,
+        dtype=np.float32,
+    )
+
+    if encoder_array.ndim != 3:
+        raise RuntimeError(
+            "SCW build encoder batch must have rank 3 "
+            f"(batch, sequence, features); got shape "
+            f"{encoder_array.shape}"
+        )
+
+    if encoder_array.shape[0] <= 0:
+        raise RuntimeError(
+            "SCW build encoder batch must contain at least one sample"
+        )
+
+    if encoder_array.shape[1] != SEQ_LEN:
+        raise RuntimeError(
+            "SCW build encoder batch sequence length mismatch: "
+            f"expected {SEQ_LEN}, got {encoder_array.shape[1]}"
+        )
+
+    if encoder_array.shape[2] != 1:
+        raise RuntimeError(
+            "SCW build encoder batch feature dimension mismatch: "
+            f"expected 1, got {encoder_array.shape[2]}"
+        )
+
     model = SCWStudentModel(
         seq_len=SEQ_LEN,
         n_out=N_OUT,
@@ -1349,17 +1378,92 @@ def build_scw_model(
         q_alpha=Q_ALPHA,
     )
 
-    enc = tf.convert_to_tensor(
-        np.asarray(
-            build_encoder_batch,
-            dtype=np.float32,
+    if not model.sencgru.built:
+        model.sencgru.build(
+            tf.TensorShape(
+                [
+                    None,
+                    encoder_array.shape[2],
+                ]
+            )
+        )
+
+    if not model.sdecgru.built:
+        model.sdecgru.build(
+            tf.TensorShape(
+                [
+                    None,
+                    1,
+                ]
+            )
+        )
+
+    if not model.sdec_dense.built:
+        model.sdec_dense.build(
+            tf.TensorShape(
+                [
+                    None,
+                    SEQ_LEN,
+                    STUDENT_UNITS,
+                ]
+            )
+        )
+
+    for layer_name, layer in (
+        (
+            "sencgru",
+            model.sencgru,
         ),
+        (
+            "sdecgru",
+            model.sdecgru,
+        ),
+    ):
+        if not layer.built:
+            raise RuntimeError(
+                f"{layer_name} did not build"
+            )
+
+        for attribute in (
+            "kernel",
+            "recurrent_kernel",
+            "bias",
+        ):
+            if not hasattr(
+                layer,
+                attribute,
+            ):
+                raise RuntimeError(
+                    f"{layer_name} failed to create "
+                    f"required variable {attribute}"
+                )
+
+    if not model.sdec_dense.built:
+        raise RuntimeError(
+            "sdec_dense did not build"
+        )
+
+    for attribute in (
+        "kernel",
+        "bias",
+    ):
+        if not hasattr(
+            model.sdec_dense,
+            attribute,
+        ):
+            raise RuntimeError(
+                "sdec_dense failed to create "
+                f"required variable {attribute}"
+            )
+
+    enc = tf.convert_to_tensor(
+        encoder_array,
         dtype=tf.float32,
     )
 
     dec = tf.zeros(
         (
-            enc.shape[0],
+            encoder_array.shape[0],
             SEQ_LEN,
             1,
         ),
@@ -1374,6 +1478,11 @@ def build_scw_model(
         training=False,
         operator_mode="deterministic",
     )
+
+    if not model.built:
+        raise RuntimeError(
+            "SCWStudentModel did not build after deterministic warm-up call"
+        )
 
     model.trainable = False
 

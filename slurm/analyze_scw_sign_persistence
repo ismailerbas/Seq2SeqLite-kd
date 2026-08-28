@@ -1,5 +1,4 @@
 #!/bin/bash
-#SBATCH --job-name=scw_persist
 #SBATCH --output=slurm-%A_%x.out
 #SBATCH --error=slurm-%A_%x.err
 #SBATCH --nodes=1
@@ -9,6 +8,7 @@
 #SBATCH --time=02:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
 
 set -euo pipefail
 
@@ -51,9 +51,9 @@ export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
 export PYTHONUNBUFFERED=1
 
-PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+PROJECT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
-DATA_PATH="${SCRATCH_BASE}/nmi"
+DATA_PATH="${PROJECT_DIR}"
 SAVE_DIR="${PROJECT_DIR}"
 ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_scw_sign_persistence.py"
 OUTPUT_DIR="${PROJECT_DIR}/results/scw_sign_persistence_analysis"
