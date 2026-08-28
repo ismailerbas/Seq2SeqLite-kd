@@ -3,15 +3,17 @@
 #SBATCH --error=slurm-%A_%x.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=2
-#SBATCH --time=01:00:00
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
 
 set -euo pipefail
 
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
-SLURM_DIR="${PROJECT_DIR}/slurm"
+SLURM_DIR="${PROJECT_DIR}"
 DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
 WORKER="${SLURM_DIR}/studentvanilla_memory_train"
@@ -22,7 +24,6 @@ TEACHER_WEIGHTS="${DATA_PATH}/teacher_best.weights.h5"
 TEACHER_CACHE="${DATA_PATH}/teacherPred_vanillaKD_L1351600000.npy"
 CAMPAIGN_SPEC="${CAMPAIGN_ROOT}/campaign_spec.json"
 MODE="${1:-bootstrap}"
-
 CONDITIONS=(b4 b6 r2 scw_k2)
 SEEDS=(42 43 44)
 
@@ -834,7 +835,6 @@ PY_MODEL_SMOKE
     log "Preflight passed"
 }
 
-
 write_or_verify_campaign_spec() {
     local training_sha
     local baseline_sha
@@ -844,19 +844,62 @@ write_or_verify_campaign_spec() {
     local pipeline_sha
     local teacher_sha
     local teacher_cache_sha
-    training_sha="$(sha256_file "${TRAINING_SCRIPT}")"
-    baseline_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd.py")"
-    scw_sha="$(sha256_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py")"
-    aggregate_sha="$(sha256_file "${AGGREGATE_SCRIPT}")"
-    worker_sha="$(sha256_file "${WORKER}")"
-    pipeline_sha="$(sha256_file "${PIPELINE_SCRIPT}")"
-    teacher_sha="$(sha256_file "${TEACHER_WEIGHTS}")"
-    teacher_cache_sha="$(sha256_file "${TEACHER_CACHE}")"
+
+    training_sha="$(
+        sha256_file \
+            "${TRAINING_SCRIPT}"
+    )"
+
+    baseline_sha="$(
+        sha256_file \
+            "${PROJECT_DIR}/train_student_vanilla_kd.py"
+    )"
+
+    scw_sha="$(
+        sha256_file \
+            "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+    )"
+
+    aggregate_sha="$(
+        sha256_file \
+            "${AGGREGATE_SCRIPT}"
+    )"
+
+    worker_sha="$(
+        sha256_file \
+            "${WORKER}"
+    )"
+
+    pipeline_sha="$(
+        sha256_file \
+            "${PIPELINE_SCRIPT}"
+    )"
+
+    teacher_sha="$(
+        sha256_file \
+            "${TEACHER_WEIGHTS}"
+    )"
+
+    teacher_cache_sha="$(
+        sha256_file \
+            "${TEACHER_CACHE}"
+    )"
 
     if [[ ! -f "${CAMPAIGN_SPEC}" ]]; then
-        if find "${CAMPAIGN_ROOT}/results" -mindepth 1 -maxdepth 1 -type d -name 'vanilla_memory_*' -print -quit | grep -q .; then
-            fatal "campaign results already exist but campaign_spec.json is missing"
+        if find \
+            "${CAMPAIGN_ROOT}/results" \
+            -mindepth 1 \
+            -maxdepth 1 \
+            -type d \
+            -name 'vanilla_memory_*' \
+            -print \
+            -quit \
+            | grep -q .; then
+
+            fatal \
+                "campaign results already exist but campaign_spec.json is missing"
         fi
+
         python - \
             "${CAMPAIGN_SPEC}" \
             "${training_sha}" \
@@ -873,6 +916,7 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+
 (
     path,
     training_sha,
@@ -884,13 +928,28 @@ from pathlib import Path
     teacher_sha,
     teacher_cache_sha,
 ) = sys.argv[1:]
+
+
 payload = {
-    "created_utc": datetime.now(timezone.utc).isoformat(),
+    "created_utc": datetime.now(
+        timezone.utc
+    ).isoformat(),
     "locked_before_training": True,
-    "conditions": ["b4", "b6", "r2", "scw_k2"],
-    "init_seeds": [42, 43, 44],
+    "conditions": [
+        "b4",
+        "b6",
+        "r2",
+        "scw_k2",
+    ],
+    "init_seeds": [
+        42,
+        43,
+        44,
+    ],
     "split_seed": 42,
-    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "epoch_shuffle_policy": (
+        "split_seed_plus_zero_based_epoch"
+    ),
     "alpha": 0.6,
     "temperature": 4.0,
     "batch_size": 1024,
@@ -939,21 +998,63 @@ payload = {
         "worker": worker_sha,
         "pipeline": pipeline_sha,
     },
-    "teacher_checkpoint_sha256": teacher_sha,
-    "teacher_prediction_cache": "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/teacherPred_vanillaKD_L1351600000.npy",
-    "teacher_prediction_cache_sha256": teacher_cache_sha,
+    "teacher_checkpoint_sha256": (
+        teacher_sha
+    ),
+    "teacher_prediction_cache": (
+        "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/"
+        "teacherPred_vanillaKD_L1351600000.npy"
+    ),
+    "teacher_prediction_cache_sha256": (
+        teacher_cache_sha
+    ),
 }
-target = Path(path)
-target.parent.mkdir(parents=True, exist_ok=True)
-tmp = target.with_suffix(target.suffix + ".tmp")
-with tmp.open("w", encoding="utf-8") as handle:
-    json.dump(payload, handle, indent=2, sort_keys=True, allow_nan=False)
-    handle.write("\n")
+
+
+target = Path(
+    path
+)
+
+target.parent.mkdir(
+    parents=True,
+    exist_ok=True,
+)
+
+temporary = target.with_suffix(
+    target.suffix + ".tmp"
+)
+
+with temporary.open(
+    "w",
+    encoding="utf-8",
+) as handle:
+    json.dump(
+        payload,
+        handle,
+        indent=2,
+        sort_keys=True,
+        allow_nan=False,
+    )
+
+    handle.write(
+        "\n"
+    )
+
     handle.flush()
-    os.fsync(handle.fileno())
-os.replace(tmp, target)
+
+    os.fsync(
+        handle.fileno()
+    )
+
+
+os.replace(
+    temporary,
+    target,
+)
 PY_CREATE_SPEC
-        log "Created locked campaign specification: ${CAMPAIGN_SPEC}"
+
+        log \
+            "Created locked campaign specification: ${CAMPAIGN_SPEC}"
     fi
 
     python - \
@@ -963,12 +1064,12 @@ PY_CREATE_SPEC
         "${scw_sha}" \
         "${aggregate_sha}" \
         "${worker_sha}" \
-        "${pipeline_sha}" \
         "${teacher_sha}" \
         "${teacher_cache_sha}" <<'PY_VERIFY_SPEC'
 import json
 import math
 import sys
+
 
 (
     path,
@@ -977,55 +1078,178 @@ import sys
     scw_sha,
     aggregate_sha,
     worker_sha,
-    pipeline_sha,
     teacher_sha,
     teacher_cache_sha,
 ) = sys.argv[1:]
-with open(path, "r", encoding="utf-8") as handle:
-    data = json.load(handle)
+
+
+with open(
+    path,
+    "r",
+    encoding="utf-8",
+) as handle:
+    data = json.load(
+        handle
+    )
+
+
 expected = {
     "locked_before_training": True,
-    "conditions": ["b4", "b6", "r2", "scw_k2"],
-    "init_seeds": [42, 43, 44],
+    "conditions": [
+        "b4",
+        "b6",
+        "r2",
+        "scw_k2",
+    ],
+    "init_seeds": [
+        42,
+        43,
+        44,
+    ],
     "split_seed": 42,
-    "epoch_shuffle_policy": "split_seed_plus_zero_based_epoch",
+    "epoch_shuffle_policy": (
+        "split_seed_plus_zero_based_epoch"
+    ),
     "alpha": 0.6,
     "temperature": 4.0,
     "batch_size": 1024,
+    "epochs_max": 300,
+    "early_stopping_patience": 15,
+    "min_delta": 1e-5,
+    "base_lr": 1e-4,
+    "lr_factor": 0.5,
+    "lr_patience": 8,
+    "lr_min": 1e-6,
+    "warmup_epochs": 5,
+    "b4": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 0,
+        "total_stored_bits_per_unit": 4,
+    },
+    "b6": {
+        "recurrence_visible_state_bits": 6,
+        "auxiliary_memory_bits": 0,
+        "total_stored_bits_per_unit": 6,
+        "kernel_recurrent_bias_activation_bits": 4,
+    },
+    "r2": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 2,
+        "total_stored_bits_per_unit": 6,
+        "residual_bits": 2,
+        "residual_levels": 4,
+        "auxiliary_gradient": "stop_gradient",
+    },
+    "scw_k2": {
+        "recurrence_visible_state_bits": 4,
+        "auxiliary_memory_bits": 2,
+        "total_stored_bits_per_unit": 6,
+        "counter_bits": 2,
+        "trigger_votes": 2,
+        "deadzone_fraction_of_delta": 0.125,
+        "counter_gradient": "none",
+    },
     "report_all_conditions": True,
-    "teacher_checkpoint_sha256": teacher_sha,
-    "teacher_prediction_cache_sha256": teacher_cache_sha,
+    "teacher_checkpoint_sha256": (
+        teacher_sha
+    ),
+    "teacher_prediction_cache": (
+        "/gpfs/u/scratch/HBNN/HBNNrbss/nmi/"
+        "teacherPred_vanillaKD_L1351600000.npy"
+    ),
+    "teacher_prediction_cache_sha256": (
+        teacher_cache_sha
+    ),
 }
-for key, value in expected.items():
-    actual = data.get(key)
-    if isinstance(value, float):
-        if not isinstance(actual, (int, float)) or not math.isclose(
-            float(actual), value, rel_tol=0.0, abs_tol=0.0
+
+
+for key, expected_value in expected.items():
+    actual_value = data.get(
+        key
+    )
+
+    if isinstance(
+        expected_value,
+        float,
+    ):
+        if (
+            not isinstance(
+                actual_value,
+                (
+                    int,
+                    float,
+                ),
+            )
+            or not math.isclose(
+                float(
+                    actual_value
+                ),
+                expected_value,
+                rel_tol=0.0,
+                abs_tol=0.0,
+            )
         ):
             raise SystemExit(
-                f"campaign spec mismatch {key}: expected={value!r} got={actual!r}"
+                f"campaign spec mismatch {key}: "
+                f"expected={expected_value!r} "
+                f"got={actual_value!r}"
             )
-    elif actual != value:
+
+    elif actual_value != expected_value:
         raise SystemExit(
-            f"campaign spec mismatch {key}: expected={value!r} got={actual!r}"
+            f"campaign spec mismatch {key}: "
+            f"expected={expected_value!r} "
+            f"got={actual_value!r}"
         )
-expected_hashes = {
+
+
+script_hashes = data.get(
+    "script_hashes"
+)
+
+if not isinstance(
+    script_hashes,
+    dict,
+):
+    raise SystemExit(
+        "campaign spec script_hashes "
+        "is missing or is not an object"
+    )
+
+
+required_script_hashes = {
     "training": training_sha,
     "baseline": baseline_sha,
     "scw": scw_sha,
     "aggregate": aggregate_sha,
     "worker": worker_sha,
-    "pipeline": pipeline_sha,
-}
-if data.get("script_hashes") != expected_hashes:
-    raise SystemExit(
-        f"campaign spec script hash mismatch: expected={expected_hashes!r} "
-        f"got={data.get('script_hashes')!r}"
-    )
-PY_VERIFY_SPEC
-    log "Campaign specification verified"
 }
 
+
+for key, expected_hash in (
+    required_script_hashes.items()
+):
+    actual_hash = script_hashes.get(
+        key
+    )
+
+    if actual_hash != expected_hash:
+        raise SystemExit(
+            "campaign script hash mismatch "
+            f"for {key}: "
+            f"expected={expected_hash!r} "
+            f"got={actual_hash!r}"
+        )
+
+
+print(
+    "CAMPAIGN_SPEC_VERIFIED"
+)
+PY_VERIFY_SPEC
+
+    log \
+        "Campaign specification verified"
+}
 verify_provenance() {
     local condition="$1"
     local seed="$2"

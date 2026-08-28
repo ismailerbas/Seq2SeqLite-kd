@@ -13,7 +13,7 @@
 set -euo pipefail
 
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
-SLURM_DIR="${PROJECT_DIR}/slurm"
+SLURM_DIR="${PROJECT_DIR}"
 DATA_PATH="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
 SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
 CAMPAIGN_ROOT="${PROJECT_DIR}/recurrent_training_campaign"
@@ -109,7 +109,7 @@ fi
 
 if [[ ! -f "${CAMPAIGN_SPEC}" ]]; then
     echo "FATAL: locked campaign specification does not exist: ${CAMPAIGN_SPEC}"
-    echo "Launch the campaign through slurm/recurrent_training_pipeline bootstrap."
+    echo "Launch the campaign through recurrent_training_pipeline bootstrap."
     exit 1
 fi
 

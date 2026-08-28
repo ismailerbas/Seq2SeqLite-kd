@@ -3,55 +3,87 @@
 #SBATCH --error=slurm-%A_%x.err
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=1
-#SBATCH --time=00:15:00
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=01:00:00
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@1200
 
 set -euo pipefail
 
 PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
 REPAIR_SCRIPT="${PROJECT_DIR}/eval/repair_recurrent_training_resume.py"
-PIPELINE_SCRIPT="${PROJECT_DIR}/slurm/recurrent_training_pipeline"
+PIPELINE_SCRIPT="${PROJECT_DIR}/recurrent_training_pipeline"
 PYTHON="/gpfs/u/home/HBNN/HBNNrbss/scratch/miniconda3x86/envs/tf210_qkeras/bin/python"
 
-if [[ ! -d "${PROJECT_DIR}" ]]; then
-    echo "FATAL: project directory does not exist: ${PROJECT_DIR}"
+
+fatal() {
+    printf 'FATAL: %s\n' "$*" >&2
     exit 1
+}
+
+
+if [[ ! -d "${PROJECT_DIR}" ]]; then
+    fatal \
+        "project directory does not exist: ${PROJECT_DIR}"
 fi
+
 
 if [[ ! -x "${PYTHON}" ]]; then
-    echo "FATAL: Python executable does not exist: ${PYTHON}"
-    exit 1
+    fatal \
+        "Python executable does not exist: ${PYTHON}"
 fi
+
 
 if [[ ! -f "${REPAIR_SCRIPT}" ]]; then
-    echo "FATAL: repair script does not exist: ${REPAIR_SCRIPT}"
-    exit 1
+    fatal \
+        "repair script does not exist: ${REPAIR_SCRIPT}"
 fi
+
 
 if [[ ! -f "${PIPELINE_SCRIPT}" ]]; then
-    echo "FATAL: pipeline script does not exist: ${PIPELINE_SCRIPT}"
-    exit 1
+    fatal \
+        "pipeline script does not exist: ${PIPELINE_SCRIPT}"
 fi
 
+
+command -v squeue >/dev/null 2>&1 || \
+    fatal "squeue is not available"
+
+
+command -v sbatch >/dev/null 2>&1 || \
+    fatal "sbatch is not available"
+
+
 cd "${PROJECT_DIR}"
+
 
 ACTIVE_WORKERS="$(
     squeue \
         -h \
         -u "${USER}" \
         -o '%j' \
-    | grep -E '^(mem_b4_s(42|43|44)|mem_b6_s(42|43|44)|mem_r2_s(42|43|44)|mem_scw_k2_s(42|43|44))$' \
+    | grep -E \
+        '^(mem_b4_s(42|43|44)|mem_b6_s(42|43|44)|mem_r2_s(42|43|44)|mem_scw_k2_s(42|43|44))$' \
     || true
 )"
 
+
 if [[ -n "${ACTIVE_WORKERS}" ]]; then
-    echo "FATAL: recurrent-memory training workers are still active."
-    echo "Wait for these workers to become terminal before recovery:"
-    printf '%s\n' "${ACTIVE_WORKERS}"
+    echo \
+        "FATAL: recurrent-memory training workers are still active."
+
+    echo \
+        "These workers must become terminal before recovery:"
+
+    printf \
+        '%s\n' \
+        "${ACTIVE_WORKERS}"
+
     exit 1
 fi
+
 
 ACTIVE_GATES="$(
     squeue \
@@ -62,31 +94,63 @@ ACTIVE_GATES="$(
     || true
 )"
 
+
 if [[ -n "${ACTIVE_GATES}" ]]; then
-    echo "FATAL: an existing mem_train_gate job is still queued."
-    echo "Cancel the old gate before running recovery:"
-    printf '%s\n' "${ACTIVE_GATES}"
+    echo \
+        "FATAL: an existing mem_train_gate job is still queued."
+
+    echo \
+        "Cancel the existing gate before running recovery:"
+
+    printf \
+        '%s\n' \
+        "${ACTIVE_GATES}"
+
     exit 1
 fi
+
 
 "${PYTHON}" \
     -m \
     py_compile \
     "${REPAIR_SCRIPT}"
 
+
 "${PYTHON}" \
     "${REPAIR_SCRIPT}" \
     --project-dir "${PROJECT_DIR}"
 
-GATE_SUBMISSION="$(
+
+RAW_GATE_JOB_ID="$(
     sbatch \
+        --parsable \
         --job-name=mem_train_gate \
         "${PIPELINE_SCRIPT}" \
         gate
 )"
 
-printf '%s\n' "${GATE_SUBMISSION}"
 
-echo "Recovery metadata passed. A new mem_train_gate was submitted."
-echo "The gate will submit only incomplete runs that have valid controlled-resume markers."
-echo "Future walltime continuations will be chained automatically by the pipeline."
+GATE_JOB_ID="${RAW_GATE_JOB_ID%%;*}"
+
+
+if [[ ! "${GATE_JOB_ID}" =~ ^[0-9]+$ ]]; then
+    fatal \
+        "invalid mem_train_gate job ID returned by sbatch: ${RAW_GATE_JOB_ID}"
+fi
+
+
+printf \
+    'Submitted mem_train_gate job %s\n' \
+    "${GATE_JOB_ID}"
+
+
+echo \
+    "Recovery metadata passed."
+
+
+echo \
+    "The gate will submit only incomplete runs that have valid controlled-resume markers."
+
+
+echo \
+    "Future controlled walltime continuations will be chained automatically by the pipeline."

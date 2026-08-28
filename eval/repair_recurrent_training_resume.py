@@ -16,6 +16,9 @@ from typing import Any, Dict, List, Tuple
 PROJECT_DIR_DEFAULT = Path(
     "/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
 )
+JOB_LOG_DIR_DEFAULT = Path(
+    "/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+)
 
 CONDITIONS = (
     "b4",
@@ -244,16 +247,9 @@ def current_script_hashes(
         ),
         "worker": sha256_file(
             project_dir
-            / "slurm"
             / "studentvanilla_memory_train"
         ),
-        "pipeline": sha256_file(
-            project_dir
-            / "slurm"
-            / "recurrent_training_pipeline"
-        ),
     }
-
 
 def verify_campaign_configuration(
     spec: Dict[str, Any],
@@ -294,7 +290,8 @@ def migrate_worker_hash_only(
         dict,
     ):
         raise RepairError(
-            "campaign_spec.script_hashes is missing or invalid"
+            "campaign_spec.script_hashes "
+            "is missing or invalid"
         )
 
     immutable_keys = (
@@ -302,23 +299,30 @@ def migrate_worker_hash_only(
         "baseline",
         "scw",
         "aggregate",
-        "pipeline",
     )
 
     for key in immutable_keys:
         require_equal(
-            locked_hashes.get(key),
-            hashes[key],
+            locked_hashes.get(
+                key
+            ),
+            hashes[
+                key
+            ],
             f"locked script hash {key}",
         )
 
-    old_worker_hash = locked_hashes.get(
-        "worker"
+    old_worker_hash = (
+        locked_hashes.get(
+            "worker"
+        )
     )
 
-    new_worker_hash = hashes[
-        "worker"
-    ]
+    new_worker_hash = (
+        hashes[
+            "worker"
+        ]
+    )
 
     if old_worker_hash == new_worker_hash:
         print(
@@ -333,10 +337,14 @@ def migrate_worker_hash_only(
             old_worker_hash,
             str,
         )
-        or len(old_worker_hash) != 64
+        or len(
+            old_worker_hash
+        )
+        != 64
     ):
         raise RepairError(
-            "Locked worker hash is missing or malformed"
+            "Locked worker hash "
+            "is missing or malformed"
         )
 
     migrations = spec.get(
@@ -349,7 +357,8 @@ def migrate_worker_hash_only(
         list,
     ):
         raise RepairError(
-            "campaign_spec.operational_migrations must be a list"
+            "campaign_spec.operational_migrations "
+            "must be a list"
         )
 
     migration = {
@@ -357,14 +366,20 @@ def migrate_worker_hash_only(
             timezone.utc
         ).isoformat(),
         "kind": (
-            "slurm_wait_sigusr1_resume_fix"
+            "recurrent_worker_runtime_recovery"
         ),
         "scientific_training_code_changed": False,
-        "old_worker_sha256": old_worker_hash,
-        "new_worker_sha256": new_worker_hash,
+        "old_worker_sha256": (
+            old_worker_hash
+        ),
+        "new_worker_sha256": (
+            new_worker_hash
+        ),
     }
 
-    updated = dict(spec)
+    updated = dict(
+        spec
+    )
 
     updated_hashes = dict(
         locked_hashes
@@ -397,8 +412,13 @@ def migrate_worker_hash_only(
     )
 
     print(
-        "[REPAIR] Updated only "
+        "[REPAIR] Updated "
         "campaign_spec.script_hashes.worker."
+    )
+
+    print(
+        "[REPAIR] Scientific training "
+        "source hashes were not changed."
     )
 
     print(
@@ -412,7 +432,6 @@ def migrate_worker_hash_only(
     )
 
     return updated
-
 
 def validate_provenance(
     provenance: Dict[str, Any],
@@ -551,20 +570,41 @@ def matching_known_failure_logs(
         f"slurm-*_mem_{condition}_s{seed}.out"
     )
 
-    candidates = list(
-        project_dir.glob(
-            pattern
-        )
+    search_roots = (
+        project_dir,
+        JOB_LOG_DIR_DEFAULT,
     )
 
-    candidates.extend(
-        (
-            project_dir
-            / "slurm"
-        ).glob(
+    candidates: List[Path] = []
+
+    seen_paths = set()
+
+    for search_root in search_roots:
+        if not search_root.is_dir():
+            continue
+
+        for candidate in search_root.glob(
             pattern
-        )
-    )
+        ):
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+
+            resolved_key = str(
+                resolved
+            )
+
+            if resolved_key in seen_paths:
+                continue
+
+            seen_paths.add(
+                resolved_key
+            )
+
+            candidates.append(
+                candidate
+            )
 
     matches: List[Path] = []
 
@@ -593,7 +633,6 @@ def matching_known_failure_logs(
     )
 
     return matches
-
 
 def repair_resume_markers(
     project_dir: Path,
@@ -796,16 +835,40 @@ def main() -> int:
         hashes,
     )
 
-    require_equal(
-        spec.get(
-            "script_hashes"
-        ),
-        hashes,
-        (
-            "campaign script hashes "
-            "after worker migration"
-        ),
+    locked_hashes = spec.get(
+        "script_hashes"
     )
+
+    if not isinstance(
+        locked_hashes,
+        dict,
+    ):
+        raise RepairError(
+            "campaign_spec.script_hashes "
+            "is missing or invalid"
+        )
+
+    required_hash_keys = (
+        "training",
+        "baseline",
+        "scw",
+        "aggregate",
+        "worker",
+    )
+
+    for key in required_hash_keys:
+        require_equal(
+            locked_hashes.get(
+                key
+            ),
+            hashes[
+                key
+            ],
+            (
+                "campaign script hash "
+                f"{key} after worker migration"
+            ),
+        )
 
     repaired, already_ready = (
         repair_resume_markers(
@@ -830,10 +893,9 @@ def main() -> int:
     )
 
     print(
-        "[REPAIR] Submit "
-        "slurm/recurrent_training_pipeline "
-        "in gate mode after this repair "
-        "job completes."
+        "[REPAIR] The root-level "
+        "recurrent_training_pipeline "
+        "can now be submitted in gate mode."
     )
 
     return 0
