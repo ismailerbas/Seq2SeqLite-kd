@@ -1,0 +1,166 @@
+#!/bin/bash
+#SBATCH --job-name=scw_persist
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+
+set -euo pipefail
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+    [[ -f "${path}" ]] || fatal "required file does not exist: ${path}"
+}
+
+require_dir() {
+    local path="$1"
+    [[ -d "${path}" ]] || fatal "required directory does not exist: ${path}"
+}
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ]; then
+    export CUDA_VISIBLE_DEVICES=0
+fi
+
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+export TF_FORCE_GPU_ALLOW_GROWTH=true
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${SCRATCH_BASE}/nmi"
+SAVE_DIR="${PROJECT_DIR}"
+ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_scw_sign_persistence.py"
+OUTPUT_DIR="${PROJECT_DIR}/results/scw_sign_persistence_analysis"
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${PIP_TMPDIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+mkdir -p "${OUTPUT_DIR}"
+
+require_dir "${PROJECT_DIR}"
+require_dir "${DATA_PATH}"
+require_dir "${PROJECT_DIR}/results"
+
+require_file "${ANALYSIS_SCRIPT}"
+require_file "${PROJECT_DIR}/train_student_vanilla_kd.py"
+require_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
+
+command -v python >/dev/null 2>&1 || fatal "python is not available in tf210_qkeras"
+command -v git >/dev/null 2>&1 || fatal "git is not available"
+command -v nvidia-smi >/dev/null 2>&1 || fatal "nvidia-smi is not available"
+
+cd "${PROJECT_DIR}"
+
+PYTHON_BIN="$(command -v python)"
+GIT_HEAD="$(git rev-parse HEAD)"
+GIT_BRANCH="$(git branch --show-current)"
+GIT_STATUS="$(git status --short)"
+
+TF_VERSION="$(${PYTHON_BIN} -c 'import tensorflow as tf; print(tf.__version__)')"
+QKERAS_VERSION="$(${PYTHON_BIN} -c 'import qkeras; print(getattr(qkeras, "__version__", "unknown"))')"
+NUMPY_VERSION="$(${PYTHON_BIN} -c 'import numpy as np; print(np.__version__)')"
+SCIPY_VERSION="$(${PYTHON_BIN} -c 'import scipy; print(scipy.__version__)')"
+MATPLOTLIB_VERSION="$(${PYTHON_BIN} -c 'import matplotlib; print(matplotlib.__version__)')"
+GPU_CHECK="$(${PYTHON_BIN} -c 'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' 2>/dev/null)"
+
+[[ -n "${GPU_CHECK}" ]] || fatal "TensorFlow GPU sanity check did not return a value"
+[[ "${GPU_CHECK}" = "1" ]] || fatal "expected exactly one TensorFlow-visible GPU, found ${GPU_CHECK}"
+
+log "======================================================================"
+log "SCW INNOVATION-SIGN PERSISTENCE ANALYSIS"
+log "======================================================================"
+log "SLURM JOB ID      : ${SLURM_JOB_ID:-unknown}"
+log "SLURM JOB NAME    : ${SLURM_JOB_NAME:-unknown}"
+log "NODE              : $(hostname)"
+log "PROJECT DIR       : ${PROJECT_DIR}"
+log "DATA PATH         : ${DATA_PATH}"
+log "SAVE DIR          : ${SAVE_DIR}"
+log "ANALYSIS SCRIPT   : ${ANALYSIS_SCRIPT}"
+log "OUTPUT DIR        : ${OUTPUT_DIR}"
+log "PYTHON            : ${PYTHON_BIN}"
+log "CONDA ENV         : ${CONDA_DEFAULT_ENV:-unset}"
+log "CUDA VISIBLE      : ${CUDA_VISIBLE_DEVICES:-unset}"
+log "TF GPU COUNT      : ${GPU_CHECK}"
+log "TF VERSION        : ${TF_VERSION}"
+log "QKERAS VERSION    : ${QKERAS_VERSION}"
+log "NUMPY VERSION     : ${NUMPY_VERSION}"
+log "SCIPY VERSION     : ${SCIPY_VERSION}"
+log "MATPLOTLIB VERSION: ${MATPLOTLIB_VERSION}"
+log "GIT BRANCH        : ${GIT_BRANCH}"
+log "GIT HEAD          : ${GIT_HEAD}"
+
+if [[ -n "${GIT_STATUS}" ]]; then
+    log "GIT STATUS        : working tree has local changes"
+    printf '%s\n' "${GIT_STATUS}"
+else
+    log "GIT STATUS        : clean"
+fi
+
+log "BATCH SIZE        : 512"
+log "BOOTSTRAP REPS    : 2000"
+log "BOOTSTRAP SEED    : 42"
+log "======================================================================"
+
+nvidia-smi
+
+${PYTHON_BIN} -m py_compile "${ANALYSIS_SCRIPT}"
+
+${PYTHON_BIN} -u "${ANALYSIS_SCRIPT}" \
+    --repo-root "${PROJECT_DIR}" \
+    --data-dir "${DATA_PATH}" \
+    --save-root "${SAVE_DIR}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --batch-size 512 \
+    --bootstrap-replicates 2000 \
+    --bootstrap-seed 42
+
+require_file "${OUTPUT_DIR}/analysis_manifest.json"
+require_file "${OUTPUT_DIR}/validation.json"
+require_file "${OUTPUT_DIR}/sign_persistence_summary.json"
+require_file "${OUTPUT_DIR}/sign_persistence_summary.csv"
+require_file "${OUTPUT_DIR}/run_length_distributions.csv"
+require_file "${OUTPUT_DIR}/trigger_segment_vote_distribution.csv"
+require_file "${OUTPUT_DIR}/scw_sign_persistence.pdf"
+require_file "${OUTPUT_DIR}/scw_sign_persistence.svg"
+require_file "${OUTPUT_DIR}/scw_sign_persistence.png"
+
+log "======================================================================"
+log "ANALYSIS COMPLETE"
+log "OUTPUT DIR: ${OUTPUT_DIR}"
+log "======================================================================"
+
+ls -lh "${OUTPUT_DIR}"
