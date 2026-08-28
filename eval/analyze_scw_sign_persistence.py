@@ -45,7 +45,7 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import matplotlib
-
+import h5py
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -1017,7 +1017,6 @@ def build_reference_model(
         bits_activation=source_bits,
         bits_state=source_bits,
     )
-
     model.load_weights(
         str(
             checkpoint
@@ -1027,8 +1026,325 @@ def build_reference_model(
     model.trainable = False
 
     return model
+def load_checkpoint_weights_by_name(
+    model,
+    checkpoint_path: Path,
+) -> None:
+    """
+    Load an HDF5 weights checkpoint into ``model`` by exact layer name.
+
+    Keras positional HDF5 loading requires the number of saved weighted layers
+    to match the number of weighted layers in the reconstructed model. MemoQ
+    Phase-3 checkpoints can legitimately contain the additional tracked
+    ``teacher_hidden_seq2seq`` model because ``train_student_memoq.py`` attaches
+    the live teacher hidden model to the final QKeras student during training.
+
+    The SCW persistence reference model requires only the actual inference
+    layers. Therefore this loader reads the checkpoint directly and loads every
+    weighted layer required by the reference model by exact layer name and exact
+    leaf variable name.
+
+    This loader is deliberately fail-closed:
+
+      1. Every weighted layer required by ``model`` must exist in the
+         checkpoint.
+      2. Every required variable leaf name must exist exactly once.
+      3. Every checkpoint tensor shape must exactly match the corresponding
+         model variable shape.
+      4. A required checkpoint layer may not contain additional variable leaves
+         that the reconstructed model does not own.
+      5. Additional top-level saved layers that are not part of the inference
+         reference model are reported and ignored.
+
+    No mismatch is silently skipped and the checkpoint file is never modified.
+    """
+    checkpoint_path = Path(
+        checkpoint_path
+    )
+
+    if not checkpoint_path.is_file():
+        raise RuntimeError(
+            "Checkpoint does not exist: "
+            f"{checkpoint_path}"
+        )
+
+    with h5py.File(
+        str(
+            checkpoint_path
+        ),
+        "r",
+    ) as handle:
+        if "layer_names" in handle.attrs:
+            group = handle
+        elif (
+            "model_weights" in handle
+            and "layer_names"
+            in handle["model_weights"].attrs
+        ):
+            group = handle[
+                "model_weights"
+            ]
+        else:
+            raise RuntimeError(
+                "Unrecognized HDF5 weights "
+                "layout (no layer_names "
+                "attribute) in "
+                f"{checkpoint_path}"
+            )
+
+        saved_layer_names = [
+            name.decode("utf8")
+            if isinstance(
+                name,
+                bytes,
+            )
+            else str(
+                name
+            )
+            for name
+            in group.attrs[
+                "layer_names"
+            ]
+        ]
+
+        saved = {}
+
+        for layer_name in saved_layer_names:
+            layer_group = group[
+                layer_name
+            ]
+
+            weight_names = [
+                name.decode("utf8")
+                if isinstance(
+                    name,
+                    bytes,
+                )
+                else str(
+                    name
+                )
+                for name
+                in layer_group.attrs.get(
+                    "weight_names",
+                    [],
+                )
+            ]
+
+            entries = []
+
+            for weight_name in weight_names:
+                entries.append(
+                    (
+                        weight_name,
+                        np.asarray(
+                            layer_group[
+                                weight_name
+                            ][
+                                ...
+                            ],
+                            dtype=np.float32,
+                        ),
+                    )
+                )
+
+            saved[
+                layer_name
+            ] = entries
+
+            print(
+                f"[CKPT] saved layer "
+                f"{layer_name!r}: "
+                f"{len(entries)} weights",
+                flush=True,
+            )
+
+    consumed = set()
+
+    for layer in model.layers:
+        if not layer.weights:
+            continue
+
+        if layer.name not in saved:
+            raise RuntimeError(
+                f"Model layer "
+                f"{layer.name!r} has no "
+                "saved counterpart in "
+                f"{checkpoint_path}. "
+                "Saved layers: "
+                f"{sorted(saved)}"
+            )
+
+        entries = saved[
+            layer.name
+        ]
+
+        by_leaf = {}
+
+        for weight_name, array in entries:
+            leaf = (
+                weight_name.split(
+                    "/"
+                )[-1]
+                .split(
+                    ":"
+                )[0]
+            )
+
+            if leaf in by_leaf:
+                raise RuntimeError(
+                    "Ambiguous saved weight "
+                    f"leaf {leaf!r} in "
+                    f"checkpoint layer "
+                    f"{layer.name!r} of "
+                    f"{checkpoint_path}; "
+                    "saved weight paths: "
+                    f"{[name for name, _ in entries]}"
+                )
+
+            by_leaf[
+                leaf
+            ] = array
+
+        new_values = []
+        used_leaves = set()
+
+        for variable in layer.weights:
+            leaf = (
+                variable.name.split(
+                    "/"
+                )[-1]
+                .split(
+                    ":"
+                )[0]
+            )
+
+            if leaf not in by_leaf:
+                raise RuntimeError(
+                    f"Weight {leaf!r} of "
+                    f"model layer "
+                    f"{layer.name!r} is "
+                    "missing from the "
+                    "checkpoint. Saved "
+                    "weights for this "
+                    "layer: "
+                    f"{sorted(by_leaf)}"
+                )
+
+            if leaf in used_leaves:
+                raise RuntimeError(
+                    "Ambiguous model weight "
+                    f"leaf {leaf!r} in layer "
+                    f"{layer.name!r}"
+                )
+
+            used_leaves.add(
+                leaf
+            )
+
+            array = by_leaf[
+                leaf
+            ]
+
+            expected_shape = tuple(
+                int(
+                    dim
+                )
+                for dim
+                in variable.shape
+            )
+
+            if (
+                tuple(
+                    array.shape
+                )
+                != expected_shape
+            ):
+                raise RuntimeError(
+                    f"Shape mismatch for "
+                    f"{layer.name}/{leaf}: "
+                    f"checkpoint "
+                    f"{tuple(array.shape)} "
+                    f"vs model "
+                    f"{expected_shape}"
+                )
+
+            new_values.append(
+                array
+            )
+
+        unused_leaves = sorted(
+            set(
+                by_leaf
+            )
+            - used_leaves
+        )
+
+        if unused_leaves:
+            raise RuntimeError(
+                f"Checkpoint layer "
+                f"{layer.name!r} carries "
+                "weights the model does "
+                "not own: "
+                f"{unused_leaves}"
+            )
+
+        layer.set_weights(
+            new_values
+        )
+
+        consumed.add(
+            layer.name
+        )
+
+        print(
+            f"[CKPT] loaded layer "
+            f"{layer.name!r} "
+            f"({len(new_values)} "
+            "weights) by name",
+            flush=True,
+        )
+
+    for layer_name in saved:
+        if (
+            layer_name not in consumed
+            and saved[
+                layer_name
+            ]
+        ):
+            print(
+                f"[CKPT] ignoring saved "
+                f"layer {layer_name!r} "
+                "(not part of the "
+                "reference model): "
+                f"{len(saved[layer_name])} "
+                "weights",
+                flush=True,
+            )
 
 
+def build_reference_model(
+    source_bits: int,
+    checkpoint: Path,
+):
+    model = build_student(
+        seq_len=SEQ_LEN,
+        n_out=N_OUT,
+        student_units=STUDENT_UNITS,
+        bits_kernel=source_bits,
+        bits_recurrent=source_bits,
+        bits_bias=source_bits,
+        bits_activation=source_bits,
+        bits_state=source_bits,
+    )
+
+    load_checkpoint_weights_by_name(
+        model=model,
+        checkpoint_path=checkpoint,
+    )
+
+    model.trainable = False
+
+    return model
 def build_scw_model(
     source_bits: int,
     state_bits: int,
