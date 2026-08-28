@@ -29,3 +29,4 @@ slurm/studentvanilla_memory_train text eol=lf
 slurm/recurrent_training_pipeline text eol=lf
 eval/build_recurrent_training_campaign.py text eol=lf
 eval/analyze_scw_sign_persistence.py text eol=lf
+slurm/analyze_scw_sign_persistence text eol=lf
