@@ -80,21 +80,19 @@ require_file "${PROJECT_DIR}/train_student_vanilla_kd.py"
 require_file "${PROJECT_DIR}/train_student_vanilla_kd_scw.py"
 
 command -v python >/dev/null 2>&1 || fatal "python is not available in tf210_qkeras"
-command -v git >/dev/null 2>&1 || fatal "git is not available"
 command -v nvidia-smi >/dev/null 2>&1 || fatal "nvidia-smi is not available"
 
 cd "${PROJECT_DIR}"
 
 PYTHON_BIN="$(command -v python)"
-GIT_HEAD="$(git rev-parse HEAD)"
-GIT_BRANCH="$(git branch --show-current)"
-GIT_STATUS="$(git status --short)"
 
 TF_VERSION="$(${PYTHON_BIN} -c 'import tensorflow as tf; print(tf.__version__)')"
 QKERAS_VERSION="$(${PYTHON_BIN} -c 'import qkeras; print(getattr(qkeras, "__version__", "unknown"))')"
+H5PY_VERSION="$(${PYTHON_BIN} -c 'import h5py; print(h5py.__version__)')"
 NUMPY_VERSION="$(${PYTHON_BIN} -c 'import numpy as np; print(np.__version__)')"
 SCIPY_VERSION="$(${PYTHON_BIN} -c 'import scipy; print(scipy.__version__)')"
 MATPLOTLIB_VERSION="$(${PYTHON_BIN} -c 'import matplotlib; print(matplotlib.__version__)')"
+
 GPU_CHECK="$(${PYTHON_BIN} -c 'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' 2>/dev/null)"
 
 [[ -n "${GPU_CHECK}" ]] || fatal "TensorFlow GPU sanity check did not return a value"
@@ -117,19 +115,10 @@ log "CUDA VISIBLE      : ${CUDA_VISIBLE_DEVICES:-unset}"
 log "TF GPU COUNT      : ${GPU_CHECK}"
 log "TF VERSION        : ${TF_VERSION}"
 log "QKERAS VERSION    : ${QKERAS_VERSION}"
+log "H5PY VERSION      : ${H5PY_VERSION}"
 log "NUMPY VERSION     : ${NUMPY_VERSION}"
 log "SCIPY VERSION     : ${SCIPY_VERSION}"
 log "MATPLOTLIB VERSION: ${MATPLOTLIB_VERSION}"
-log "GIT BRANCH        : ${GIT_BRANCH}"
-log "GIT HEAD          : ${GIT_HEAD}"
-
-if [[ -n "${GIT_STATUS}" ]]; then
-    log "GIT STATUS        : working tree has local changes"
-    printf '%s\n' "${GIT_STATUS}"
-else
-    log "GIT STATUS        : clean"
-fi
-
 log "BATCH SIZE        : 512"
 log "BOOTSTRAP REPS    : 2000"
 log "BOOTSTRAP SEED    : 42"

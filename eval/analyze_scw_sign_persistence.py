@@ -1002,30 +1002,6 @@ def load_test_data(
         test_idx,
     )
 
-
-def build_reference_model(
-    source_bits: int,
-    checkpoint: Path,
-):
-    model = build_student(
-        seq_len=SEQ_LEN,
-        n_out=N_OUT,
-        student_units=STUDENT_UNITS,
-        bits_kernel=source_bits,
-        bits_recurrent=source_bits,
-        bits_bias=source_bits,
-        bits_activation=source_bits,
-        bits_state=source_bits,
-    )
-    model.load_weights(
-        str(
-            checkpoint
-        )
-    )
-
-    model.trainable = False
-
-    return model
 def load_checkpoint_weights_by_name(
     model,
     checkpoint_path: Path,
@@ -1044,19 +1020,15 @@ def load_checkpoint_weights_by_name(
     weighted layer required by the reference model by exact layer name and exact
     leaf variable name.
 
-    This loader is deliberately fail-closed:
-
-      1. Every weighted layer required by ``model`` must exist in the
-         checkpoint.
+    This loader is fail-closed:
+      1. Every weighted layer required by ``model`` must exist in the checkpoint.
       2. Every required variable leaf name must exist exactly once.
-      3. Every checkpoint tensor shape must exactly match the corresponding
-         model variable shape.
-      4. A required checkpoint layer may not contain additional variable leaves
-         that the reconstructed model does not own.
-      5. Additional top-level saved layers that are not part of the inference
-         reference model are reported and ignored.
+      3. Every checkpoint tensor shape must exactly match the model variable.
+      4. A required checkpoint layer may not contain unmatched extra variables.
+      5. Additional saved top-level weighted layers are reported and ignored.
 
-    No mismatch is silently skipped and the checkpoint file is never modified.
+    No required mismatch is silently skipped and the checkpoint is never
+    modified.
     """
     checkpoint_path = Path(
         checkpoint_path
@@ -1086,20 +1058,23 @@ def load_checkpoint_weights_by_name(
             ]
         else:
             raise RuntimeError(
-                "Unrecognized HDF5 weights "
-                "layout (no layer_names "
-                "attribute) in "
+                "Unrecognized HDF5 weights layout "
+                "(no layer_names attribute) in "
                 f"{checkpoint_path}"
             )
 
         saved_layer_names = [
-            name.decode("utf8")
-            if isinstance(
-                name,
-                bytes,
-            )
-            else str(
-                name
+            (
+                name.decode(
+                    "utf8"
+                )
+                if isinstance(
+                    name,
+                    bytes,
+                )
+                else str(
+                    name
+                )
             )
             for name
             in group.attrs[
@@ -1115,13 +1090,17 @@ def load_checkpoint_weights_by_name(
             ]
 
             weight_names = [
-                name.decode("utf8")
-                if isinstance(
-                    name,
-                    bytes,
-                )
-                else str(
-                    name
+                (
+                    name.decode(
+                        "utf8"
+                    )
+                    if isinstance(
+                        name,
+                        bytes,
+                    )
+                    else str(
+                        name
+                    )
                 )
                 for name
                 in layer_group.attrs.get(
@@ -1180,7 +1159,10 @@ def load_checkpoint_weights_by_name(
 
         by_leaf = {}
 
-        for weight_name, array in entries:
+        for (
+            weight_name,
+            array,
+        ) in entries:
             leaf = (
                 weight_name.split(
                     "/"
@@ -1345,6 +1327,7 @@ def build_reference_model(
     model.trainable = False
 
     return model
+
 def build_scw_model(
     source_bits: int,
     state_bits: int,
