@@ -1815,6 +1815,52 @@ class SCWStudentModel(
             )
         )
 
+        if not self.sencgru.built:
+            enc_feature_dim = (
+                enc_inputs.shape[-1]
+            )
+
+            if enc_feature_dim is None:
+                raise RuntimeError(
+                    "Cannot build sencgru inside call: "
+                    "the encoder feature dimension is dynamic; "
+                    "build the layer explicitly before calling the model"
+                )
+
+            self.sencgru.build(
+                tf.TensorShape(
+                    [
+                        None,
+                        int(
+                            enc_feature_dim
+                        ),
+                    ]
+                )
+            )
+
+        if not self.sdecgru.built:
+            dec_feature_dim = (
+                dec_inputs.shape[-1]
+            )
+
+            if dec_feature_dim is None:
+                raise RuntimeError(
+                    "Cannot build sdecgru inside call: "
+                    "the decoder feature dimension is dynamic; "
+                    "build the layer explicitly before calling the model"
+                )
+
+            self.sdecgru.build(
+                tf.TensorShape(
+                    [
+                        None,
+                        int(
+                            dec_feature_dim
+                        ),
+                    ]
+                )
+            )
+
         (
             enc_kernel_q,
             enc_recurrent_q,

@@ -1488,7 +1488,6 @@ def build_scw_model(
 
     return model
 
-
 def transfer_standard_weights(
     reference_model,
     scw_model: SCWStudentModel,
