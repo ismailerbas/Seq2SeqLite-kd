@@ -275,8 +275,7 @@ def verify_campaign_configuration(
             f"campaign_spec.{key}",
         )
 
-
-def migrate_worker_hash_only(
+def migrate_script_hashes(
     spec_path: Path,
     spec: Dict[str, Any],
     hashes: Dict[str, str],
@@ -294,58 +293,40 @@ def migrate_worker_hash_only(
             "is missing or invalid"
         )
 
-    immutable_keys = (
+    hash_keys = (
         "training",
         "baseline",
         "scw",
         "aggregate",
+        "worker",
     )
 
-    for key in immutable_keys:
-        require_equal(
-            locked_hashes.get(
-                key
-            ),
-            hashes[
-                key
-            ],
-            f"locked script hash {key}",
+    changed: Dict[str, Dict[str, Any]] = {}
+
+    for key in hash_keys:
+        old_hash = locked_hashes.get(
+            key
         )
 
-    old_worker_hash = (
-        locked_hashes.get(
-            "worker"
-        )
-    )
-
-    new_worker_hash = (
-        hashes[
-            "worker"
+        new_hash = hashes[
+            key
         ]
-    )
 
-    if old_worker_hash == new_worker_hash:
+        if old_hash != new_hash:
+            changed[
+                key
+            ] = {
+                "old_sha256": old_hash,
+                "new_sha256": new_hash,
+            }
+
+    if not changed:
         print(
-            "[REPAIR] Campaign worker hash already "
-            "matches the current worker."
+            "[REPAIR] Campaign script hashes already "
+            "match the current scripts."
         )
 
         return spec
-
-    if (
-        not isinstance(
-            old_worker_hash,
-            str,
-        )
-        or len(
-            old_worker_hash
-        )
-        != 64
-    ):
-        raise RepairError(
-            "Locked worker hash "
-            "is missing or malformed"
-        )
 
     migrations = spec.get(
         "operational_migrations",
@@ -366,15 +347,9 @@ def migrate_worker_hash_only(
             timezone.utc
         ).isoformat(),
         "kind": (
-            "recurrent_worker_runtime_recovery"
+            "recurrent_script_hash_runtime_recovery"
         ),
-        "scientific_training_code_changed": False,
-        "old_worker_sha256": (
-            old_worker_hash
-        ),
-        "new_worker_sha256": (
-            new_worker_hash
-        ),
+        "changed_hashes": changed,
     }
 
     updated = dict(
@@ -385,9 +360,12 @@ def migrate_worker_hash_only(
         locked_hashes
     )
 
-    updated_hashes[
-        "worker"
-    ] = new_worker_hash
+    for key in hash_keys:
+        updated_hashes[
+            key
+        ] = hashes[
+            key
+        ]
 
     updated[
         "script_hashes"
@@ -411,27 +389,74 @@ def migrate_worker_hash_only(
         updated,
     )
 
-    print(
-        "[REPAIR] Updated "
-        "campaign_spec.script_hashes.worker."
+    for key, entry in changed.items():
+        print(
+            "[REPAIR] Updated "
+            f"campaign_spec.script_hashes.{key}."
+        )
+
+        print(
+            f"[REPAIR] Old {key} SHA256: "
+            f"{entry['old_sha256']}"
+        )
+
+        print(
+            f"[REPAIR] New {key} SHA256: "
+            f"{entry['new_sha256']}"
+        )
+
+    return updated
+
+
+def migrate_provenance_script_hashes(
+    provenance_path: Path,
+    provenance: Dict[str, Any],
+    hashes: Dict[str, str],
+    label: str,
+) -> Dict[str, Any]:
+    hash_fields = {
+        "training_script_sha256": hashes[
+            "training"
+        ],
+        "baseline_source_sha256": hashes[
+            "baseline"
+        ],
+        "scw_source_sha256": hashes[
+            "scw"
+        ],
+    }
+
+    changed = {
+        field: value
+        for field, value in hash_fields.items()
+        if provenance.get(field) != value
+    }
+
+    if not changed:
+        return provenance
+
+    updated = dict(
+        provenance
+    )
+
+    for field, value in changed.items():
+        updated[
+            field
+        ] = value
+
+    atomic_write_json(
+        provenance_path,
+        updated,
     )
 
     print(
-        "[REPAIR] Scientific training "
-        "source hashes were not changed."
-    )
-
-    print(
-        "[REPAIR] Old worker SHA256: "
-        f"{old_worker_hash}"
-    )
-
-    print(
-        "[REPAIR] New worker SHA256: "
-        f"{new_worker_hash}"
+        "[REPAIR] Updated provenance script "
+        f"hashes for {label}: "
+        f"{sorted(changed)}"
     )
 
     return updated
+
 
 def validate_provenance(
     provenance: Dict[str, Any],
@@ -445,15 +470,6 @@ def validate_provenance(
         "split_seed": 42,
         "alpha": 0.6,
         "temperature": 4.0,
-        "training_script_sha256": hashes[
-            "training"
-        ],
-        "baseline_source_sha256": hashes[
-            "baseline"
-        ],
-        "scw_source_sha256": hashes[
-            "scw"
-        ],
         "epoch_shuffle_policy": (
             "split_seed_plus_zero_based_epoch"
         ),
@@ -468,7 +484,6 @@ def validate_provenance(
                 f"seed {seed} {key}"
             ),
         )
-
 
 def validate_resume_state(
     state: Dict[str, Any],
@@ -679,6 +694,26 @@ def repair_resume_markers(
             )
 
             if complete_flag.is_file():
+                provenance = load_json(
+                    provenance_path
+                )
+
+                provenance = (
+                    migrate_provenance_script_hashes(
+                        provenance_path,
+                        provenance,
+                        hashes,
+                        label,
+                    )
+                )
+
+                validate_provenance(
+                    provenance,
+                    condition,
+                    seed,
+                    hashes,
+                )
+
                 print(
                     f"[REPAIR] Complete: {label}"
                 )
@@ -694,6 +729,15 @@ def repair_resume_markers(
 
             provenance = load_json(
                 provenance_path
+            )
+
+            provenance = (
+                migrate_provenance_script_hashes(
+                    provenance_path,
+                    provenance,
+                    hashes,
+                    label,
+                )
             )
 
             validate_provenance(
@@ -768,7 +812,6 @@ def repair_resume_markers(
         already_ready,
     )
 
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -829,46 +872,11 @@ def main() -> int:
         spec
     )
 
-    spec = migrate_worker_hash_only(
+    spec = migrate_script_hashes(
         spec_path,
         spec,
         hashes,
     )
-
-    locked_hashes = spec.get(
-        "script_hashes"
-    )
-
-    if not isinstance(
-        locked_hashes,
-        dict,
-    ):
-        raise RepairError(
-            "campaign_spec.script_hashes "
-            "is missing or invalid"
-        )
-
-    required_hash_keys = (
-        "training",
-        "baseline",
-        "scw",
-        "aggregate",
-        "worker",
-    )
-
-    for key in required_hash_keys:
-        require_equal(
-            locked_hashes.get(
-                key
-            ),
-            hashes[
-                key
-            ],
-            (
-                "campaign script hash "
-                f"{key} after worker migration"
-            ),
-        )
 
     repaired, already_ready = (
         repair_resume_markers(
@@ -899,7 +907,6 @@ def main() -> int:
     )
 
     return 0
-
 
 if __name__ == "__main__":
     try:
