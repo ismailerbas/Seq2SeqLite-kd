@@ -46,6 +46,8 @@ os.environ.setdefault("TF_ENABLE_ONEDNN_OPTS", "0")
 
 import matplotlib
 import h5py
+from scipy.io import savemat
+
 matplotlib.use("Agg")
 
 import matplotlib.pyplot as plt
@@ -1703,6 +1705,7 @@ def validate_native_equivalence(
 def make_trace_function(
     model: SCWStudentModel,
     operator_mode: str,
+    include_state_trajectory: bool = False,
 ):
     if operator_mode not in (
         "deterministic",
@@ -1957,6 +1960,34 @@ def make_trace_function(
             ),
         )
 
+        q_before_ta = None
+        q_after_ta = None
+
+        if include_state_trajectory:
+            q_before_ta = tf.TensorArray(
+                tf.float32,
+                size=live_steps,
+                clear_after_read=False,
+                element_shape=tf.TensorShape(
+                    [
+                        None,
+                        units,
+                    ]
+                ),
+            )
+
+            q_after_ta = tf.TensorArray(
+                tf.float32,
+                size=live_steps,
+                clear_after_read=False,
+                element_shape=tf.TensorShape(
+                    [
+                        None,
+                        units,
+                    ]
+                ),
+            )
+
         half_step = tf.constant(
             model.sdecgru.half_step,
             dtype=tf.float32,
@@ -2001,6 +2032,12 @@ def make_trace_function(
 
             q_prev = q_dec_hard
             counter_prev = counter_dec
+
+            if include_state_trajectory:
+                q_before_ta = q_before_ta.write(
+                    i,
+                    q_prev,
+                )
 
             delta_raw = (
                 raw_next
@@ -2063,11 +2100,16 @@ def make_trace_function(
                 operator_mode=operator_mode,
             )
 
+            if include_state_trajectory:
+                q_after_ta = q_after_ta.write(
+                    i,
+                    q_next_hard,
+                )
+
             if operator_mode == "scw":
                 trigger = (
                     counterfactual_trigger
                 )
-
             else:
                 trigger = tf.zeros_like(
                     counterfactual_trigger,
@@ -2167,7 +2209,10 @@ def make_trace_function(
             dec_hidden
         )
 
-        return {
+        trace_outputs: Dict[
+            str,
+            tf.Tensor,
+        ] = {
             "predictions": tf.cast(
                 predictions,
                 tf.float32,
@@ -2246,8 +2291,39 @@ def make_trace_function(
             ),
         }
 
-    return trace_batch
+        if include_state_trajectory:
+            trace_outputs[
+                "raw_state"
+            ] = tf.cast(
+                dec_hidden,
+                tf.float32,
+            )
 
+            trace_outputs[
+                "q_before"
+            ] = tf.transpose(
+                q_before_ta.stack(),
+                perm=(
+                    1,
+                    0,
+                    2,
+                ),
+            )
+
+            trace_outputs[
+                "q_after"
+            ] = tf.transpose(
+                q_after_ta.stack(),
+                perm=(
+                    1,
+                    0,
+                    2,
+                ),
+            )
+
+        return trace_outputs
+
+    return trace_batch
 
 def validate_trace_equivalence(
     condition: ConditionSpec,
@@ -3864,6 +3940,1737 @@ def run_full_test_trace(
 
     return accumulator
 
+def validate_figure2a_trace(
+    condition: ConditionSpec,
+    operator_mode: str,
+    trace: Mapping[
+        str,
+        np.ndarray,
+    ],
+    expected_state_changes: int,
+    expected_triggers: int,
+    expected_visible_triggers: int,
+) -> Dict[
+    str,
+    float,
+]:
+    if operator_mode not in (
+        "deterministic",
+        "scw",
+    ):
+        raise ValueError(
+            f"Unsupported operator_mode={operator_mode!r}"
+        )
+
+    required = (
+        "predictions",
+        "raw_state",
+        "q_before",
+        "q_after",
+        "delta_raw",
+        "normal",
+        "subthreshold",
+        "active_vote",
+        "vote",
+        "trigger",
+        "visible_change",
+        "counter_before",
+        "counter_after",
+    )
+
+    missing = [
+        key
+        for key in required
+        if key not in trace
+    ]
+
+    if missing:
+        raise KeyError(
+            f"{condition.key}/{operator_mode}: "
+            f"Figure 2A trace is missing tensors: {missing}"
+        )
+
+    predictions = np.asarray(
+        trace[
+            "predictions"
+        ],
+        dtype=np.float32,
+    )
+
+    raw_state = np.asarray(
+        trace[
+            "raw_state"
+        ],
+        dtype=np.float32,
+    )
+
+    q_before = np.asarray(
+        trace[
+            "q_before"
+        ],
+        dtype=np.float32,
+    )
+
+    q_after = np.asarray(
+        trace[
+            "q_after"
+        ],
+        dtype=np.float32,
+    )
+
+    delta_raw = np.asarray(
+        trace[
+            "delta_raw"
+        ],
+        dtype=np.float32,
+    )
+
+    normal = np.asarray(
+        trace[
+            "normal"
+        ],
+        dtype=bool,
+    )
+
+    subthreshold = np.asarray(
+        trace[
+            "subthreshold"
+        ],
+        dtype=bool,
+    )
+
+    active_vote = np.asarray(
+        trace[
+            "active_vote"
+        ],
+        dtype=bool,
+    )
+
+    vote = np.asarray(
+        trace[
+            "vote"
+        ],
+        dtype=np.float32,
+    )
+
+    trigger = np.asarray(
+        trace[
+            "trigger"
+        ],
+        dtype=bool,
+    )
+
+    visible_change = np.asarray(
+        trace[
+            "visible_change"
+        ],
+        dtype=bool,
+    )
+
+    counter_before = np.asarray(
+        trace[
+            "counter_before"
+        ],
+        dtype=np.float32,
+    )
+
+    counter_after = np.asarray(
+        trace[
+            "counter_after"
+        ],
+        dtype=np.float32,
+    )
+
+    expected_prediction_shape = (
+        1,
+        SEQ_LEN,
+        N_OUT,
+    )
+
+    expected_raw_shape = (
+        1,
+        SEQ_LEN,
+        STUDENT_UNITS,
+    )
+
+    expected_live_shape = (
+        1,
+        LIVE_STEPS,
+        STUDENT_UNITS,
+    )
+
+    if predictions.shape != expected_prediction_shape:
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            f"predictions shape {predictions.shape} "
+            f"does not match {expected_prediction_shape}"
+        )
+
+    if raw_state.shape != expected_raw_shape:
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            f"raw_state shape {raw_state.shape} "
+            f"does not match {expected_raw_shape}"
+        )
+
+    for (
+        key,
+        value,
+    ) in (
+        (
+            "q_before",
+            q_before,
+        ),
+        (
+            "q_after",
+            q_after,
+        ),
+        (
+            "delta_raw",
+            delta_raw,
+        ),
+        (
+            "normal",
+            normal,
+        ),
+        (
+            "subthreshold",
+            subthreshold,
+        ),
+        (
+            "active_vote",
+            active_vote,
+        ),
+        (
+            "vote",
+            vote,
+        ),
+        (
+            "trigger",
+            trigger,
+        ),
+        (
+            "visible_change",
+            visible_change,
+        ),
+        (
+            "counter_before",
+            counter_before,
+        ),
+        (
+            "counter_after",
+            counter_after,
+        ),
+    ):
+        if value.shape != expected_live_shape:
+            raise RuntimeError(
+                f"{condition.key}/{operator_mode}: "
+                f"{key} shape {value.shape} "
+                f"does not match {expected_live_shape}"
+            )
+
+    raw_live = raw_state[
+        :,
+        :LIVE_STEPS,
+        :,
+    ]
+
+    reconstructed_delta = (
+        raw_live
+        - q_before
+    )
+
+    delta_difference = np.abs(
+        reconstructed_delta.astype(
+            np.float64
+        )
+        - delta_raw.astype(
+            np.float64
+        )
+    )
+
+    delta_identity_max_abs = float(
+        np.max(
+            delta_difference
+        )
+    )
+
+    if delta_identity_max_abs > 1.0e-7:
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "delta_raw does not equal raw_state - q_before; "
+            f"max_abs={delta_identity_max_abs:.8g}"
+        )
+
+    if LIVE_STEPS > 1:
+        if not np.array_equal(
+            q_before[
+                :,
+                1:,
+                :,
+            ],
+            q_after[
+                :,
+                :-1,
+                :,
+            ],
+        ):
+            raise RuntimeError(
+                f"{condition.key}/{operator_mode}: "
+                "q trajectory continuity failed: "
+                "q_before[t+1] does not exactly equal q_after[t]"
+            )
+
+    reconstructed_visible_change = np.not_equal(
+        q_after,
+        q_before,
+    )
+
+    if not np.array_equal(
+        reconstructed_visible_change,
+        visible_change,
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "visible_change does not exactly match q_after != q_before"
+        )
+
+    if np.any(
+        normal
+        & subthreshold
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "normal and subthreshold masks overlap"
+        )
+
+    if np.any(
+        ~(
+            normal
+            | subthreshold
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "normal and subthreshold masks are not exhaustive"
+        )
+
+    if np.any(
+        active_vote
+        & ~subthreshold
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "active_vote occurred outside the subthreshold region"
+        )
+
+    if np.any(
+        active_vote
+        & (
+            vote
+            == 0
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "an active vote has zero sign"
+        )
+
+    if np.any(
+        trigger
+        & ~active_vote
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "a trigger occurred without an active vote"
+        )
+
+    observed_state_changes = int(
+        np.count_nonzero(
+            visible_change
+        )
+    )
+
+    observed_triggers = int(
+        np.count_nonzero(
+            trigger
+        )
+    )
+
+    observed_visible_triggers = int(
+        np.count_nonzero(
+            trigger
+            & visible_change
+        )
+    )
+
+    if observed_state_changes != int(
+        expected_state_changes
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "selected-sequence state-change count does not match "
+            "the full-test accumulator: "
+            f"trace={observed_state_changes}, "
+            f"accumulator={expected_state_changes}"
+        )
+
+    if observed_triggers != int(
+        expected_triggers
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "selected-sequence trigger count does not match "
+            "the full-test accumulator: "
+            f"trace={observed_triggers}, "
+            f"accumulator={expected_triggers}"
+        )
+
+    if observed_visible_triggers != int(
+        expected_visible_triggers
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "selected-sequence visible-trigger count does not match "
+            "the full-test accumulator: "
+            f"trace={observed_visible_triggers}, "
+            f"accumulator={expected_visible_triggers}"
+        )
+
+    if (
+        operator_mode
+        == "deterministic"
+        and observed_triggers != 0
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "deterministic trace contains SCW triggers"
+        )
+
+    if not np.all(
+        np.isfinite(
+            raw_state
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "raw_state contains non-finite values"
+        )
+
+    if not np.all(
+        np.isfinite(
+            q_before
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "q_before contains non-finite values"
+        )
+
+    if not np.all(
+        np.isfinite(
+            q_after
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "q_after contains non-finite values"
+        )
+
+    if not np.all(
+        np.isfinite(
+            counter_before
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "counter_before contains non-finite values"
+        )
+
+    if not np.all(
+        np.isfinite(
+            counter_after
+        )
+    ):
+        raise RuntimeError(
+            f"{condition.key}/{operator_mode}: "
+            "counter_after contains non-finite values"
+        )
+
+    return {
+        "delta_identity_max_abs": (
+            delta_identity_max_abs
+        ),
+        "state_changes": float(
+            observed_state_changes
+        ),
+        "triggers": float(
+            observed_triggers
+        ),
+        "visible_triggers": float(
+            observed_visible_triggers
+        ),
+        "q_continuity_exact": 1.0,
+        "visible_change_identity_exact": 1.0,
+    }
+
+
+def export_figure2a_representative_trace(
+    output_dir: Path,
+    condition: ConditionSpec,
+    model: SCWStudentModel,
+    deterministic_acc: ModeAccumulator,
+    scw_acc: ModeAccumulator,
+    normalized_input: np.ndarray,
+    test_idx: np.ndarray,
+    checkpoint: Path,
+) -> Dict:
+    if condition.key != "b8_to_b4":
+        raise ValueError(
+            "Figure 2A representative trace must be exported "
+            "from the b8_to_b4 condition"
+        )
+
+    if deterministic_acc.condition.key != condition.key:
+        raise RuntimeError(
+            "Deterministic accumulator condition does not match "
+            "the Figure 2A condition"
+        )
+
+    if scw_acc.condition.key != condition.key:
+        raise RuntimeError(
+            "SCW accumulator condition does not match "
+            "the Figure 2A condition"
+        )
+
+    if deterministic_acc.operator_mode != "deterministic":
+        raise RuntimeError(
+            "Figure 2A deterministic accumulator has the wrong operator mode"
+        )
+
+    if scw_acc.operator_mode != "scw":
+        raise RuntimeError(
+            "Figure 2A SCW accumulator has the wrong operator mode"
+        )
+
+    if len(
+        test_idx
+    ) != deterministic_acc.n_sequences:
+        raise RuntimeError(
+            "Figure 2A test-index count does not match "
+            "the deterministic accumulator"
+        )
+
+    if len(
+        test_idx
+    ) != scw_acc.n_sequences:
+        raise RuntimeError(
+            "Figure 2A test-index count does not match "
+            "the SCW accumulator"
+        )
+
+    elements_per_sequence = int(
+        LIVE_STEPS
+        * STUDENT_UNITS
+    )
+
+    deterministic_state_change_fraction_by_sequence = (
+        deterministic_acc.state_changes_by_sequence.astype(
+            np.float64
+        )
+        / float(
+            elements_per_sequence
+        )
+    )
+
+    median_deterministic_state_change_fraction = float(
+        np.median(
+            deterministic_state_change_fraction_by_sequence
+        )
+    )
+
+    eligible_test_positions = np.flatnonzero(
+        scw_acc.visible_triggers_by_sequence
+        > 0
+    )
+
+    if eligible_test_positions.size == 0:
+        raise RuntimeError(
+            "No B8-to-B4 test sequence contains a visible SCW trigger; "
+            "Figure 2A trigger visualization cannot be generated"
+        )
+
+    eligible_distances = np.abs(
+        deterministic_state_change_fraction_by_sequence[
+            eligible_test_positions
+        ]
+        - median_deterministic_state_change_fraction
+    )
+
+    selected_eligible_offset = int(
+        np.argmin(
+            eligible_distances
+        )
+    )
+
+    selected_test_position = int(
+        eligible_test_positions[
+            selected_eligible_offset
+        ]
+    )
+
+    selected_dataset_row = int(
+        test_idx[
+            selected_test_position
+        ]
+    )
+
+    selected_deterministic_state_change_fraction = float(
+        deterministic_state_change_fraction_by_sequence[
+            selected_test_position
+        ]
+    )
+
+    selected_distance_from_median = float(
+        abs(
+            selected_deterministic_state_change_fraction
+            - median_deterministic_state_change_fraction
+        )
+    )
+
+    selected_input = np.asarray(
+        normalized_input[
+            selected_dataset_row:
+            selected_dataset_row
+            + 1
+        ],
+        dtype=np.float32,
+    )
+
+    expected_input_shape = (
+        1,
+        SEQ_LEN,
+        1,
+    )
+
+    if selected_input.shape != expected_input_shape:
+        raise RuntimeError(
+            "Selected Figure 2A input has unexpected shape: "
+            f"{selected_input.shape}; "
+            f"expected {expected_input_shape}"
+        )
+
+    trace_deterministic_with_state = make_trace_function(
+        model=model,
+        operator_mode="deterministic",
+        include_state_trajectory=True,
+    )
+
+    trace_scw_with_state = make_trace_function(
+        model=model,
+        operator_mode="scw",
+        include_state_trajectory=True,
+    )
+
+    selected_input_tf = tf.convert_to_tensor(
+        selected_input,
+        dtype=tf.float32,
+    )
+
+    deterministic_trace_tf = (
+        trace_deterministic_with_state(
+            selected_input_tf
+        )
+    )
+
+    scw_trace_tf = (
+        trace_scw_with_state(
+            selected_input_tf
+        )
+    )
+
+    deterministic_trace = {
+        key: np.asarray(
+            tensor.numpy()
+        )
+        for (
+            key,
+            tensor,
+        ) in deterministic_trace_tf.items()
+    }
+
+    scw_trace = {
+        key: np.asarray(
+            tensor.numpy()
+        )
+        for (
+            key,
+            tensor,
+        ) in scw_trace_tf.items()
+    }
+
+    direct_deterministic_prediction = predict_model(
+        model,
+        selected_input,
+        operator_mode="deterministic",
+    )
+
+    direct_scw_prediction = predict_model(
+        model,
+        selected_input,
+        operator_mode="scw",
+    )
+
+    deterministic_prediction_difference = np.abs(
+        direct_deterministic_prediction.astype(
+            np.float64
+        )
+        - deterministic_trace[
+            "predictions"
+        ].astype(
+            np.float64
+        )
+    )
+
+    scw_prediction_difference = np.abs(
+        direct_scw_prediction.astype(
+            np.float64
+        )
+        - scw_trace[
+            "predictions"
+        ].astype(
+            np.float64
+        )
+    )
+
+    deterministic_prediction_max_abs = float(
+        np.max(
+            deterministic_prediction_difference
+        )
+    )
+
+    deterministic_prediction_mean_abs = float(
+        np.mean(
+            deterministic_prediction_difference
+        )
+    )
+
+    scw_prediction_max_abs = float(
+        np.max(
+            scw_prediction_difference
+        )
+    )
+
+    scw_prediction_mean_abs = float(
+        np.mean(
+            scw_prediction_difference
+        )
+    )
+
+    if (
+        deterministic_prediction_max_abs
+        > EQUIVALENCE_TOLERANCE
+        or deterministic_prediction_mean_abs
+        > EQUIVALENCE_TOLERANCE
+    ):
+        raise RuntimeError(
+            "Figure 2A deterministic trajectory-capture trace "
+            "does not reproduce direct model output: "
+            f"max_abs={deterministic_prediction_max_abs:.8g}, "
+            f"mean_abs={deterministic_prediction_mean_abs:.8g}, "
+            f"tolerance={EQUIVALENCE_TOLERANCE:.8g}"
+        )
+
+    if (
+        scw_prediction_max_abs
+        > EQUIVALENCE_TOLERANCE
+        or scw_prediction_mean_abs
+        > EQUIVALENCE_TOLERANCE
+    ):
+        raise RuntimeError(
+            "Figure 2A SCW trajectory-capture trace "
+            "does not reproduce direct model output: "
+            f"max_abs={scw_prediction_max_abs:.8g}, "
+            f"mean_abs={scw_prediction_mean_abs:.8g}, "
+            f"tolerance={EQUIVALENCE_TOLERANCE:.8g}"
+        )
+
+    deterministic_validation = validate_figure2a_trace(
+        condition=condition,
+        operator_mode="deterministic",
+        trace=deterministic_trace,
+        expected_state_changes=int(
+            deterministic_acc.state_changes_by_sequence[
+                selected_test_position
+            ]
+        ),
+        expected_triggers=int(
+            deterministic_acc.triggers_by_sequence[
+                selected_test_position
+            ]
+        ),
+        expected_visible_triggers=int(
+            deterministic_acc.visible_triggers_by_sequence[
+                selected_test_position
+            ]
+        ),
+    )
+
+    scw_validation = validate_figure2a_trace(
+        condition=condition,
+        operator_mode="scw",
+        trace=scw_trace,
+        expected_state_changes=int(
+            scw_acc.state_changes_by_sequence[
+                selected_test_position
+            ]
+        ),
+        expected_triggers=int(
+            scw_acc.triggers_by_sequence[
+                selected_test_position
+            ]
+        ),
+        expected_visible_triggers=int(
+            scw_acc.visible_triggers_by_sequence[
+                selected_test_position
+            ]
+        ),
+    )
+
+    deterministic_active_votes_per_unit = np.count_nonzero(
+        deterministic_trace[
+            "active_vote"
+        ][
+            0,
+            :,
+            :,
+        ],
+        axis=0,
+    ).astype(
+        np.int64
+    )
+
+    scw_visible_trigger_mask = (
+        scw_trace[
+            "trigger"
+        ][
+            0,
+            :,
+            :,
+        ]
+        & scw_trace[
+            "visible_change"
+        ][
+            0,
+            :,
+            :,
+        ]
+    )
+
+    scw_visible_triggers_per_unit = np.count_nonzero(
+        scw_visible_trigger_mask,
+        axis=0,
+    ).astype(
+        np.int64
+    )
+
+    maximum_visible_triggers = int(
+        np.max(
+            scw_visible_triggers_per_unit
+        )
+    )
+
+    if maximum_visible_triggers <= 0:
+        raise RuntimeError(
+            "Selected Figure 2A sequence was expected to contain "
+            "a visible SCW trigger, but no decoder unit has one"
+        )
+
+    trigger_candidate_units = np.flatnonzero(
+        scw_visible_triggers_per_unit
+        == maximum_visible_triggers
+    )
+
+    candidate_active_vote_counts = (
+        deterministic_active_votes_per_unit[
+            trigger_candidate_units
+        ]
+    )
+
+    maximum_candidate_active_votes = int(
+        np.max(
+            candidate_active_vote_counts
+        )
+    )
+
+    final_candidate_units = trigger_candidate_units[
+        candidate_active_vote_counts
+        == maximum_candidate_active_votes
+    ]
+
+    selected_unit_index = int(
+        final_candidate_units[
+            0
+        ]
+    )
+
+    selected_unit_one_based = int(
+        selected_unit_index
+        + 1
+    )
+
+    selected_unit_scw_visible_trigger_mask = (
+        scw_visible_trigger_mask[
+            :,
+            selected_unit_index,
+        ]
+    )
+
+    selected_unit_scw_visible_trigger_steps_one_based = (
+        np.flatnonzero(
+            selected_unit_scw_visible_trigger_mask
+        ).astype(
+            np.int32
+        )
+        + 1
+    )
+
+    if selected_unit_scw_visible_trigger_steps_one_based.size == 0:
+        raise RuntimeError(
+            "Selected Figure 2A decoder unit has no visible SCW trigger"
+        )
+
+    decoder_metadata = model.sdecgru.metadata()
+
+    output_dir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    npz_path = (
+        output_dir
+        / "figure2a_b8_to_b4_representative_trace.npz"
+    )
+
+    mat_path = (
+        output_dir
+        / "figure2a_b8_to_b4_representative_trace.mat"
+    )
+
+    manifest_path = (
+        output_dir
+        / "figure2a_b8_to_b4_representative_trace_manifest.json"
+    )
+
+    decoder_steps_one_based = np.arange(
+        1,
+        LIVE_STEPS
+        + 1,
+        dtype=np.int32,
+    )
+
+    decoder_units_zero_based = np.arange(
+        STUDENT_UNITS,
+        dtype=np.int32,
+    )
+
+    decoder_units_one_based = np.arange(
+        1,
+        STUDENT_UNITS
+        + 1,
+        dtype=np.int32,
+    )
+
+    deterministic_raw_state_live = np.asarray(
+        deterministic_trace[
+            "raw_state"
+        ][
+            0,
+            :LIVE_STEPS,
+            :,
+        ],
+        dtype=np.float32,
+    )
+
+    scw_raw_state_live = np.asarray(
+        scw_trace[
+            "raw_state"
+        ][
+            0,
+            :LIVE_STEPS,
+            :,
+        ],
+        dtype=np.float32,
+    )
+
+    array_payload = {
+        "decoder_steps_one_based": (
+            decoder_steps_one_based
+        ),
+        "decoder_units_zero_based": (
+            decoder_units_zero_based
+        ),
+        "decoder_units_one_based": (
+            decoder_units_one_based
+        ),
+        "test_dataset_rows_zero_based": np.asarray(
+            test_idx,
+            dtype=np.int64,
+        ),
+        "deterministic_state_change_fraction_by_test_sequence": np.asarray(
+            deterministic_state_change_fraction_by_sequence,
+            dtype=np.float64,
+        ),
+        "scw_visible_triggers_by_test_sequence": np.asarray(
+            scw_acc.visible_triggers_by_sequence,
+            dtype=np.int64,
+        ),
+        "selected_test_position_zero_based": np.asarray(
+            selected_test_position,
+            dtype=np.int64,
+        ),
+        "selected_test_position_one_based": np.asarray(
+            selected_test_position
+            + 1,
+            dtype=np.int64,
+        ),
+        "selected_dataset_row_zero_based": np.asarray(
+            selected_dataset_row,
+            dtype=np.int64,
+        ),
+        "selected_dataset_row_one_based": np.asarray(
+            selected_dataset_row
+            + 1,
+            dtype=np.int64,
+        ),
+        "selected_unit_index_zero_based": np.asarray(
+            selected_unit_index,
+            dtype=np.int32,
+        ),
+        "selected_unit_index_one_based": np.asarray(
+            selected_unit_one_based,
+            dtype=np.int32,
+        ),
+        "median_deterministic_state_change_fraction": np.asarray(
+            median_deterministic_state_change_fraction,
+            dtype=np.float64,
+        ),
+        "selected_deterministic_state_change_fraction": np.asarray(
+            selected_deterministic_state_change_fraction,
+            dtype=np.float64,
+        ),
+        "selected_distance_from_median": np.asarray(
+            selected_distance_from_median,
+            dtype=np.float64,
+        ),
+        "selected_input": np.asarray(
+            selected_input[
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "state_delta": np.asarray(
+            float(
+                model.sdecgru.delta
+            ),
+            dtype=np.float64,
+        ),
+        "state_half_step": np.asarray(
+            float(
+                model.sdecgru.half_step
+            ),
+            dtype=np.float64,
+        ),
+        "state_qmin": np.asarray(
+            float(
+                model.sdecgru.qmin
+            ),
+            dtype=np.float64,
+        ),
+        "state_qmax": np.asarray(
+            float(
+                model.sdecgru.qmax
+            ),
+            dtype=np.float64,
+        ),
+        "scw_deadzone": np.asarray(
+            float(
+                model.sdecgru.deadzone
+            ),
+            dtype=np.float64,
+        ),
+        "scw_deadzone_fraction": np.asarray(
+            float(
+                model.sdecgru.deadzone_fraction
+            ),
+            dtype=np.float64,
+        ),
+        "scw_trigger_votes": np.asarray(
+            int(
+                model.sdecgru.trigger_votes
+            ),
+            dtype=np.int32,
+        ),
+        "scw_counter_min": np.asarray(
+            int(
+                model.sdecgru.counter_min
+            ),
+            dtype=np.int32,
+        ),
+        "scw_counter_max": np.asarray(
+            int(
+                model.sdecgru.counter_max
+            ),
+            dtype=np.int32,
+        ),
+        "deterministic_predictions": np.asarray(
+            deterministic_trace[
+                "predictions"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_raw_state_live": (
+            deterministic_raw_state_live
+        ),
+        "deterministic_raw_state_terminal": np.asarray(
+            deterministic_trace[
+                "raw_state"
+            ][
+                0,
+                LIVE_STEPS,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_q_before": np.asarray(
+            deterministic_trace[
+                "q_before"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_q_after": np.asarray(
+            deterministic_trace[
+                "q_after"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_delta_raw": np.asarray(
+            deterministic_trace[
+                "delta_raw"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_normal": np.asarray(
+            deterministic_trace[
+                "normal"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "deterministic_subthreshold": np.asarray(
+            deterministic_trace[
+                "subthreshold"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "deterministic_active_vote": np.asarray(
+            deterministic_trace[
+                "active_vote"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "deterministic_vote": np.asarray(
+            deterministic_trace[
+                "vote"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_visible_change": np.asarray(
+            deterministic_trace[
+                "visible_change"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "deterministic_counter_before": np.asarray(
+            deterministic_trace[
+                "counter_before"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_counter_after": np.asarray(
+            deterministic_trace[
+                "counter_after"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_predictions": np.asarray(
+            scw_trace[
+                "predictions"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_raw_state_live": (
+            scw_raw_state_live
+        ),
+        "scw_raw_state_terminal": np.asarray(
+            scw_trace[
+                "raw_state"
+            ][
+                0,
+                LIVE_STEPS,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_q_before": np.asarray(
+            scw_trace[
+                "q_before"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_q_after": np.asarray(
+            scw_trace[
+                "q_after"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_delta_raw": np.asarray(
+            scw_trace[
+                "delta_raw"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_normal": np.asarray(
+            scw_trace[
+                "normal"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "scw_subthreshold": np.asarray(
+            scw_trace[
+                "subthreshold"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "scw_active_vote": np.asarray(
+            scw_trace[
+                "active_vote"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "scw_vote": np.asarray(
+            scw_trace[
+                "vote"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_trigger": np.asarray(
+            scw_trace[
+                "trigger"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "scw_visible_change": np.asarray(
+            scw_trace[
+                "visible_change"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=bool,
+        ),
+        "scw_counter_before": np.asarray(
+            scw_trace[
+                "counter_before"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_counter_after": np.asarray(
+            scw_trace[
+                "counter_after"
+            ][
+                0,
+                :,
+                :,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_active_votes_per_unit": np.asarray(
+            deterministic_active_votes_per_unit,
+            dtype=np.int64,
+        ),
+        "scw_visible_triggers_per_unit": np.asarray(
+            scw_visible_triggers_per_unit,
+            dtype=np.int64,
+        ),
+        "selected_unit_scw_visible_trigger_steps_one_based": np.asarray(
+            selected_unit_scw_visible_trigger_steps_one_based,
+            dtype=np.int32,
+        ),
+        "deterministic_selected_raw_state": np.asarray(
+            deterministic_raw_state_live[
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_selected_q_before": np.asarray(
+            deterministic_trace[
+                "q_before"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_selected_q_after": np.asarray(
+            deterministic_trace[
+                "q_after"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_selected_active_vote": np.asarray(
+            deterministic_trace[
+                "active_vote"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=bool,
+        ),
+        "deterministic_selected_vote": np.asarray(
+            deterministic_trace[
+                "vote"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "deterministic_selected_visible_change": np.asarray(
+            deterministic_trace[
+                "visible_change"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=bool,
+        ),
+        "scw_selected_raw_state": np.asarray(
+            scw_raw_state_live[
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_selected_q_before": np.asarray(
+            scw_trace[
+                "q_before"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_selected_q_after": np.asarray(
+            scw_trace[
+                "q_after"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_selected_active_vote": np.asarray(
+            scw_trace[
+                "active_vote"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=bool,
+        ),
+        "scw_selected_vote": np.asarray(
+            scw_trace[
+                "vote"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_selected_trigger": np.asarray(
+            scw_trace[
+                "trigger"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=bool,
+        ),
+        "scw_selected_visible_trigger": np.asarray(
+            selected_unit_scw_visible_trigger_mask,
+            dtype=bool,
+        ),
+        "scw_selected_visible_change": np.asarray(
+            scw_trace[
+                "visible_change"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=bool,
+        ),
+        "scw_selected_counter_before": np.asarray(
+            scw_trace[
+                "counter_before"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+        "scw_selected_counter_after": np.asarray(
+            scw_trace[
+                "counter_after"
+            ][
+                0,
+                :,
+                selected_unit_index,
+            ],
+            dtype=np.float32,
+        ),
+    }
+
+    np.savez_compressed(
+        npz_path,
+        **array_payload,
+    )
+
+    savemat(
+        mat_path,
+        array_payload,
+        do_compression=True,
+        long_field_names=True,
+        oned_as="column",
+    )
+
+    manifest = {
+        "analysis": (
+            "Figure 2A representative B8-trained model "
+            "forced to B4 recurrent-state trajectory"
+        ),
+        "condition": (
+            condition.key
+        ),
+        "condition_display_name": (
+            condition.display_name
+        ),
+        "repository": (
+            "https://github.com/ismailerbas/Seq2SeqLite-kd"
+        ),
+        "checkpoint": {
+            "path": str(
+                checkpoint
+            ),
+            "sha256": sha256_file(
+                checkpoint
+            ),
+        },
+        "selection": {
+            "sequence_rule": (
+                "Among held-out sequences containing at least one "
+                "recurrence-visible SCW trigger, choose the sequence "
+                "whose deterministic B8-to-B4 decoder state-change "
+                "fraction is closest to the full-test median. "
+                "Ties are resolved by the lowest test-partition position."
+            ),
+            "unit_rule": (
+                "Within the selected sequence, choose the decoder unit "
+                "with the largest number of recurrence-visible SCW triggers. "
+                "Ties are resolved first by the largest deterministic "
+                "active-vote count and then by the lowest unit index."
+            ),
+            "visual_inspection_used": False,
+            "eligible_sequences_with_visible_scw_trigger": int(
+                eligible_test_positions.size
+            ),
+            "median_deterministic_state_change_fraction": (
+                median_deterministic_state_change_fraction
+            ),
+            "selected_test_position_zero_based": (
+                selected_test_position
+            ),
+            "selected_test_position_one_based": (
+                selected_test_position
+                + 1
+            ),
+            "selected_dataset_row_zero_based": (
+                selected_dataset_row
+            ),
+            "selected_dataset_row_one_based": (
+                selected_dataset_row
+                + 1
+            ),
+            "selected_deterministic_state_change_fraction": (
+                selected_deterministic_state_change_fraction
+            ),
+            "selected_distance_from_median": (
+                selected_distance_from_median
+            ),
+            "selected_unit_index_zero_based": (
+                selected_unit_index
+            ),
+            "selected_unit_index_one_based": (
+                selected_unit_one_based
+            ),
+            "selected_unit_deterministic_active_votes": int(
+                deterministic_active_votes_per_unit[
+                    selected_unit_index
+                ]
+            ),
+            "selected_unit_scw_visible_triggers": int(
+                scw_visible_triggers_per_unit[
+                    selected_unit_index
+                ]
+            ),
+            "selected_unit_scw_visible_trigger_steps_one_based": (
+                selected_unit_scw_visible_trigger_steps_one_based
+            ),
+        },
+        "state_interface": (
+            decoder_metadata
+        ),
+        "selected_sequence_counts": {
+            "deterministic_state_changes": int(
+                deterministic_acc.state_changes_by_sequence[
+                    selected_test_position
+                ]
+            ),
+            "scw_state_changes": int(
+                scw_acc.state_changes_by_sequence[
+                    selected_test_position
+                ]
+            ),
+            "scw_triggers": int(
+                scw_acc.triggers_by_sequence[
+                    selected_test_position
+                ]
+            ),
+            "scw_visible_triggers": int(
+                scw_acc.visible_triggers_by_sequence[
+                    selected_test_position
+                ]
+            ),
+        },
+        "validation": {
+            "deterministic_trace": (
+                deterministic_validation
+            ),
+            "scw_trace": (
+                scw_validation
+            ),
+            "deterministic_prediction_equivalence": {
+                "max_abs": (
+                    deterministic_prediction_max_abs
+                ),
+                "mean_abs": (
+                    deterministic_prediction_mean_abs
+                ),
+                "tolerance": (
+                    EQUIVALENCE_TOLERANCE
+                ),
+                "passed": True,
+            },
+            "scw_prediction_equivalence": {
+                "max_abs": (
+                    scw_prediction_max_abs
+                ),
+                "mean_abs": (
+                    scw_prediction_mean_abs
+                ),
+                "tolerance": (
+                    EQUIVALENCE_TOLERANCE
+                ),
+                "passed": True,
+            },
+        },
+        "outputs": {
+            "npz": (
+                npz_path.name
+            ),
+            "mat": (
+                mat_path.name
+            ),
+            "manifest": (
+                manifest_path.name
+            ),
+        },
+        "array_shapes": {
+            key: list(
+                np.asarray(
+                    value
+                ).shape
+            )
+            for (
+                key,
+                value,
+            ) in array_payload.items()
+        },
+    }
+
+    write_json(
+        manifest_path,
+        manifest,
+    )
+
+    print(
+        "[FIGURE 2A] representative trajectory exported",
+        flush=True,
+    )
+
+    print(
+        "[FIGURE 2A] "
+        f"test_position_zero_based={selected_test_position}, "
+        f"dataset_row_zero_based={selected_dataset_row}, "
+        f"unit_zero_based={selected_unit_index}, "
+        f"unit_one_based={selected_unit_one_based}",
+        flush=True,
+    )
+
+    print(
+        "[FIGURE 2A] "
+        "median deterministic state-change fraction="
+        f"{median_deterministic_state_change_fraction:.8f}, "
+        "selected="
+        f"{selected_deterministic_state_change_fraction:.8f}",
+        flush=True,
+    )
+
+    print(
+        "[FIGURE 2A] "
+        "selected-unit visible SCW trigger steps="
+        f"{selected_unit_scw_visible_trigger_steps_one_based.tolist()}",
+        flush=True,
+    )
+
+    print(
+        f"[FIGURE 2A] NPZ={npz_path}",
+        flush=True,
+    )
+
+    print(
+        f"[FIGURE 2A] MAT={mat_path}",
+        flush=True,
+    )
+
+    print(
+        f"[FIGURE 2A] manifest={manifest_path}",
+        flush=True,
+    )
+
+    return manifest
 
 def validate_against_manuscript(
     condition: ConditionSpec,
@@ -5561,6 +7368,18 @@ def main() -> None:
             f"{condition.display_name}",
             flush=True,
         )
+
+        if condition.key == "b8_to_b4":
+            export_figure2a_representative_trace(
+                output_dir=output_dir,
+                condition=condition,
+                model=analysis_model,
+                deterministic_acc=deterministic_acc,
+                scw_acc=scw_acc,
+                normalized_input=normalized_input,
+                test_idx=test_idx,
+                checkpoint=checkpoint,
+            )
 
         all_accumulators[
             condition.key
