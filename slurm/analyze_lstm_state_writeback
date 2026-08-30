@@ -1,0 +1,310 @@
+#!/bin/bash
+#SBATCH --job-name=lstm_state_writeback
+#SBATCH --output=/gpfs/u/scratch/HBNN/HBNNrbss/nmi/slurm-%j_%x.out
+#SBATCH --error=/gpfs/u/scratch/HBNN/HBNNrbss/nmi/slurm-%j_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
+
+set -euo pipefail
+
+DIAG_LOG="/gpfs/u/scratch/HBNN/HBNNrbss/nmi/slurmdiag-${SLURM_JOB_ID:-manual}.log"
+
+exec > "${DIAG_LOG}" 2>&1
+
+log() {
+    printf \
+        '[%s] %s\n' \
+        "$(date '+%Y-%m-%d %H:%M:%S')" \
+        "$*"
+}
+
+on_error() {
+    local exit_code="$1"
+    local line_number="$2"
+    local failed_command="$3"
+
+    log \
+        "SCRIPT FAILED: exit_code=${exit_code} line=${line_number} command=${failed_command}"
+}
+
+on_exit() {
+    local exit_code="$1"
+
+    log \
+        "SCRIPT EXIT: exit_code=${exit_code} elapsed_seconds=${SECONDS}"
+}
+
+trap \
+    'on_error "$?" "${LINENO}" "${BASH_COMMAND}"' \
+    ERR
+
+trap \
+    'on_exit "$?"' \
+    EXIT
+
+export PS4='+ [sec=${SECONDS} line=${LINENO}] '
+
+set -x
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+
+    [[ -f "${path}" ]] \
+        || fatal \
+        "required file does not exist: ${path}"
+}
+
+require_dir() {
+    local path="$1"
+
+    [[ -d "${path}" ]] \
+        || fatal \
+        "required directory does not exist: ${path}"
+}
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(
+    /gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook
+)"
+
+conda activate tf210_qkeras
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+export PYTHONUNBUFFERED=1
+
+PROJECT_DIR="/gpfs/u/scratch/HBNN/HBNNrbss/nmi"
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+DATA_PATH="${PROJECT_DIR}"
+
+ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/analyze_lstm_state_writeback.py"
+
+CHECKPOINT="${PROJECT_DIR}/results/vanilla_kd_lstm_T4.0_a0.6_b8k8r8a8s8_lstm32x1_dense3_effbs1024_microbs1024_lr1e-04/student_best.weights.h5"
+
+ARGS_FILE="$(
+    dirname "${CHECKPOINT}"
+)/student_args.json"
+
+TEST_METRICS="$(
+    dirname "${CHECKPOINT}"
+)/test_metrics.json"
+
+OUTPUT_DIR="${PROJECT_DIR}/results/lstm_state_writeback_analysis_b8_to_b4"
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+
+require_dir "${PROJECT_DIR}"
+require_dir "${DATA_PATH}"
+require_dir "${PROJECT_DIR}/results"
+
+require_file "${ANALYSIS_SCRIPT}"
+require_file "${PROJECT_DIR}/train_student_vanilla_kd_lstm.py"
+require_file "${PROJECT_DIR}/train_student_vanilla_kd.py"
+require_file "${CHECKPOINT}"
+require_file "${ARGS_FILE}"
+require_file "${TEST_METRICS}"
+
+if [ -e "${OUTPUT_DIR}" ]; then
+    fatal \
+        "output directory already exists; refusing to overwrite prior analysis: ${OUTPUT_DIR}"
+fi
+
+mkdir -p "${OUTPUT_DIR}"
+
+command -v python >/dev/null 2>&1 \
+    || fatal \
+    "python is not available in tf210_qkeras"
+
+command -v nvidia-smi >/dev/null 2>&1 \
+    || fatal \
+    "nvidia-smi is not available"
+
+cd "${PROJECT_DIR}"
+
+PYTHON_BIN="$(
+    command -v python
+)"
+
+TF_VERSION="$(
+    ${PYTHON_BIN} \
+        -c \
+        'import tensorflow as tf; print(tf.__version__)'
+)"
+
+QKERAS_VERSION="$(
+    ${PYTHON_BIN} \
+        -c \
+        'import qkeras; print(getattr(qkeras, "__version__", "unknown"))'
+)"
+
+NUMPY_VERSION="$(
+    ${PYTHON_BIN} \
+        -c \
+        'import numpy as np; print(np.__version__)'
+)"
+
+GPU_CHECK="$(
+    ${PYTHON_BIN} \
+        -c \
+        'import tensorflow as tf; print(len(tf.config.list_physical_devices("GPU")))' \
+        2>/dev/null
+)"
+
+[[ -n "${GPU_CHECK}" ]] \
+    || fatal \
+    "TensorFlow GPU sanity check returned no value"
+
+[[ "${GPU_CHECK}" = "1" ]] \
+    || fatal \
+    "expected exactly one TensorFlow-visible GPU, found ${GPU_CHECK}"
+
+log "======================================================================"
+log "FROZEN LSTM RECURRENT-STATE WRITEBACK ANALYSIS"
+log "======================================================================"
+log "SLURM JOB ID      : ${SLURM_JOB_ID:-unknown}"
+log "NODE              : $(hostname)"
+log "PROJECT DIR       : ${PROJECT_DIR}"
+log "ANALYSIS SCRIPT   : ${ANALYSIS_SCRIPT}"
+log "CHECKPOINT        : ${CHECKPOINT}"
+log "ARGS FILE         : ${ARGS_FILE}"
+log "OUTPUT DIR        : ${OUTPUT_DIR}"
+log "PYTHON            : ${PYTHON_BIN}"
+log "CONDA ENV         : ${CONDA_DEFAULT_ENV:-unset}"
+log "TF GPU COUNT      : ${GPU_CHECK}"
+log "TF VERSION        : ${TF_VERSION}"
+log "QKERAS VERSION    : ${QKERAS_VERSION}"
+log "NUMPY VERSION     : ${NUMPY_VERSION}"
+log "======================================================================"
+
+nvidia-smi
+
+${PYTHON_BIN} \
+    -m \
+    py_compile \
+    "${PROJECT_DIR}/train_student_vanilla_kd_lstm.py"
+
+${PYTHON_BIN} \
+    -m \
+    py_compile \
+    "${ANALYSIS_SCRIPT}"
+
+${PYTHON_BIN} \
+    -u \
+    "${ANALYSIS_SCRIPT}" \
+    --repo-root "${PROJECT_DIR}" \
+    --data-dir "${DATA_PATH}" \
+    --checkpoint "${CHECKPOINT}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --student-units 32 \
+    --seq-len 135 \
+    --n-out 3 \
+    --gate-width-ns 0.09 \
+    --bits-kernel 8 \
+    --bits-bias 8 \
+    --bits-recurrent 8 \
+    --bits-activation 8 \
+    --native-state-bits 8 \
+    --forced-state-bits 4 \
+    --expected-alpha 0.6 \
+    --batch-size 512 \
+    --tolerance 5e-5 \
+    --equivalence-samples 2048
+
+require_file \
+    "${OUTPUT_DIR}/analysis_manifest.json"
+
+require_file \
+    "${OUTPUT_DIR}/validation.json"
+
+require_file \
+    "${OUTPUT_DIR}/lstm_state_writeback_summary.json"
+
+require_file \
+    "${OUTPUT_DIR}/lstm_state_writeback_summary.csv"
+
+require_file \
+    "${OUTPUT_DIR}/native_per_sequence_metrics.npz"
+
+require_file \
+    "${OUTPUT_DIR}/forced_per_sequence_metrics.npz"
+
+require_file \
+    "${OUTPUT_DIR}/forced_ef_per_sequence_metrics.npz"
+
+require_file \
+    "${OUTPUT_DIR}/identity_per_sequence_metrics.npz"
+
+${PYTHON_BIN} \
+    - \
+    "${OUTPUT_DIR}/validation.json" \
+    <<'PY'
+import json
+import sys
+
+with open(
+    sys.argv[1],
+    "r",
+) as handle:
+    validation = json.load(
+        handle
+    )
+
+for key in (
+    "native_equivalence_preflight",
+    "native_equivalence_full_test",
+):
+    result = validation.get(
+        key
+    )
+
+    if (
+        result is None
+        or result.get("passed")
+        is not True
+    ):
+        raise SystemExit(
+            "validation gate failed: "
+            f"{key}: {result}"
+        )
+
+print(
+    "NATIVE EQUIVALENCE GATES PASSED"
+)
+PY
+
+log "======================================================================"
+log "ANALYSIS COMPLETE"
+log "OUTPUT DIR: ${OUTPUT_DIR}"
+log "======================================================================"
+
+ls -lh "${OUTPUT_DIR}"

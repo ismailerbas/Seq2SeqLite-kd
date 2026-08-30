@@ -1,0 +1,400 @@
+#!/bin/bash
+#SBATCH --job-name=lstm_vanilla_b8k8r8a8s8
+#SBATCH --output=/gpfs/u/scratch/HBNN/HBNNrbss/nmi/slurm-%j_%x.out
+#SBATCH --error=/gpfs/u/scratch/HBNN/HBNNrbss/nmi/slurm-%j_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
+
+set -uo pipefail
+
+RESUME_FLAG=${1:-""}
+
+if [ -n "${RESUME_FLAG}" ] && [ "${RESUME_FLAG}" != "--resume" ]; then
+    echo "FATAL: argument 1 must be --resume or empty, got: ${RESUME_FLAG}"
+    exit 1
+fi
+
+BITS_KERNEL=8
+BITS_BIAS=8
+BITS_RECURRENT=8
+BITS_ACTIVATION=8
+BITS_STATE=8
+
+STUDENT_UNITS=32
+TEACHER_UNITS=128
+TEACHER_LAYERS=2
+
+BATCH_SIZE=1024
+ACCUMULATION_STEPS=1
+MICRO_BATCH_SIZE=$((BATCH_SIZE / ACCUMULATION_STEPS))
+
+TEMPERATURE=4.0
+ALPHA=0.6
+
+WARMUP_EPOCHS=5
+TOTAL_EPOCHS=300
+PATIENCE_LIMIT=15
+
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+PROJECT_DIR="${SCRATCH_BASE}/nmi"
+DATA_PATH="${PROJECT_DIR}"
+SAVE_DIR="${PROJECT_DIR}"
+
+SCRIPT_DIR="$(
+    cd "$( dirname "${BASH_SOURCE[0]}" )"
+    pwd
+)"
+
+TRAIN_SCRIPT="${SCRIPT_DIR}/train_student_vanilla_kd_lstm.py"
+
+TEACHER_WEIGHTS="${PROJECT_DIR}/teacher_best.weights.h5"
+
+JOB_TAG="vanilla_kd_lstm_T${TEMPERATURE}_a${ALPHA}_b${BITS_KERNEL}k${BITS_BIAS}r${BITS_RECURRENT}a${BITS_ACTIVATION}s${BITS_STATE}_lstm${STUDENT_UNITS}x1_dense3_effbs${BATCH_SIZE}_microbs${MICRO_BATCH_SIZE}_lr1e-04"
+
+JOB_DIR="${SAVE_DIR}/results/${JOB_TAG}"
+
+RESUME_STATE_FILE="${JOB_DIR}/resume_state.json"
+
+BEST_CKPT="${JOB_DIR}/student_best.weights.h5"
+
+RESUME_CHECKPOINT_INDEX="${JOB_DIR}/resume_ckpt/checkpoint"
+
+TEST_METRICS="${JOB_DIR}/test_metrics.json"
+
+if [ ! -f "${TEACHER_WEIGHTS}" ]; then
+    echo "FATAL: teacher weights not found: ${TEACHER_WEIGHTS}"
+    exit 1
+fi
+
+if [ ! -f "${TRAIN_SCRIPT}" ]; then
+    echo "FATAL: training script not found: ${TRAIN_SCRIPT}"
+    exit 1
+fi
+
+if [ ! -f "${SCRIPT_DIR}/train_student_vanilla_kd.py" ]; then
+    echo "FATAL: base training script not found in project root:"
+    echo "  ${SCRIPT_DIR}/train_student_vanilla_kd.py"
+    exit 1
+fi
+
+mkdir -p "${JOB_DIR}"
+
+if [ -z "${RESUME_FLAG}" ]; then
+    if [ -f "${RESUME_STATE_FILE}" ] \
+       || [ -f "${RESUME_CHECKPOINT_INDEX}" ] \
+       || [ -f "${TEST_METRICS}" ]; then
+
+        echo "FATAL: existing resumable or completed LSTM run detected in:"
+        echo "  ${JOB_DIR}"
+        echo "Use --resume for a preempted run, or move the existing result directory before starting a fresh run."
+        exit 1
+    fi
+else
+    if [ ! -f "${RESUME_STATE_FILE}" ]; then
+        echo "FATAL: --resume requested but resume_state.json is missing:"
+        echo "  ${RESUME_STATE_FILE}"
+        exit 1
+    fi
+
+    if [ ! -f "${RESUME_CHECKPOINT_INDEX}" ]; then
+        echo "FATAL: --resume requested but TensorFlow resume checkpoint metadata is missing:"
+        echo "  ${RESUME_CHECKPOINT_INDEX}"
+        exit 1
+    fi
+
+    if [ ! -f "${BEST_CKPT}" ]; then
+        echo "FATAL: --resume requested but best checkpoint is missing:"
+        echo "  ${BEST_CKPT}"
+        exit 1
+    fi
+fi
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(
+    /gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook
+)"
+
+conda activate tf210_qkeras
+
+export LD_LIBRARY_PATH="${CONDA_PREFIX}/lib:${LD_LIBRARY_PATH:-}"
+
+export CUDA_VISIBLE_DEVICES=0
+export TF_CPP_MIN_LOG_LEVEL=2
+export TF_ENABLE_ONEDNN_OPTS=0
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+
+export PYTHONUNBUFFERED=1
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+
+GPU_CHECK=$(
+    python -c \
+    "import tensorflow as tf; print(len(tf.config.list_physical_devices('GPU')))" \
+    2>/dev/null
+)
+
+if [ -z "${GPU_CHECK}" ] || [ "${GPU_CHECK}" != "1" ]; then
+    echo "FATAL: expected exactly one TensorFlow-visible GPU, found: ${GPU_CHECK:-none}"
+    exit 1
+fi
+
+python -m py_compile "${TRAIN_SCRIPT}"
+
+if [ "$?" -ne 0 ]; then
+    echo "FATAL: Python syntax check failed: ${TRAIN_SCRIPT}"
+    exit 1
+fi
+
+PREEMPT_REQUESTED=0
+PYTHON_PID=""
+
+handle_usr1() {
+    PREEMPT_REQUESTED=1
+
+    echo "============================================================"
+    echo "SIGUSR1 received."
+    echo "Stopping Python and resubmitting from the last completed epoch."
+    echo "============================================================"
+
+    if [ -n "${PYTHON_PID}" ] \
+       && kill -0 "${PYTHON_PID}" 2>/dev/null; then
+
+        kill -TERM "${PYTHON_PID}" 2>/dev/null || true
+    fi
+}
+
+trap handle_usr1 SIGUSR1
+
+echo "============================================================"
+echo "VANILLA KD LSTM STUDENT TRAINING"
+echo "============================================================"
+echo "SLURM JOB ID        : ${SLURM_JOB_ID:-unset}"
+echo "SLURM JOB NAME      : ${SLURM_JOB_NAME:-unset}"
+echo "NODE                : $(hostname)"
+echo "PROJECT DIR         : ${PROJECT_DIR}"
+echo "TRAIN SCRIPT        : ${TRAIN_SCRIPT}"
+echo "TEACHER WEIGHTS     : ${TEACHER_WEIGHTS}"
+echo "JOB TAG             : ${JOB_TAG}"
+echo "JOB DIR             : ${JOB_DIR}"
+echo "RESUME FLAG         : ${RESUME_FLAG:-off}"
+echo "PYTHON              : $(which python)"
+echo "TF VERSION          : $(python -c 'import tensorflow as tf; print(tf.__version__)' 2>/dev/null)"
+echo "QKERAS VERSION      : $(python -c 'import qkeras; print(getattr(qkeras, "__version__", "unknown"))' 2>/dev/null)"
+echo "TF PHYSICAL GPUS    : ${GPU_CHECK}"
+echo "============================================================"
+
+PYTHON_ARGS=(
+    "${TRAIN_SCRIPT}"
+    --data-dir "${DATA_PATH}"
+    --save-dir "${SAVE_DIR}"
+    --teacher-ckpt "${TEACHER_WEIGHTS}"
+    --teacher-units "${TEACHER_UNITS}"
+    --teacher-layers "${TEACHER_LAYERS}"
+    --seq-len 135
+    --n-out 3
+    --gate-width-ns 0.09
+    --temperature "${TEMPERATURE}"
+    --alpha "${ALPHA}"
+    --bits-kernel "${BITS_KERNEL}"
+    --bits-bias "${BITS_BIAS}"
+    --bits-recurrent "${BITS_RECURRENT}"
+    --bits-activation "${BITS_ACTIVATION}"
+    --bits-state "${BITS_STATE}"
+    --student-units "${STUDENT_UNITS}"
+    --batch-size "${BATCH_SIZE}"
+    --accumulation-steps "${ACCUMULATION_STEPS}"
+    --epochs "${TOTAL_EPOCHS}"
+    --patience "${PATIENCE_LIMIT}"
+    --min-delta 1e-5
+    --lr 1e-4
+    --ref-batch-size "${MICRO_BATCH_SIZE}"
+    --lr-factor 0.5
+    --lr-patience 8
+    --lr-min 1e-6
+    --warmup-epochs "${WARMUP_EPOCHS}"
+    --infer-batch 8192
+    --log-interval 10
+    --prefetch-batches 32
+    --pipeline-workers 4
+    --split-seed 42
+)
+
+if [ "${RESUME_FLAG}" = "--resume" ]; then
+    PYTHON_ARGS+=(--resume)
+fi
+
+python "${PYTHON_ARGS[@]}" &
+
+PYTHON_PID=$!
+
+echo "Python launched with PID=${PYTHON_PID}"
+
+wait "${PYTHON_PID}"
+
+EXIT_CODE=$?
+
+if kill -0 "${PYTHON_PID}" 2>/dev/null; then
+    wait "${PYTHON_PID}"
+    EXIT_CODE=$?
+fi
+
+echo "Python process ${PYTHON_PID} exited with code ${EXIT_CODE}"
+
+resubmit_job() {
+    local next_arg=""
+
+    if [ -f "${RESUME_STATE_FILE}" ] \
+       && [ -f "${RESUME_CHECKPOINT_INDEX}" ] \
+       && [ -f "${BEST_CKPT}" ]; then
+
+        next_arg="--resume"
+
+        echo "Resubmission will use the saved last-completed-epoch checkpoint."
+    else
+        echo "No completed-epoch resume checkpoint exists yet."
+        echo "Resubmission will restart the fresh run."
+    fi
+
+    local new_job_id
+
+    if [ -n "${next_arg}" ]; then
+        new_job_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${SLURM_JOB_NAME}" \
+                "${SCRIPT_DIR}/trainlstmvanilla" \
+                "${next_arg}"
+        )
+    else
+        new_job_id=$(
+            sbatch \
+                --parsable \
+                --job-name="${SLURM_JOB_NAME}" \
+                "${SCRIPT_DIR}/trainlstmvanilla"
+        )
+    fi
+
+    local rc=$?
+
+    if [ "${rc}" -ne 0 ]; then
+        echo "FATAL: automatic resubmission failed with code ${rc}."
+        return "${rc}"
+    fi
+
+    echo "Resubmitted successfully. New SLURM job ID: ${new_job_id}"
+
+    return 0
+}
+
+if [ "${PREEMPT_REQUESTED}" = "1" ]; then
+    echo "Preemption signal handled. Resubmitting."
+
+    resubmit_job
+    RESUBMIT_RC=$?
+
+    if [ "${RESUBMIT_RC}" -ne 0 ]; then
+        exit "${RESUBMIT_RC}"
+    fi
+
+    exit 0
+fi
+
+if [ "${EXIT_CODE}" = "143" ]; then
+    echo "Python exited with SIGTERM status 143."
+    echo "Treating as wall-time preemption."
+
+    resubmit_job
+    RESUBMIT_RC=$?
+
+    if [ "${RESUBMIT_RC}" -ne 0 ]; then
+        exit "${RESUBMIT_RC}"
+    fi
+
+    exit 0
+fi
+
+if [ "${EXIT_CODE}" -ne 0 ]; then
+    echo "FATAL: Python exited with nonzero status ${EXIT_CODE}."
+    echo "Not resubmitting a genuine error."
+    exit "${EXIT_CODE}"
+fi
+
+if [ -f "${TEST_METRICS}" ]; then
+    echo "Training and test evaluation completed successfully."
+    echo "Results: ${JOB_DIR}"
+    exit 0
+fi
+
+if [ ! -f "${RESUME_STATE_FILE}" ]; then
+    echo "FATAL: Python exited 0 without test_metrics.json or resume_state.json."
+    exit 1
+fi
+
+NEXT_EPOCH=$(
+    python -c \
+    "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(int(s.get('epoch', 0)))" \
+    2>/dev/null
+)
+
+PATIENCE_CT=$(
+    python -c \
+    "import json; s=json.load(open('${RESUME_STATE_FILE}')); print(int(s.get('patience_ct', 0)))" \
+    2>/dev/null
+)
+
+if [ -z "${NEXT_EPOCH}" ] || [ -z "${PATIENCE_CT}" ]; then
+    echo "FATAL: could not read epoch/patience from ${RESUME_STATE_FILE}"
+    exit 1
+fi
+
+echo "Python exited 0 before test_metrics.json was produced."
+echo "Completed epochs : ${NEXT_EPOCH}"
+echo "Patience count   : ${PATIENCE_CT}"
+
+if [ "${NEXT_EPOCH}" -lt "${TOTAL_EPOCHS}" ] \
+   && [ "${PATIENCE_CT}" -lt "${PATIENCE_LIMIT}" ]; then
+
+    echo "Training has epochs remaining."
+    echo "Resubmitting with --resume."
+
+    resubmit_job
+    RESUBMIT_RC=$?
+
+    if [ "${RESUBMIT_RC}" -ne 0 ]; then
+        exit "${RESUBMIT_RC}"
+    fi
+
+    exit 0
+fi
+
+echo "Training state is complete but test_metrics.json is missing."
+echo "Resubmitting to run best-checkpoint evaluation."
+
+resubmit_job
+RESUBMIT_RC=$?
+
+if [ "${RESUBMIT_RC}" -ne 0 ]; then
+    exit "${RESUBMIT_RC}"
+fi
+
+exit 0
