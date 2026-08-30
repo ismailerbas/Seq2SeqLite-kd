@@ -1,0 +1,155 @@
+#!/bin/bash
+#SBATCH --output=slurm-%A_%x.out
+#SBATCH --error=slurm-%A_%x.err
+#SBATCH --nodes=1
+#SBATCH --ntasks-per-node=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=02:00:00
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=erbasi@rpi.edu
+#SBATCH --signal=B:SIGUSR1@120
+
+set -euo pipefail
+
+log() {
+    printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*"
+}
+
+fatal() {
+    log "FATAL: $*"
+    exit 1
+}
+
+require_file() {
+    local path="$1"
+
+    if [[ ! -f "${path}" ]]; then
+        fatal "required file does not exist: ${path}"
+    fi
+}
+
+require_dir() {
+    local path="$1"
+
+    if [[ ! -d "${path}" ]]; then
+        fatal "required directory does not exist: ${path}"
+    fi
+}
+
+module purge
+module load gcc/9.3.0/1
+
+eval "$(/gpfs/u/scratch/HBNN/HBNNrbss/miniconda3x86/bin/conda shell.bash hook)"
+conda activate tf210_qkeras
+
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export PYTHONUNBUFFERED=1
+
+SCRATCH_BASE="/gpfs/u/scratch/HBNN/HBNNrbss"
+PROJECT_DIR="/gpfs/u/home/HBNN/HBNNrbss/scratch/nmi"
+
+ANALYSIS_SCRIPT="${PROJECT_DIR}/eval/export_figure3b_occupancy.py"
+
+V4_RUN="${PROJECT_DIR}/results/vanilla_kd_T4.0_a0.6_b4k4r4a4s4_gru32x1_dense3_effbs1024_microbs1024_lr1e-04"
+
+V4_ROOT="${V4_RUN}/recurrent_memory_analysis"
+
+B4_DIR="${V4_ROOT}/V4_det_B4"
+B8_DIR="${V4_ROOT}/V4_det_B8"
+
+OUTPUT_DIR="${PROJECT_DIR}/results/figure3_inputs"
+
+export TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export PIP_CACHE_DIR="${SCRATCH_BASE}/pip_cache"
+export PIP_TMPDIR="${SCRATCH_BASE}/tmp_pip"
+export MPLCONFIGDIR="${SCRATCH_BASE}/mpl_cache"
+export XDG_CACHE_HOME="${SCRATCH_BASE}/xdg_cache"
+
+mkdir -p "${TMPDIR}"
+mkdir -p "${PIP_CACHE_DIR}"
+mkdir -p "${PIP_TMPDIR}"
+mkdir -p "${MPLCONFIGDIR}"
+mkdir -p "${XDG_CACHE_HOME}"
+mkdir -p "${OUTPUT_DIR}"
+
+require_dir "${PROJECT_DIR}"
+require_dir "${PROJECT_DIR}/eval"
+require_dir "${PROJECT_DIR}/results"
+require_dir "${V4_RUN}"
+require_dir "${V4_ROOT}"
+require_dir "${B4_DIR}"
+require_dir "${B8_DIR}"
+
+require_file "${ANALYSIS_SCRIPT}"
+require_file "${PROJECT_DIR}/eval/analyze_recurrent_memory.py"
+require_file "${PROJECT_DIR}/eval/analyze_writeback.py"
+
+require_file "${B4_DIR}/recurrent_memory_complete.flag"
+require_file "${B4_DIR}/recurrent_memory_summary.json"
+require_file "${B4_DIR}/recurrent_memory_manifest.json"
+require_file "${B4_DIR}/recurrent_memory_per_sequence.npz"
+
+require_file "${B8_DIR}/recurrent_memory_complete.flag"
+require_file "${B8_DIR}/recurrent_memory_summary.json"
+require_file "${B8_DIR}/recurrent_memory_manifest.json"
+require_file "${B8_DIR}/recurrent_memory_per_sequence.npz"
+
+command -v python >/dev/null 2>&1 || fatal "python is not available"
+
+PYTHON_BIN="$(command -v python)"
+
+NUMPY_VERSION="$(
+    "${PYTHON_BIN}" -c 'import numpy as np; print(np.__version__)'
+)"
+
+SCIPY_VERSION="$(
+    "${PYTHON_BIN}" -c 'import scipy; print(scipy.__version__)'
+)"
+
+log "======================================================================"
+log "FIGURE 3B DECODER OCCUPANCY EXPORT"
+log "======================================================================"
+log "SLURM JOB ID   : ${SLURM_JOB_ID:-unknown}"
+log "SLURM JOB NAME : ${SLURM_JOB_NAME:-unknown}"
+log "NODE           : $(hostname)"
+log "PROJECT DIR    : ${PROJECT_DIR}"
+log "ANALYSIS SCRIPT: ${ANALYSIS_SCRIPT}"
+log "V4 RUN         : ${V4_RUN}"
+log "NATIVE B4 DIR  : ${B4_DIR}"
+log "B8 STATE DIR   : ${B8_DIR}"
+log "OUTPUT DIR     : ${OUTPUT_DIR}"
+log "PYTHON         : ${PYTHON_BIN}"
+log "CONDA ENV      : ${CONDA_DEFAULT_ENV:-unset}"
+log "NUMPY VERSION  : ${NUMPY_VERSION}"
+log "SCIPY VERSION  : ${SCIPY_VERSION}"
+log "======================================================================"
+
+"${PYTHON_BIN}" -m py_compile \
+    "${ANALYSIS_SCRIPT}"
+
+"${PYTHON_BIN}" -u \
+    "${ANALYSIS_SCRIPT}" \
+    --project-root "${PROJECT_DIR}" \
+    --output-dir "${OUTPUT_DIR}"
+
+require_file "${OUTPUT_DIR}/figure3b_occupancy_discovery.json"
+require_file "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.csv"
+require_file "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.npz"
+require_file "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.mat"
+require_file "${OUTPUT_DIR}/figure3b_decoder_occupied_levels_manifest.json"
+
+log "======================================================================"
+log "FIGURE 3B EXPORT COMPLETE"
+log "======================================================================"
+
+ls -lh \
+    "${OUTPUT_DIR}/figure3b_occupancy_discovery.json" \
+    "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.csv" \
+    "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.npz" \
+    "${OUTPUT_DIR}/figure3b_decoder_occupied_levels.mat" \
+    "${OUTPUT_DIR}/figure3b_decoder_occupied_levels_manifest.json"
+
+log "======================================================================"
