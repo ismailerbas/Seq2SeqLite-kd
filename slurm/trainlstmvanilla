@@ -72,9 +72,9 @@ if [ ! -f "${TRAIN_SCRIPT}" ]; then
     exit 1
 fi
 
-if [ ! -f "${SCRIPT_DIR}/train_student_vanilla_kd.py" ]; then
+if [ ! -f "${PROJECT_DIR}/train_student_vanilla_kd.py" ]; then
     echo "FATAL: base training script not found in project root:"
-    echo "  ${SCRIPT_DIR}/train_student_vanilla_kd.py"
+    echo "  ${PROJECT_DIR}/train_student_vanilla_kd.py"
     exit 1
 fi
 
@@ -277,7 +277,7 @@ resubmit_job() {
             sbatch \
                 --parsable \
                 --job-name="${SLURM_JOB_NAME}" \
-                "${SCRIPT_DIR}/trainlstmvanilla" \
+                "${PROJECT_DIR}/trainlstmvanilla" \
                 "${next_arg}"
         )
     else
@@ -285,7 +285,7 @@ resubmit_job() {
             sbatch \
                 --parsable \
                 --job-name="${SLURM_JOB_NAME}" \
-                "${SCRIPT_DIR}/trainlstmvanilla"
+                "${PROJECT_DIR}/trainlstmvanilla"
         )
     fi
 
