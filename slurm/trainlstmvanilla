@@ -46,12 +46,7 @@ PROJECT_DIR="${SCRATCH_BASE}/nmi"
 DATA_PATH="${PROJECT_DIR}"
 SAVE_DIR="${PROJECT_DIR}"
 
-SCRIPT_DIR="$(
-    cd "$( dirname "${BASH_SOURCE[0]}" )"
-    pwd
-)"
-
-TRAIN_SCRIPT="${SCRIPT_DIR}/train_student_vanilla_kd_lstm.py"
+TRAIN_SCRIPT="${PROJECT_DIR}/train_student_vanilla_kd_lstm.py"
 
 TEACHER_WEIGHTS="${PROJECT_DIR}/teacher_best.weights.h5"
 
