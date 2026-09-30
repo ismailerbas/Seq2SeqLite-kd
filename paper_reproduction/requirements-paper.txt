@@ -1,0 +1,9 @@
+# Reproduction environment verified for
+# "Resource-Aware Hardware–Software Co-Design for Biomedical Imaging"
+#
+# Verified with Python 3.10.18
+
+tensorflow==2.10.1
+numpy==1.23.5
+QKeras==0.9.0
+h5py==3.16.0
