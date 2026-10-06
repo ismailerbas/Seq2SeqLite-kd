@@ -1,24 +1,54 @@
 # Seq2SeqLite: Resource-Aware and Low-Precision Recurrent Inference
 
-This repository contains the Seq2Seq and Seq2SeqLite training, quantization, evaluation, and recurrent-state analysis code used for fluorescence lifetime inference.
+This repository contains Seq2Seq and Seq2SeqLite software for fluorescence lifetime inference, including model training, quantization, recurrent-state analysis, evaluation, and paper-specific reproducibility material.
 
-The codebase supports two complementary studies:
+## Publications and reviewer reproduction
 
-1. **When Quantization Breaks Memory: Recurrent-State Write-Back in Low-Precision Temporal Inference**  
-   arXiv: https://arxiv.org/abs/2609.04490
+This repository supports two complementary studies that use the same Seq2SeqLite model family and fluorescence lifetime inference framework.
 
-2. **Resource-Aware Co-Design for Real-Time Biomedical Inference on Constrained Hardware**
+### 1. When Quantization Breaks Memory: Recurrent-State Write-Back in Low-Precision Temporal Inference
 
-Both studies use the Seq2SeqLite model family and the same fluorescence lifetime inference framework. The recurrent-state study focuses on low-precision state storage and recurrent-state write-back. The resource-aware co-design study uses the Seq2SeqLite model family for compact biomedical inference under constrained hardware resources.
+**Ismail Erbas, Xavier Intes, and Vikas Pandey**
+
+arXiv:2609.04490
+
+This study examines how low-precision recurrent-state storage affects temporal inference in GRU and LSTM models, and evaluates recurrent-state write-back methods that preserve information lost through coarse state quantization.
+
+**Reviewer reproduction:** [`docs/QUANTIZATION_PAPER_REPRODUCTION.md`](docs/QUANTIZATION_PAPER_REPRODUCTION.md)
+
+### 2. Resource-Aware Hardware–Software Co-Design for Biomedical Imaging
+
+This study evaluates Seq2SeqLite as a compact fluorescence lifetime inference model under hardware resource constraints, including knowledge distillation, quantization, experimental validation, FPGA synthesis, and resource-aware scheduling.
+
+**Reviewer reproduction:** [`paper_reproduction/README.md`](paper_reproduction/README.md)
+
+The software-only repository contains the model definitions, evaluation and verification scripts, configuration files, table-generation utilities, and expected results required to trace the reported results. Large evaluation datasets and model checkpoints are distributed separately through the manuscript's reviewer reproducibility package.
+
+Hardware synthesis and resource-aware scheduling are maintained separately:
+
+- **Vitis HLS reproduction:** [Seq2SeqLite-HLS](https://github.com/ismailerbas/Seq2SeqLite-HLS)
+- **STOMP resource-aware scheduling:** [STOMP](https://github.com/ismailerbas/stomp/tree/meta)
+
+## Synthetic fluorescence lifetime data
+
+Synthetic fluorescence lifetime data used in this research were generated using the PyFLI fluorescence lifetime imaging framework.
+
+PyFLI provides simulation and processing tools for fluorescence lifetime imaging and can be used to generate additional or custom synthetic FLI datasets:
+
+[PyFLI repository](https://github.com/vkp217/pyfli-pkg)
+
+The paper-specific reproduction workflows use frozen evaluation datasets so that reported numerical results can be compared directly. PyFLI is provided as the route for generating new simulated datasets rather than as a replacement for the frozen evaluation data used to reproduce the reported manuscript values.
 
 ## Repository structure
 
 ```text
-configs/
-docs/
-eval/
-slurm/
-tables/
+configs/             Model and experiment configurations
+docs/                Documentation and paper-specific guidance
+eval/                Evaluation and recurrent-state analysis
+slurm/               Cluster job templates
+tables/              Table-generation utilities
+
+paper_reproduction/  Resource-aware paper reproduction package
 
 train_teacher.py
 train_student_vanilla_kd.py
@@ -26,68 +56,18 @@ train_student_memoq.py
 train_student_vanilla_kd_lstm.py
 train_student_vanilla_kd_memory_campaign.py
 train_student_vanilla_kd_scw.py
-
-eval_experimental.py
-predict_5_pixels_local.py
-extract_student_weights.py
-requirements.txt
 ```
 
-Important recurrent-state analysis scripts in `eval/` include:
+## General installation
 
-```text
-analyze_lifetime_binned_error.py
-analyze_lstm_state_writeback.py
-analyze_memoq_deadzone.py
-analyze_recurrent_memory.py
-analyze_scw_sign_persistence.py
-analyze_writeback.py
-bench_student_timing.py
-bench_teacher_timing.py
-build_recurrent_memory_results.py
-build_recurrent_training_campaign.py
-build_v8_allocation_results.py
-recurrent_memory_stats.py
-validate_recurrent_memory_smoke.py
-```
+General development dependencies are provided in `requirements.txt`.
 
-## Model family
+Paper-specific reviewer environments and commands are documented separately in the corresponding reproduction guide:
 
-The baseline Seq2Seq model is a stacked GRU encoder-decoder used for time-resolved fluorescence reconstruction and lifetime estimation.
+- [`docs/QUANTIZATION_PAPER_REPRODUCTION.md`](docs/QUANTIZATION_PAPER_REPRODUCTION.md)
+- [`paper_reproduction/README.md`](paper_reproduction/README.md)
 
-Seq2SeqLite is the compact student model used in the low-precision studies. The configuration analyzed in the recurrent-state paper is a single-layer 32-unit GRU encoder-decoder with a linear dense readout and 6,627 trainable parameters.
-
-Knowledge distillation transfers the output behavior of the larger Seq2Seq teacher to the compact Seq2SeqLite student.
-
-## Installation
-
-Clone the repository:
-
-```bash
-git clone https://github.com/ismailerbas/Seq2SeqLite-kd.git
-cd Seq2SeqLite-kd
-```
-
-Create an isolated Python environment and install the dependencies:
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-```
-
-PyFLI is available separately at:
-
-https://github.com/vkp217/pyfli-pkg
-
-## Reproducibility notes
-
-Post-training recurrent-state intervention analyses keep the trained checkpoint fixed while changing only the recurrent-state write-back rule under study.
-
-Before a post-training intervention is analyzed, the reconstructed native checkpoint is checked against the corresponding original implementation at the tensor and task-metric levels.
-
-The QMem hardening sequence represents one training trajectory. The native 4-bit and native 8-bit GRU models are independently trained reference solutions. Matched recurrent-memory experiments use identical initial trainable parameters within each matched run.
+Using the paper-specific instructions is recommended when reproducing reported manuscript results.
 
 ## Citation
 
@@ -95,24 +75,16 @@ The QMem hardening sequence represents one training trajectory. The native 4-bit
 
 ```bibtex
 @misc{erbas2026quantizationbreaksmemoryrecurrentstate,
-      title={When Quantization Breaks Memory: Recurrent-State Write-Back in Low-Precision Temporal Inference}, 
+      title={When Quantization Breaks Memory: Recurrent-State Write-Back in Low-Precision Temporal Inference},
       author={Ismail Erbas and Xavier Intes and Vikas Pandey},
       year={2026},
       eprint={2609.04490},
       archivePrefix={arXiv},
       primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2609.04490}, 
+      url={https://arxiv.org/abs/2609.04490}
 }
 ```
 
-### Resource-Aware Co-Design for Real-Time Biomedical Inference on Constrained Hardware
+### Resource-Aware Hardware–Software Co-Design for Biomedical Imaging
 
-The citation for this study will be added when its public record is available.
-
-## Contact
-
-Ismail Erbas  
-Department of Biomedical Engineering  
-Rensselaer Polytechnic Institute  
-Troy, New York, USA  
-erbasi@rpi.edu
+Citation information will be added when a public manuscript record is available.
